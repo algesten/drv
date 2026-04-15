@@ -15,7 +15,7 @@ where
 pub struct Registry {
     pub atoms: Vec<AtomRegistration>,
     pub lenses: Vec<LensRegistration>,
-    pub exprs: Vec<ExprRegistration>,
+    pub memos: Vec<MemoRegistration>,
 }
 
 #[derive(Clone)]
@@ -45,17 +45,17 @@ pub struct LensField {
 }
 
 #[derive(Clone)]
-pub struct ExprRegistration {
+pub struct MemoRegistration {
     pub fn_name: String,
     pub vis_tokens: String,
-    pub lens_params: Vec<ExprLensParam>,
+    pub lens_params: Vec<MemoLensParam>,
     pub output_ty_tokens: String,
     /// The function body tokens (as a string), to be re-parsed by assemble.
     pub body_tokens: String,
 }
 
 #[derive(Clone)]
-pub struct ExprLensParam {
+pub struct MemoLensParam {
     pub param_name: String,
     pub lens_name: String,
 }

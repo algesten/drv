@@ -23,7 +23,7 @@ pub struct Editor {
     pub tabs: ImVector<String>,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn visible_lines(lens: &VisibleLines) -> Vec<String> {
     lens.content
         .iter()
@@ -33,7 +33,7 @@ fn visible_lines(lens: &VisibleLines) -> Vec<String> {
         .collect()
 }
 
-#[drv::expr]
+#[drv::memo]
 fn tab_list(lens: &TabList) -> Vec<String> {
     let mut out: Vec<String> = lens.tabs.iter().cloned().collect();
     out.push(format!("({} lines)", lens.content.len()));
@@ -58,7 +58,7 @@ struct NotificationLens {
     pub notification_count: u32,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn notification_badge(lens: &NotificationLens) -> String {
     if *lens.notification_count == 0 {
         format!("{}: no notifications", lens.user_name)
@@ -72,13 +72,13 @@ struct ItemsLens {
     pub items: ImVector<String>,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn item_count(lens: &ItemsLens) -> usize {
     lens.items.len()
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 3. CHAINING — expr output as atom, feeding into another expr
+// 3. CHAINING — memo output as atom, feeding into another memo
 // ══════════════════════════════════════════════════════════════════════
 
 #[drv::atom]
@@ -89,7 +89,7 @@ pub struct Summary {
     pub label: String,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn doubled_total(lens: &CountLens) -> usize {
     *lens.total * 2
 }
@@ -115,12 +115,12 @@ pub struct GameState {
     pub frame_count: u64,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn player_distance(lens: &PlayerLens) -> f32 {
     (*lens.player_x * *lens.player_x + *lens.player_y * *lens.player_y).sqrt()
 }
 
-#[drv::expr]
+#[drv::memo]
 fn score_display(lens: &ScoreLens) -> String {
     format!("{} / {}", lens.score, lens.high_score)
 }
@@ -146,7 +146,7 @@ pub struct BufferStore {
     pub last_save: u64,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn active_content(lens: &AllBuffersLens) -> Option<String> {
     lens.active
         .as_ref()
@@ -166,13 +166,13 @@ pub struct Counter {
     pub name: String,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn is_positive(lens: &ValueLens) -> bool {
     *lens.value > 0
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 7. MULTI-LENS — expr taking lenses from different atoms
+// 7. MULTI-LENS — memo taking lenses from different atoms
 // ══════════════════════════════════════════════════════════════════════
 
 #[drv::lens(Editor)]
@@ -185,13 +185,13 @@ struct DashboardUserLens {
     pub user_name: String,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn combined_header(tabs: &EditorTabsLens, user: &DashboardUserLens) -> String {
     format!("{}: {} tabs open", user.user_name, tabs.tabs.len())
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 8. TWO-LEVEL CHAINING — expr output is an atom feeding another expr
+// 8. TWO-LEVEL CHAINING — memo output is an atom feeding another memo
 // ══════════════════════════════════════════════════════════════════════
 
 #[drv::atom]
@@ -205,7 +205,7 @@ pub struct AppState {
     pub theme: String,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn items_summary(lens: &AppItemsLens) -> ItemsSummary {
     ItemsSummary {
         count: lens.items.len(),
@@ -226,7 +226,7 @@ pub struct ItemsSummary {
     pub current: String,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn summary_label(lens: &ItemsSummaryLens) -> String {
     if lens.current.is_empty() {
         format!("{} items, none selected", lens.count)
@@ -235,8 +235,8 @@ fn summary_label(lens: &ItemsSummaryLens) -> String {
     }
 }
 
-// Atom used directly as expr input (identity lens — all fields).
-#[drv::expr]
+// Atom used directly as memo input (identity lens — all fields).
+#[drv::memo]
 fn summary_label_full(s: &ItemsSummary) -> String {
     format!("{}: {}", s.count, s.current)
 }
@@ -346,7 +346,7 @@ fn standalone_lens_imbl_vector() {
 }
 
 #[test]
-fn chaining_expr_output_as_atom() {
+fn chaining_memo_output_as_atom() {
     let mut summary = Summary {
         total: 5,
         label: "test".into(),
@@ -588,7 +588,7 @@ fn two_level_chaining() {
 }
 
 #[test]
-fn atom_as_expr_input() {
+fn atom_as_memo_input() {
     let mut s = ItemsSummary {
         count: 5,
         current: "hello".into(),

@@ -3,8 +3,8 @@
 Memoized derivations over plain Rust structs.
 
 `drv` lets you declare a struct of ground-truth data (an **atom**), project
-subsets of its fields (a **lens**), and compute derived values (an **expr**)
-that are automatically memoized. When nothing changed, nothing recomputes.
+subsets of its fields (a **lens**), and compute derived values (a **memo**)
+that are automatically cached. When nothing changed, nothing recomputes.
 
 ## Quick example
 
@@ -19,7 +19,7 @@ pub struct Scoreboard {
     pub time_ms: u64,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn total_score(lens: &TotalLens) -> u32 {
     lens.hits.iter().sum()
 }
@@ -41,14 +41,14 @@ Moving the player? Free. `total_score` only recomputes when `hits` change.
 ## The three pieces
 
 **Atom** — a struct of ground-truth data. Declared with `#[drv::atom]`.
-All fields must be `pub` and must implement `PartialEq + Clone + Debug + Default`.
+All fields must be `pub` and must implement `PartialEq + Clone + Debug + Default + Send`.
 
 **Lens** — a projection: a subset of an atom's fields, by name and type.
 It declares "this computation depends on exactly these fields and no others."
 
-**Expr** — a pure function from a lens (or an atom directly) to an output.
-Annotated with `#[drv::expr]`. Memoization is automatic — the result is cached
-and only recomputed when the input fields change.
+**Memo** — a pure function from a lens (or an atom directly) to an output.
+Annotated with `#[drv::memo]`. The result is cached and only recomputed when
+the input fields change.
 
 At the end of your crate, `drv::assemble!()` stitches everything together.
 
@@ -95,12 +95,12 @@ struct MyLens {
 }
 ```
 
-Use standalone lenses when the lens is defined closer to the expr that consumes
+Use standalone lenses when the lens is defined closer to the memo that consumes
 it, or when the atom is in another module and you don't want to modify it.
 
-## Calling exprs
+## Calling memos
 
-`#[drv::expr]` generates a free function with the same name. The function
+`#[drv::memo]` generates a free function with the same name. The function
 body reads from the lens; the generated wrapper handles memoization. You
 call it with `&atom` — the macro auto-converts into the right lens:
 
@@ -112,7 +112,7 @@ pub struct AppState {
     pub viewport_rows: u32,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn item_count(lens: &CountLens) -> usize {
     lens.items.len()
 }
@@ -130,7 +130,7 @@ Memoization happens behind the scenes — no cache struct, no setup.
 
 ## Using an atom directly
 
-An expr can take the atom itself as input — treated as an "identity lens" over
+A memo can take the atom itself as input — treated as an "identity lens" over
 all data fields:
 
 ```rust
@@ -140,7 +140,7 @@ pub struct Stats {
     pub count: u32,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn average(s: &Stats) -> u32 {
     if s.count == 0 { 0 } else { s.total / s.count }
 }
@@ -151,7 +151,7 @@ really do depend on everything.
 
 ## Multiple lenses
 
-An expr can take lenses from multiple atoms. The cache lives in the first
+A memo can take lenses from multiple atoms. The cache lives in the first
 parameter's atom:
 
 ```rust
@@ -167,7 +167,7 @@ pub struct Settings {
     pub multiplier: u32,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn weighted_score(hits: &HitsLens, settings: &MultiplierLens) -> u32 {
     hits.hits.iter().sum::<u32>() * settings.multiplier
 }
@@ -175,14 +175,14 @@ fn weighted_score(hits: &HitsLens, settings: &MultiplierLens) -> u32 {
 let score = weighted_score(&game, &settings);   // cache stored in `game`
 ```
 
-If any of the lens field comparisons fail, the expr recomputes. Two lenses from
+If any of the lens field comparisons fail, the memo recomputes. Two lenses from
 the same atom (`fn foo(a: &LensA, b: &LensB)` called as `foo(&app, &app)`)
 works too.
 
 ## Chaining
 
-An expr output can feed into another expr. Mark the output type as an atom too.
-When constructing it inside the expr body, close with `..Default::default()` so
+A memo's output can feed into another memo. Mark the output type as an atom too.
+When constructing it inside the memo body, close with `..Default::default()` so
 `drv` can set up its internal state:
 
 ```rust
@@ -199,7 +199,7 @@ struct HitsLens {
     pub hits: Vec<u32>,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn stats(lens: &HitsLens) -> Stats {
     Stats {
         total: lens.hits.iter().sum(),
@@ -221,7 +221,7 @@ pub struct Stats {
     pub best: u32,
 }
 
-#[drv::expr]
+#[drv::memo]
 fn average(lens: &AverageLens) -> u32 {
     if *lens.count == 0 { 0 } else { *lens.total / *lens.count }
 }
@@ -241,7 +241,7 @@ cached, `average` sees the same input, also returns cached. Zero work.
                                                 │
                                                 │
                                       transform_function_3
-                                             (expr)
+                                             (memo)
                                                 ▲
                                                 │
                                                 │
@@ -258,7 +258,7 @@ cached, `average` sees the same input, also returns cached. Zero work.
               ▲                                 ▲
               │                                 │
     transform_function_1              transform_function_2
-           (expr)                            (expr)
+           (memo)                            (memo)
               ▲                                 ▲
               │                                 │
               │                  ┌──────────────┴──────────────┐
@@ -279,7 +279,7 @@ cached, `average` sees the same input, also returns cached. Zero work.
 
 ## Choosing field types
 
-Atom fields must implement `PartialEq + Clone + Debug + Default`.
+Atom fields must implement `PartialEq + Clone + Debug + Default + Send`.
 
 ### What runs when
 
@@ -288,10 +288,10 @@ references into the atom). What runs on each call:
 
 - **Every call — `PartialEq` on each lens field.** Used to check whether
   the input has changed since the last call.
-- **Every call — `Clone` on the output.** Exprs return by value.
+- **Every call — `Clone` on the output.** Memos return by value.
 - **Cache miss only — `Clone` on each lens field.** A copy is kept for the
   next call's comparison.
-- **Cache miss only — the expr body runs.**
+- **Cache miss only — the memo body runs.**
 
 Two kinds of costs matter on the hot path:
 
@@ -365,34 +365,34 @@ pub struct AppState {
 
 ## Multiple atoms, multiple crates
 
-Each atom and its exprs must live in the same crate. This is by design —
+Each atom and its memos must live in the same crate. This is by design —
 `drv::assemble!()` collects everything within a single compilation unit.
 
 For larger applications, split your state into domain-specific atoms in
 separate crates:
 
 ```
-crate: my-app-buffers   → BufferState atom + buffer exprs
-crate: my-app-ui        → UiState atom + ui exprs
-crate: my-app-lsp       → LspState atom + lsp exprs
+crate: my-app-buffers   → BufferState atom + buffer memos
+crate: my-app-ui        → UiState atom + ui memos
+crate: my-app-lsp       → LspState atom + lsp memos
 crate: my-app           → composes the above
 ```
 
 Each crate is self-contained. The top-level crate can define its own atoms
-that compose fields from the domain crates, with its own lenses and exprs
+that compose fields from the domain crates, with its own lenses and memos
 over the combined state.
 
 ## Assembly
 
 `drv::assemble!()` must appear once, after all `#[drv::atom]`, `#[drv::lens]`,
-and `#[drv::expr]` declarations in the crate. It collects all registrations
+and `#[drv::memo]` declarations in the crate. It collects all registrations
 and emits the cache types, the lens types, and the memoized free functions.
 
 ```
 // lib.rs
 mod state;       // atoms
-mod views;       // lenses + exprs
-mod rendering;   // more lenses + exprs
+mod views;       // lenses + memos
+mod rendering;   // more lenses + memos
 
 drv::assemble!();
 ```
@@ -406,6 +406,8 @@ drv::assemble!();
 - **Zero runtime tracking.** No proxy objects, no access instrumentation, no
   subscription management. Just field-by-field `PartialEq`.
 - **Memoization is automatic.** No cache struct to construct, no explicit
-  setup — just call the expr.
-- **Free functions, not methods.** Exprs are ordinary functions. Call sites
+  setup — just call the memo.
+- **Free functions, not methods.** Memos are ordinary functions. Call sites
   don't need to know any generated type names.
+
+License: MIT OR Apache-2.0

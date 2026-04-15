@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{FnArg, ItemFn, Pat, ReturnType, Type};
 
-use crate::registry::{self, ExprLensParam, ExprRegistration};
+use crate::registry::{self, MemoLensParam, MemoRegistration};
 
 pub fn expand(item: ItemFn) -> Result<TokenStream, syn::Error> {
     let fn_name = &item.sig.ident;
@@ -11,7 +11,7 @@ pub fn expand(item: ItemFn) -> Result<TokenStream, syn::Error> {
         return Err(syn::Error::new_spanned(
             &item.sig.inputs,
             format!(
-                "#[drv::expr] function '{}' must take at least one parameter: &LensName",
+                "#[drv::memo] function '{}' must take at least one parameter: &LensName",
                 fn_name,
             ),
         ));
@@ -29,7 +29,7 @@ pub fn expand(item: ItemFn) -> Result<TokenStream, syn::Error> {
             return Err(syn::Error::new_spanned(
                 &item.sig,
                 format!(
-                    "#[drv::expr] function '{}' must have an explicit return type",
+                    "#[drv::memo] function '{}' must have an explicit return type",
                     fn_name,
                 ),
             ));
@@ -63,11 +63,11 @@ pub fn expand(item: ItemFn) -> Result<TokenStream, syn::Error> {
             }
         }
 
-        if reg.exprs.iter().any(|e| e.fn_name == fn_name_str) {
+        if reg.memos.iter().any(|e| e.fn_name == fn_name_str) {
             return Err(syn::Error::new_spanned(
                 fn_name,
                 format!(
-                    "expr '{}' is already declared -- expr names must be unique within a crate",
+                    "memo '{}' is already declared -- memo names must be unique within a crate",
                     fn_name
                 ),
             ));
@@ -77,12 +77,12 @@ pub fn expand(item: ItemFn) -> Result<TokenStream, syn::Error> {
         let body_tokens = quote!(#body).to_string();
         let vis = &item.vis;
 
-        reg.exprs.push(ExprRegistration {
+        reg.memos.push(MemoRegistration {
             fn_name: fn_name_str,
             vis_tokens: quote!(#vis).to_string(),
             lens_params: lens_params
                 .iter()
-                .map(|(param_name, lens_name)| ExprLensParam {
+                .map(|(param_name, lens_name)| MemoLensParam {
                     param_name: param_name.to_string(),
                     lens_name: lens_name.to_string(),
                 })
@@ -108,7 +108,7 @@ fn extract_param_info(
             return Err(syn::Error::new_spanned(
                 param,
                 format!(
-                    "#[drv::expr] function '{}' must take &LensName, not self",
+                    "#[drv::memo] function '{}' must take &LensName, not self",
                     fn_name
                 ),
             ));
@@ -121,7 +121,7 @@ fn extract_param_info(
             return Err(syn::Error::new_spanned(
                 &typed.pat,
                 format!(
-                    "#[drv::expr] function '{}': parameter must be a simple name",
+                    "#[drv::memo] function '{}': parameter must be a simple name",
                     fn_name
                 ),
             ));
@@ -134,7 +134,7 @@ fn extract_param_info(
                 return Err(syn::Error::new_spanned(
                     &typed.ty,
                     format!(
-                        "#[drv::expr] function '{}' must take &LensName (shared reference)",
+                        "#[drv::memo] function '{}' must take &LensName (shared reference)",
                         fn_name
                     ),
                 ));
@@ -145,7 +145,7 @@ fn extract_param_info(
             return Err(syn::Error::new_spanned(
                 &typed.ty,
                 format!(
-                    "#[drv::expr] function '{}' must take &LensName (a shared reference to a lens)",
+                    "#[drv::memo] function '{}' must take &LensName (a shared reference to a lens)",
                     fn_name,
                 ),
             ));
@@ -160,7 +160,7 @@ fn extract_param_info(
                 return Err(syn::Error::new_spanned(
                     inner_ty,
                     format!(
-                        "#[drv::expr] function '{}': the lens type must be a simple name",
+                        "#[drv::memo] function '{}': the lens type must be a simple name",
                         fn_name
                     ),
                 ));
@@ -170,7 +170,7 @@ fn extract_param_info(
             return Err(syn::Error::new_spanned(
                 inner_ty,
                 format!(
-                    "#[drv::expr] function '{}': expected a lens type name",
+                    "#[drv::memo] function '{}': expected a lens type name",
                     fn_name
                 ),
             ));

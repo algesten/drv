@@ -8,22 +8,22 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
     registry::with(|reg| {
         let mut output = TokenStream::new();
 
-        // Group exprs by primary atom (first param's lens → atom).
+        // Group memos by primary atom (first param's lens → atom).
         // Also collect per-atom state fields.
-        let mut atom_exprs: std::collections::HashMap<String, Vec<ExprInfo>> =
+        let mut atom_memos: std::collections::HashMap<String, Vec<MemoInfo>> =
             std::collections::HashMap::new();
 
-        for expr in &reg.exprs {
-            let first = &expr.lens_params[0];
+        for memo in &reg.memos {
+            let first = &memo.lens_params[0];
             let first_lens = reg.find_lens(&first.lens_name).unwrap();
             let primary_atom = first_lens.atom_name.clone();
 
-            let params: Vec<ExprParamInfo> = expr
+            let params: Vec<MemoParamInfo> = memo
                 .lens_params
                 .iter()
                 .map(|lp| {
                     let lens = reg.find_lens(&lp.lens_name).unwrap();
-                    ExprParamInfo {
+                    MemoParamInfo {
                         param_name: lp.param_name.clone(),
                         lens_name: lp.lens_name.clone(),
                         atom_name: lens.atom_name.clone(),
@@ -33,24 +33,24 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
                 })
                 .collect();
 
-            atom_exprs.entry(primary_atom).or_default().push(ExprInfo {
-                fn_name: expr.fn_name.clone(),
-                vis_tokens: expr.vis_tokens.clone(),
+            atom_memos.entry(primary_atom).or_default().push(MemoInfo {
+                fn_name: memo.fn_name.clone(),
+                vis_tokens: memo.vis_tokens.clone(),
                 params,
-                output_ty_tokens: expr.output_ty_tokens.clone(),
-                body_tokens: expr.body_tokens.clone(),
+                output_ty_tokens: memo.output_ty_tokens.clone(),
+                body_tokens: memo.body_tokens.clone(),
             });
         }
 
-        // Per-atom state struct (one slot pair per expr).
+        // Per-atom state struct (one slot pair per memo).
         for atom in &reg.atoms {
-            let exprs = atom_exprs.get(&atom.name).cloned().unwrap_or_default();
-            if exprs.is_empty() {
+            let memos = atom_memos.get(&atom.name).cloned().unwrap_or_default();
+            if memos.is_empty() {
                 continue;
             }
 
             let state_name = format_ident!("__Drv{}State", atom.name);
-            let state_fields: Vec<TokenStream> = exprs
+            let state_fields: Vec<TokenStream> = memos
                 .iter()
                 .flat_map(|e| {
                     let in_field = format_ident!("{}_input", e.fn_name);
@@ -74,17 +74,17 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
             });
         }
 
-        // Generate the rewritten expr functions.
-        for expr in &reg.exprs {
-            let first = &expr.lens_params[0];
+        // Generate the rewritten memo functions.
+        for memo in &reg.memos {
+            let first = &memo.lens_params[0];
             let first_lens = reg.find_lens(&first.lens_name).unwrap();
             let primary_atom = first_lens.atom_name.clone();
-            let params: Vec<ExprParamInfo> = expr
+            let params: Vec<MemoParamInfo> = memo
                 .lens_params
                 .iter()
                 .map(|lp| {
                     let lens = reg.find_lens(&lp.lens_name).unwrap();
-                    ExprParamInfo {
+                    MemoParamInfo {
                         param_name: lp.param_name.clone(),
                         lens_name: lp.lens_name.clone(),
                         atom_name: lens.atom_name.clone(),
@@ -94,27 +94,27 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
                 })
                 .collect();
 
-            let info = ExprInfo {
-                fn_name: expr.fn_name.clone(),
-                vis_tokens: expr.vis_tokens.clone(),
+            let info = MemoInfo {
+                fn_name: memo.fn_name.clone(),
+                vis_tokens: memo.vis_tokens.clone(),
                 params,
-                output_ty_tokens: expr.output_ty_tokens.clone(),
-                body_tokens: expr.body_tokens.clone(),
+                output_ty_tokens: memo.output_ty_tokens.clone(),
+                body_tokens: memo.body_tokens.clone(),
             };
 
-            output.extend(generate_expr_fn(&info, &primary_atom, reg));
+            output.extend(generate_memo_fn(&info, &primary_atom, reg));
         }
 
         Ok(output)
     })
 }
 
-/// What type is stored in the cache for this expr's input?
+/// What type is stored in the cache for this memo's input?
 /// - Single param, lens: the lens's snapshot type (`__DrvCountLens`)
 /// - Single param, identity (atom): the atom's identity snapshot (`__Drv{Atom}Identity`)
 /// - Multiple params: tuple of snapshots
-fn input_storage_type(expr: &ExprInfo, _reg: &registry::Registry) -> TokenStream {
-    let snapshot_types: Vec<Ident> = expr.params.iter().map(snapshot_ident_for).collect();
+fn input_storage_type(memo: &MemoInfo, _reg: &registry::Registry) -> TokenStream {
+    let snapshot_types: Vec<Ident> = memo.params.iter().map(snapshot_ident_for).collect();
 
     if snapshot_types.len() == 1 {
         let s = &snapshot_types[0];
@@ -124,7 +124,7 @@ fn input_storage_type(expr: &ExprInfo, _reg: &registry::Registry) -> TokenStream
     }
 }
 
-fn snapshot_ident_for(param: &ExprParamInfo) -> Ident {
+fn snapshot_ident_for(param: &MemoParamInfo) -> Ident {
     if param.is_identity {
         format_ident!("__Drv{}Identity", param.atom_name)
     } else {
@@ -132,20 +132,20 @@ fn snapshot_ident_for(param: &ExprParamInfo) -> Ident {
     }
 }
 
-fn generate_expr_fn(expr: &ExprInfo, primary_atom: &str, _reg: &registry::Registry) -> TokenStream {
-    let fn_ident = Ident::new(&expr.fn_name, Span::call_site());
+fn generate_memo_fn(memo: &MemoInfo, primary_atom: &str, _reg: &registry::Registry) -> TokenStream {
+    let fn_ident = Ident::new(&memo.fn_name, Span::call_site());
     let state_name = format_ident!("__Drv{}State", primary_atom);
-    let input_field = format_ident!("{}_input", expr.fn_name);
-    let output_field = format_ident!("{}_output", expr.fn_name);
+    let input_field = format_ident!("{}_input", memo.fn_name);
+    let output_field = format_ident!("{}_output", memo.fn_name);
     let output_ty: syn::Type =
-        syn::parse_str(&expr.output_ty_tokens).expect("output type should parse");
+        syn::parse_str(&memo.output_ty_tokens).expect("output type should parse");
 
     // Parse visibility and body tokens from strings back to TokenStream.
-    let vis: TokenStream = expr.vis_tokens.parse().unwrap_or_else(|_| quote! {});
-    let body: TokenStream = expr.body_tokens.parse().expect("body should parse");
+    let vis: TokenStream = memo.vis_tokens.parse().unwrap_or_else(|_| quote! {});
+    let body: TokenStream = memo.body_tokens.parse().expect("body should parse");
 
     // Build compute fn: reuses user's signature (lens types) and body.
-    let compute_params: Vec<TokenStream> = expr
+    let compute_params: Vec<TokenStream> = memo
         .params
         .iter()
         .map(|p| {
@@ -159,7 +159,7 @@ fn generate_expr_fn(expr: &ExprInfo, primary_atom: &str, _reg: &registry::Regist
     // For atoms used as identity lens, the param is `&AtomName`.
     // We need a lifetime parameter per non-identity lens param.
     let mut lifetime_params: Vec<TokenStream> = Vec::new();
-    let outer_params: Vec<TokenStream> = expr
+    let outer_params: Vec<TokenStream> = memo
         .params
         .iter()
         .enumerate()
@@ -184,7 +184,7 @@ fn generate_expr_fn(expr: &ExprInfo, primary_atom: &str, _reg: &registry::Regist
     };
 
     // Inside the function, convert each param into the lens.
-    let conversions: Vec<TokenStream> = expr
+    let conversions: Vec<TokenStream> = memo
         .params
         .iter()
         .map(|p| {
@@ -199,31 +199,31 @@ fn generate_expr_fn(expr: &ExprInfo, primary_atom: &str, _reg: &registry::Regist
         .collect();
 
     // First param determines where the cache is.
-    let first_pname = Ident::new(&expr.params[0].param_name, Span::call_site());
-    let cache_expr = if expr.params[0].is_identity {
+    let first_pname = Ident::new(&memo.params[0].param_name, Span::call_site());
+    let cache_expr = if memo.params[0].is_identity {
         quote! { &#first_pname.__drv }
     } else {
         quote! { #first_pname.__drv }
     };
 
     // Freshness check: compare each param against the stored snapshot.
-    let input_idents: Vec<Ident> = (0..expr.params.len())
+    let input_idents: Vec<Ident> = (0..memo.params.len())
         .map(|i| format_ident!("__drv_in_{}", i))
         .collect();
 
-    let single = expr.params.len() == 1;
+    let single = memo.params.len() == 1;
 
     let fresh_check = if single {
-        let pname = Ident::new(&expr.params[0].param_name, Span::call_site());
+        let pname = Ident::new(&memo.params[0].param_name, Span::call_site());
         // For identity: compare *atom == *snapshot via atom's PartialEq<Snapshot>
         // For lens: compare *lens == *snapshot via lens's PartialEq<Snapshot>
-        if expr.params[0].is_identity {
+        if memo.params[0].is_identity {
             quote! { *#pname == *__prev }
         } else {
             quote! { #pname == *__prev }
         }
     } else {
-        let checks: Vec<TokenStream> = expr
+        let checks: Vec<TokenStream> = memo
             .params
             .iter()
             .zip(input_idents.iter())
@@ -247,15 +247,15 @@ fn generate_expr_fn(expr: &ExprInfo, primary_atom: &str, _reg: &registry::Regist
 
     // Build snapshot on cache miss.
     let snapshot_build: TokenStream = if single {
-        let p = &expr.params[0];
+        let p = &memo.params[0];
         build_snapshot_expr(p)
     } else {
-        let builders: Vec<TokenStream> = expr.params.iter().map(build_snapshot_expr).collect();
+        let builders: Vec<TokenStream> = memo.params.iter().map(build_snapshot_expr).collect();
         quote! { (#(#builders),*) }
     };
 
     // Compute call args.
-    let compute_args: Vec<TokenStream> = expr
+    let compute_args: Vec<TokenStream> = memo
         .params
         .iter()
         .map(|p| {
@@ -296,7 +296,7 @@ fn generate_expr_fn(expr: &ExprInfo, primary_atom: &str, _reg: &registry::Regist
 
 /// The lens type used inside the user's compute fn.
 /// For identity lens: the atom itself. For regular lens: `LensName<'_>`.
-fn lens_type_for(param: &ExprParamInfo) -> TokenStream {
+fn lens_type_for(param: &MemoParamInfo) -> TokenStream {
     if param.is_identity {
         let atom = Ident::new(&param.atom_name, Span::call_site());
         quote! { #atom }
@@ -307,7 +307,7 @@ fn lens_type_for(param: &ExprParamInfo) -> TokenStream {
 }
 
 /// Build a snapshot value from a lens/atom param.
-fn build_snapshot_expr(param: &ExprParamInfo) -> TokenStream {
+fn build_snapshot_expr(param: &MemoParamInfo) -> TokenStream {
     let pname = Ident::new(&param.param_name, Span::call_site());
     if param.is_identity {
         // Identity snapshot: clone each field from the atom.
@@ -327,16 +327,16 @@ fn build_snapshot_expr(param: &ExprParamInfo) -> TokenStream {
 }
 
 #[derive(Clone)]
-struct ExprInfo {
+struct MemoInfo {
     fn_name: String,
     vis_tokens: String,
-    params: Vec<ExprParamInfo>,
+    params: Vec<MemoParamInfo>,
     output_ty_tokens: String,
     body_tokens: String,
 }
 
 #[derive(Clone)]
-struct ExprParamInfo {
+struct MemoParamInfo {
     param_name: String,
     lens_name: String,
     atom_name: String,

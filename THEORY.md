@@ -72,19 +72,19 @@ The atom itself can also be used as a lens — the "identity lens" over all data
 fields. This is a convenience for computations that genuinely depend on
 everything.
 
-### Expr
+### Memo
 
-An expr is a pure function from one or more lenses to an output value. It is
+A memo is a pure function from one or more lenses to an output value. It is
 automatically memoized: the runtime maintains a cache of
 `(last_inputs, last_output)` and skips recomputation when every lens matches.
 
-In database terms, the expr is a **materialized view** — a precomputed query
+In database terms, a memo is a **materialized view** — a precomputed query
 result that is maintained incrementally. In signal frameworks, it is a
-**computed signal** or **memo**. In the incremental computation literature, it
-is a **thunk** (Adapton) or **query** (Salsa).
+**computed signal**. In the incremental computation literature, it is a
+**thunk** (Adapton) or **query** (Salsa).
 
-An expr's output can itself be marked as an atom, enabling chaining: the output
-of one expr becomes the input to another's lens. This creates a DAG of
+A memo's output can itself be marked as an atom, enabling chaining: the output
+of one memo becomes the input to another's lens. This creates a DAG of
 derivations, each independently memoized.
 
 ## The projection-as-dependency insight
@@ -151,24 +151,24 @@ With `imbl`, it is also efficient.
 
 ## Memoization strategy
 
-Each `#[drv::expr]` function is transformed by the macro into a free function
+Each `#[drv::memo]` function is transformed by the macro into a free function
 with the same name that performs the memoization inline.
 
 The atom carries a `__drv: drv::Cache` field — a type-erased, interior-mutable
-slot (`RefCell<Option<Box<dyn Any>>>`). On first call, the slot is initialized
-with a per-atom state struct holding `(input, output)` pairs — one for each
-expr that targets this atom.
+slot (`RefCell<Option<Box<dyn Any + Send>>>`). On first call, the slot is
+initialized with a per-atom state struct holding `(input, output)` pairs — one
+for each memo that targets this atom.
 
 The evaluation flow:
 
 ```
-call expr(&atom)
+call memo(&atom)
   → convert &atom into the lens (auto via Into)
   → borrow atom.__drv mutably
   → compare each lens field against the cached snapshot
     → all equal: clone and return the cached output (FAST PATH)
     → any differ:
-        → run the expr function with the new lens
+        → run the memo function with the new lens
         → clone the lens fields into an owned snapshot
         → store new snapshot + output in the cache
         → clone and return the new output
@@ -183,12 +183,12 @@ For cheap types (`usize`, `String`, `imbl` collections), this is effectively
 free. For expensive types, the programmer should consider whether full-output
 returns are appropriate, or wrap the output in `Rc`/`Arc` for cheap cloning.
 
-### Multi-lens exprs
+### Multi-lens memos
 
-When an expr takes multiple lens parameters, the cache lives in the first
+When a memo takes multiple lens parameters, the cache lives in the first
 parameter's atom. The stored input is a tuple of owned snapshots, one per
 lens. On each call, every lens is compared against its stored snapshot;
-if any differ, the expr recomputes.
+if any differ, the memo recomputes.
 
 This handles two cases uniformly:
 - Lenses from different atoms (e.g., `fn header(tabs: &TabsLens, user: &UserLens)`)
@@ -196,19 +196,19 @@ This handles two cases uniformly:
 
 ## Chaining and transitive memoization
 
-When an expr's output is marked as an atom, other lenses can project from it:
+When a memo's output is marked as an atom, other lenses can project from it:
 
 ```
-Atom A → Lens L1 → Expr E1 → Atom B → Lens L2 → Expr E2 → Output
+Atom A → Lens L1 → Memo M1 → Atom B → Lens L2 → Memo M2 → Output
 ```
 
 Each link is independently memoized. If A changes but only in fields that
-L1 doesn't select, E1 returns cached, B is unchanged, L2 sees no change,
-E2 returns cached. Zero work propagates through the entire chain.
+L1 doesn't select, M1 returns cached, B is unchanged, L2 sees no change,
+M2 returns cached. Zero work propagates through the entire chain.
 
-If A changes in a field that L1 selects, E1 recomputes and produces a new B.
+If A changes in a field that L1 selects, M1 recomputes and produces a new B.
 L2 then compares its fields against the new B. If those specific fields
-haven't changed (the recomputation produced the same values), E2 still
+haven't changed (the recomputation produced the same values), M2 still
 returns cached.
 
 This is the **early cutoff** property (Build Systems a la Carte): even when
@@ -216,9 +216,9 @@ an upstream computation re-runs, downstream computations are skipped if the
 output didn't actually change. In `drv`, early cutoff falls out naturally
 from the `PartialEq` check — it doesn't require special support.
 
-For an atom used as an expr output, the programmer constructs it in the expr
+For an atom used as a memo output, the programmer constructs it in the memo
 body with `..Default::default()` to fill in the hidden cache field. The
-cache is fresh on every recomputation of the upstream expr — which is correct
+cache is fresh on every recomputation of the upstream memo — which is correct
 because the atom value itself is new.
 
 ## Memory layout
@@ -227,11 +227,11 @@ Each atom carries its own cache via the `__drv: drv::Cache` field:
 
 ```rust
 pub struct Cache {
-    inner: RefCell<Option<Box<dyn Any>>>,
+    inner: RefCell<Option<Box<dyn Any + Send>>>,
 }
 ```
 
-On first call to any expr targeting this atom, the `Box<dyn Any>` is
+On first call to any memo targeting this atom, the `Box<dyn Any + Send>` is
 initialized with a state struct generated by `drv::assemble!()`:
 
 ```rust
@@ -241,20 +241,21 @@ pub struct __DrvEditorState {
     visible_lines_output: Option<Vec<String>>,
     status_bar_input: Option<__DrvStatusBarLens>,
     status_bar_output: Option<StatusBar>,
-    // ... one pair per expr targeting Editor
+    // ... one pair per memo targeting Editor
 }
 ```
 
-The type erasure (`Box<dyn Any>`) allows the atom type to be defined without
-forward-referencing the state type — which is important because the state
-type depends on what exprs exist, and exprs can be declared in any order
-relative to the atom.
+The type erasure (`Box<dyn Any + Send>`) allows the atom type to be defined
+without forward-referencing the state type — which is important because the
+state type depends on what memos exist, and memos can be declared in any order
+relative to the atom. The `Send` bound propagates to the atom, so atoms can be
+moved across threads.
 
 Access cost:
 - `RefCell::borrow_mut()` — a single atomic-like flag check
 - `Box<dyn Any>::downcast_mut::<T>()` — a single `TypeId` comparison
 - Lazy initialization on first use — one `Box::new` allocation per atom
-  instance per expr-owning atom
+  instance per memo-owning atom
 
 After initialization, the hot path is: flag check, downcast, field comparison.
 No `HashMap` lookup, no subscription table, no graph traversal.
@@ -321,20 +322,20 @@ incremental update machinery.
   be in the lens. This may cause unnecessary recomputation when an irrelevant
   field changes.
 
-- **No incremental update.** When the cache is stale, the expr recomputes from
-  scratch. There is no mechanism to pass "what changed" to the expr and let it
+- **No incremental update.** When the cache is stale, the memo recomputes from
+  scratch. There is no mechanism to pass "what changed" to the memo and let it
   update incrementally. For most UI derivations (rendering a visible slice,
   computing a status bar), full recomputation is cheap. For expensive
   derivations over large collections, this may be a bottleneck.
 
-- **Single-crate scope.** All exprs for an atom must be in the same crate.
-  Cross-crate exprs are not supported. `drv::assemble!()` collects everything
+- **Single-crate scope.** All memos for an atom must be in the same crate.
+  Cross-crate memos are not supported. `drv::assemble!()` collects everything
   within a single compilation unit.
 
-- **Owned returns.** Exprs return their output by value (via `Clone`). For
+- **Owned returns.** Memos return their output by value (via `Clone`). For
   cheap types this is free; for expensive outputs, wrap in `Rc`/`Arc`.
 
-- **No cycle detection.** If expr A depends on expr B which depends on expr A,
+- **No cycle detection.** If memo A depends on memo B which depends on memo A,
   the result is infinite recursion. The programmer must ensure the dependency
   graph is acyclic. In practice, lens-based projections rarely create cycles
   because they select from existing data rather than computed data.

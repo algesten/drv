@@ -249,7 +249,7 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
     }
 
     // Generate identity lens: atom itself as lens.
-    // Register it so exprs taking `&AtomName` work.
+    // Register it so memos taking `&AtomName` work.
     {
         let snapshot_ident = format_ident!("__Drv{}Identity", struct_name);
         let field_names: Vec<Ident> = data_field_idents.iter().cloned().cloned().collect();
