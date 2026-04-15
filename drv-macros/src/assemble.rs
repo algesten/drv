@@ -42,12 +42,12 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
             });
         }
 
-        // Per-atom state struct (one slot pair per memo).
+        // Per-atom state struct + Atom impl. Emit for every atom, even if no
+        // memos target it (the atom's `__drv: Cache<Self>` field requires the
+        // Atom impl regardless).
         for atom in &reg.atoms {
+            let atom_ident = Ident::new(&atom.name, Span::call_site());
             let memos = atom_memos.get(&atom.name).cloned().unwrap_or_default();
-            if memos.is_empty() {
-                continue;
-            }
 
             let state_name = format_ident!("__Drv{}State", atom.name);
             let state_fields: Vec<TokenStream> = memos
@@ -70,6 +70,10 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
                 #[derive(Default)]
                 pub struct #state_name {
                     #(#state_fields,)*
+                }
+
+                impl ::drv::Atom for #atom_ident {
+                    type State = #state_name;
                 }
             });
         }
@@ -132,9 +136,12 @@ fn snapshot_ident_for(param: &MemoParamInfo) -> Ident {
     }
 }
 
-fn generate_memo_fn(memo: &MemoInfo, primary_atom: &str, _reg: &registry::Registry) -> TokenStream {
+fn generate_memo_fn(
+    memo: &MemoInfo,
+    _primary_atom: &str,
+    _reg: &registry::Registry,
+) -> TokenStream {
     let fn_ident = Ident::new(&memo.fn_name, Span::call_site());
-    let state_name = format_ident!("__Drv{}State", primary_atom);
     let input_field = format_ident!("{}_input", memo.fn_name);
     let output_field = format_ident!("{}_output", memo.fn_name);
     let output_ty: syn::Type =
@@ -276,11 +283,7 @@ fn generate_memo_fn(memo: &MemoInfo, primary_atom: &str, _reg: &registry::Regist
 
             #(#conversions)*
 
-            let mut __cache_ref = ::core::cell::RefCell::borrow_mut(&#cache_expr.inner);
-            let __state: &mut #state_name = __cache_ref
-                .get_or_insert_with(|| ::std::boxed::Box::new(#state_name::default()))
-                .downcast_mut::<#state_name>()
-                .expect("drv: internal cache type mismatch");
+            let mut __state = ::core::cell::RefCell::borrow_mut(&#cache_expr.inner);
 
             let __fresh = __state.#input_field.as_ref().is_some_and(|#fresh_pattern| #fresh_check);
 

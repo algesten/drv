@@ -148,7 +148,7 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
         #vis struct #struct_name #generics {
             #(#clean_fields,)*
             #[doc(hidden)]
-            pub __drv: ::drv::Cache,
+            pub __drv: ::drv::Cache<Self>,
         }
     };
 
@@ -324,7 +324,7 @@ pub(crate) fn generate_lens_types(
         #[derive(Copy, Clone, Debug)]
         pub struct #lens_ident<'drv> {
             #[doc(hidden)]
-            pub __drv: &'drv ::drv::Cache,
+            pub __drv: &'drv ::drv::Cache<#atom_ident>,
             #(pub #fn1: &'drv #ft1,)*
         }
 

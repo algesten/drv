@@ -409,5 +409,3 @@ drv::assemble!();
   setup — just call the memo.
 - **Free functions, not methods.** Memos are ordinary functions. Call sites
   don't need to know any generated type names.
-
-License: MIT OR Apache-2.0

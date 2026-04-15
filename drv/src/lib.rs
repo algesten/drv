@@ -444,12 +444,20 @@
 //! - **Free functions, not methods.** Memos are ordinary functions. Call sites
 //!   don't need to know any generated type names.
 
-use std::any::Any;
 use std::cell::RefCell;
 
-/// A type-erased memoization cache, embedded in atom structs.
+/// Trait implemented by `#[drv::atom]` structs. The associated `State` type
+/// is emitted by `drv::assemble!()` and contains one `Option<snapshot>` +
+/// `Option<output>` pair per memo targeting this atom.
+pub trait Atom {
+    type State: Default + Send + 'static;
+}
+
+/// Stack-allocated memoization cache, embedded in atom structs.
 ///
 /// Uses interior mutability so lenses can borrow `&self` instead of `&mut self`.
+/// The `State` type is supplied by the atom's `Atom` impl, letting the cache
+/// layout be fully known at compile time — no heap allocation, no type erasure.
 ///
 /// Transparent trait impls so derives on atom structs work correctly:
 /// - `PartialEq`: always `true` (cache state doesn't affect equality)
@@ -457,56 +465,56 @@ use std::cell::RefCell;
 /// - `Default`: empty cache
 /// - `Hash`: no-op
 /// - `Debug`: prints `Cache(..)`
-pub struct Cache {
+pub struct Cache<A: Atom> {
     #[doc(hidden)]
-    pub inner: RefCell<Option<Box<dyn Any + Send>>>,
+    pub inner: RefCell<A::State>,
 }
 
-impl Cache {
+impl<A: Atom> Cache<A> {
     pub fn new() -> Self {
         Cache {
-            inner: RefCell::new(None),
+            inner: RefCell::new(A::State::default()),
         }
     }
 }
 
-impl Default for Cache {
+impl<A: Atom> Default for Cache<A> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Clone for Cache {
+impl<A: Atom> Clone for Cache<A> {
     fn clone(&self) -> Self {
         Self::new()
     }
 }
 
-impl PartialEq for Cache {
+impl<A: Atom> PartialEq for Cache<A> {
     fn eq(&self, _: &Self) -> bool {
         true
     }
 }
 
-impl Eq for Cache {}
+impl<A: Atom> Eq for Cache<A> {}
 
-impl std::fmt::Debug for Cache {
+impl<A: Atom> std::fmt::Debug for Cache<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "Cache(..)")
     }
 }
 
-impl std::hash::Hash for Cache {
+impl<A: Atom> std::hash::Hash for Cache<A> {
     fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
-impl PartialOrd for Cache {
+impl<A: Atom> PartialOrd for Cache<A> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Cache {
+impl<A: Atom> Ord for Cache<A> {
     fn cmp(&self, _: &Self) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal
     }
