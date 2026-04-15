@@ -63,11 +63,19 @@ pub enum MemoParam {
         param_name: String,
         lens_name: String,
     },
-    /// An owned value parameter. Contributes to the cache key via PartialEq
-    /// and is stored via Clone.
+    /// An owned value parameter like `u32` or `String`. Contributes to the
+    /// cache key via PartialEq; stored via Clone.
     Value {
         param_name: String,
         ty_tokens: String,
+    },
+    /// A reference value parameter like `&str` or `&[u8]`. The referent `T`
+    /// must implement `ToOwned`. Stored as `<T as ToOwned>::Owned`, compared
+    /// via `PartialEq` between `&T` and the owned form.
+    ValueRef {
+        param_name: String,
+        /// Token string of the referent type (e.g. "str" for &str).
+        referent_tokens: String,
     },
 }
 

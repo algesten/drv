@@ -291,6 +291,17 @@ fn multi_value(offset: u32, lens: &BaseLens, scale: u32) -> u32 {
     offset + (*lens.base * scale)
 }
 
+// Reference value params — `&str` and `&[u8]` stored via ToOwned.
+#[drv::memo]
+fn with_str(lens: &BaseLens, prefix: &str) -> String {
+    format!("{}={}", prefix, lens.base)
+}
+
+#[drv::memo]
+fn with_bytes(lens: &BaseLens, bytes: &[u8]) -> usize {
+    (*lens.base as usize) + bytes.len()
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // ASSEMBLE — must come after all declarations
 // ══════════════════════════════════════════════════════════════════════
@@ -720,6 +731,44 @@ fn mixed_lens_change_invalidates() {
     // Change the lens's field — cache should invalidate.
     a.base = 100;
     assert_eq!(with_value_after(&a, 2), 200);
+}
+
+#[test]
+fn value_ref_str() {
+    let a = MixedAtom {
+        base: 42,
+        ..Default::default()
+    };
+    // Pass &str — stored internally as String.
+    assert_eq!(with_str(&a, "val"), "val=42");
+    // Same string: cache hit.
+    assert_eq!(with_str(&a, "val"), "val=42");
+    // Different string: recomputes.
+    assert_eq!(with_str(&a, "new"), "new=42");
+    // Back to the first string: recomputes (single slot, old was overwritten).
+    assert_eq!(with_str(&a, "val"), "val=42");
+}
+
+#[test]
+fn value_ref_bytes() {
+    let a = MixedAtom {
+        base: 10,
+        ..Default::default()
+    };
+    assert_eq!(with_bytes(&a, &[1, 2, 3]), 13);
+    assert_eq!(with_bytes(&a, &[1, 2, 3]), 13); // hit
+    assert_eq!(with_bytes(&a, &[1, 2, 3, 4]), 14); // different bytes
+}
+
+#[test]
+fn value_ref_with_owned_string() {
+    // Users can also pass owned types that coerce via AutoRef.
+    let a = MixedAtom {
+        base: 1,
+        ..Default::default()
+    };
+    let s: String = "hello".into();
+    assert_eq!(with_str(&a, &s), "hello=1");
 }
 
 // ══════════════════════════════════════════════════════════════════════

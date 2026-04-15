@@ -104,6 +104,11 @@ fn generate_input_struct(memo: &MemoInfo) -> TokenStream {
                     let ty: syn::Type = syn::parse_str(ty_tokens).expect("value type should parse");
                     quote! { #name: #ty }
                 }
+                MemoParamKind::ValueRef { referent_tokens } => {
+                    let referent: syn::Type =
+                        syn::parse_str(referent_tokens).expect("referent type should parse");
+                    quote! { #name: <#referent as ::std::borrow::ToOwned>::Owned }
+                }
             }
         })
         .collect();
@@ -142,6 +147,11 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                     let ty: syn::Type = syn::parse_str(ty_tokens).expect("value type should parse");
                     quote! { #pname: #ty }
                 }
+                MemoParamKind::ValueRef { referent_tokens } => {
+                    let referent: syn::Type =
+                        syn::parse_str(referent_tokens).expect("referent type should parse");
+                    quote! { #pname: &#referent }
+                }
             }
         })
         .collect();
@@ -175,6 +185,11 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                     let ty: syn::Type = syn::parse_str(ty_tokens).expect("value type should parse");
                     quote! { #pname: #ty }
                 }
+                MemoParamKind::ValueRef { referent_tokens } => {
+                    let referent: syn::Type =
+                        syn::parse_str(referent_tokens).expect("referent type should parse");
+                    quote! { #pname: &#referent }
+                }
             }
         })
         .collect();
@@ -200,6 +215,9 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                     quote! { let #pname: _ = #pname.into(); }
                 }
                 MemoParamKind::Value { .. } => {
+                    quote! {}
+                }
+                MemoParamKind::ValueRef { .. } => {
                     quote! {}
                 }
             }
@@ -239,6 +257,11 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                 MemoParamKind::Value { .. } => {
                     quote! { #pname == __prev.#field }
                 }
+                MemoParamKind::ValueRef { .. } => {
+                    // &T vs <T as ToOwned>::Owned: relies on PartialEq impls
+                    // between them (e.g. `&str == String`, `&[u8] == Vec<u8>`).
+                    quote! { #pname == __prev.#field }
+                }
             }
         })
         .collect();
@@ -274,6 +297,12 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                 MemoParamKind::Value { .. } => {
                     quote! { #field: #pname }
                 }
+                MemoParamKind::ValueRef { referent_tokens } => {
+                    // Store the owned form via ToOwned::to_owned(&T) → T::Owned.
+                    let referent: syn::Type =
+                        syn::parse_str(referent_tokens).expect("referent type should parse");
+                    quote! { #field: <#referent as ::std::borrow::ToOwned>::to_owned(#pname) }
+                }
             }
         })
         .collect();
@@ -296,6 +325,11 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                     // Clone to pass to compute; the original is moved into the
                     // snapshot below.
                     quote! { #pname.clone() }
+                }
+                MemoParamKind::ValueRef { .. } => {
+                    // Pass the reference through directly; no clone needed
+                    // for the compute call.
+                    quote! { #pname }
                 }
             }
         })
@@ -394,6 +428,17 @@ fn build_memo_info(
                     },
                 });
             }
+            MemoParam::ValueRef {
+                param_name,
+                referent_tokens,
+            } => {
+                params.push(MemoParamLocal {
+                    param_name: param_name.clone(),
+                    kind: MemoParamKind::ValueRef {
+                        referent_tokens: referent_tokens.clone(),
+                    },
+                });
+            }
         }
     }
 
@@ -435,6 +480,10 @@ enum MemoParamKind {
     },
     Value {
         ty_tokens: String,
+    },
+    ValueRef {
+        /// Token string for the referent type (e.g. "str", "[u8]").
+        referent_tokens: String,
     },
 }
 
