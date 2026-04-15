@@ -179,6 +179,31 @@ If any of the lens field comparisons fail, the memo recomputes. Two lenses from
 the same atom (`fn foo(a: &LensA, b: &LensB)` called as `foo(&app, &app)`)
 works too.
 
+## Value parameters
+
+Memos can also take owned values or borrowed references to types like
+`&str` or `&[u8]` alongside lens parameters. Values participate in the
+cache key just like lens fields — any change triggers a recompute.
+
+```rust
+#[drv::memo]
+fn labeled(lens: &CountLens, label: &str, multiplier: u32) -> String {
+    format!("{}={}", label, *lens.count * multiplier)
+}
+```
+
+Parameter classification:
+
+- `&Lens` or `&Atom` — a lens parameter (required: at least one lens).
+- Owned types (`u32`, `String`, `MyStruct`) — stored via `Clone`.
+- Borrowed types with `ToOwned` (`&str`, `&[u8]`, `&Path`, ...) — stored
+  as `<T as ToOwned>::Owned` (so `&str` stores as `String`).
+
+Value types must implement `PartialEq + Clone + Send + 'static`; borrowed
+value types must satisfy `T: ToOwned` with the owned form matching the
+usual bounds. Declared order is preserved at the call site; the cache is
+always stored on the first lens parameter's atom.
+
 ## Chaining
 
 A memo's output can feed into another memo. Mark the output type as an atom too.
@@ -298,9 +323,12 @@ Two kinds of costs matter on the hot path:
 1. Per-field `PartialEq` cost.
 2. Output `Clone` cost.
 
-For `PartialEq`, the field type matters (scalars are free, `imbl` is
-O(log n), plain `Vec`/`HashMap` is O(n)). For output `Clone`, the output
-type matters — wrap expensive outputs in `Rc`/`Arc` for O(1) cloning.
+For `PartialEq`, the field type matters. Scalars are free. Collections
+(both `Vec`/`HashMap` and `imbl::Vector`/`imbl::HashMap`) iterate and
+compare pairwise — O(n) worst case on a cache hit. `imbl` does not
+short-circuit via pointer equality; its advantage is O(1) `Clone` on
+cache miss, not faster comparison. For output `Clone`, wrap expensive
+outputs in `Rc`/`Arc` for O(1) cloning.
 
 **Principle:** choose types where `PartialEq` is proportional to the amount of
 change, not the total size of the data.
@@ -322,24 +350,39 @@ entire map on every access — O(n). Every memoized call pays full traversal
 cost, defeating the point.
 
 [imbl](https://docs.rs/imbl) provides **persistent** (structurally-shared)
-collections:
+collections. Its main advantage for memoization is that **`Clone` is
+O(1)** — cache-miss snapshots are nearly free regardless of size. Its
+`PartialEq`, however, is implemented by iterating and comparing elements
+pairwise (just like `Vec`/`HashMap`), with no pointer-equality
+short-circuit — so cache-hit comparison is O(n) regardless of whether
+nothing, some, or everything changed.
 
 | Type | Clone | PartialEq | Mutation |
 |------|-------|-----------|---------|
 | `Vec<T>` | O(n) | O(n) | O(1) amortized |
 | `HashMap<K,V>` | O(n) | O(n) | O(1) amortized |
-| `imbl::Vector<T>` | **O(1)** | **O(log n)** | O(log n) |
-| `imbl::HashMap<K,V>` | **O(1)** | **O(log n)** | O(log n) |
+| `imbl::Vector<T>` | **O(1)** | O(n) | O(log n) |
+| `imbl::HashMap<K,V>` | **O(1)** | O(n) | O(log n) |
 
-- **Clone is O(1)**: bumps a reference count on the root node.
-- **PartialEq is O(log n) between related versions**: walks the tree,
-  short-circuits on pointer-equal subtrees. Unchanged collections compare
-  in O(1).
-- **Mutation is O(log n)**: the trade-off. For typical sizes, negligible.
+For both kinds of collection, `==` short-circuits on the first differing
+element, so returning `false` is often faster than returning `true`.
 
-Think of `imbl` collections as git commits: each version shares most of its
-structure with the previous one. Comparing two close versions is cheap because
-most of the tree is literally the same memory.
+- **Clone is O(1) for `imbl`**: bumps a reference count on the root node.
+  This makes snapshot creation on cache miss nearly free.
+- **PartialEq walks elements pairwise for both `imbl` and std**: no
+  structural-sharing optimization happens in `==`. The comparison is
+  O(position of first difference) on miss, O(n) on a confirmed hit.
+- **Mutation is O(log n) for `imbl`**: the trade-off. For typical sizes,
+  negligible.
+
+**Practical upshot:** use `imbl` when you expect frequent cache misses
+(so snapshot cost matters) or when your atom's collection is modified
+often (so `Clone`-on-write under interior mutation matters). For atoms
+where the collection changes rarely, `Vec`/`HashMap` are often fine.
+
+If you need truly O(1) comparison on unchanged collections, wrap the
+field in `Arc<T>` and compare via `Arc::ptr_eq` in a custom `PartialEq`
+wrapper — `drv` does not provide this out of the box.
 
 ### Rule of thumb
 
@@ -358,8 +401,8 @@ pub struct AppState {
     pub viewport_rows: u32,               // scalar — trivial
     pub show_sidebar: bool,               // scalar — trivial
 
-    pub tabs: Vector<String>,             // persistent — O(1) clone, O(log n) eq
-    pub buffers: HashMap<String, Buffer>, // persistent — O(1) clone, O(log n) eq
+    pub tabs: Vector<String>,             // persistent — O(1) clone, O(n) eq
+    pub buffers: HashMap<String, Buffer>, // persistent — O(1) clone, O(n) eq
 }
 ```
 

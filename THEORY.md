@@ -130,14 +130,22 @@ For collections, comparison cost depends on the collection type:
 - `Vec<T>`, `HashMap<K,V>`: comparison is O(n). This is correct but
   potentially expensive for large collections.
 
-- `imbl::Vector<T>`, `imbl::HashMap<K,V>`: comparison is O(log n) between
-  structurally related versions. These persistent data structures share
-  internal nodes via reference counting. Two versions derived from the same
-  original share most of their structure. Comparison walks only the subtrees
-  that differ.
+- `imbl::Vector<T>`, `imbl::HashMap<K,V>`: `PartialEq` iterates elements
+  pairwise (just like `Vec`/`HashMap`) and does *not* short-circuit via
+  pointer equality. Cost is O(n) on a cache hit, O(position of first
+  difference) on a miss. The structural-sharing advantage of `imbl` applies
+  to `Clone` (O(1), refcount bump on the root) and mutation (O(log n)), not
+  to equality.
 
-  Clone is O(1) (reference count bump on the root node), so constructing a
-  lens from an atom is also cheap.
+  So `imbl`'s advantage for memoization is primarily that snapshot creation
+  on cache miss is cheap. The cache-hit comparison cost is the same order
+  as with `Vec`/`HashMap`.
+
+  `imbl::Vector` also exposes a separate `ptr_eq` method that checks whether
+  two values share the same root node — explicit pointer equality — but this
+  is not used by `==`. Users who want constant-time cache-hit comparison on
+  large collections would need to wrap the field in a newtype that uses
+  `ptr_eq` inside its `PartialEq`.
 
 The recommendation: use `imbl` collections for any collection field in an
 atom. Scalar fields need no special treatment.
@@ -178,8 +186,10 @@ call memo(&atom)
 ```
 
 The fast path does no heap allocation at all. The comparison is field-by-field
-`PartialEq`. For `imbl` collections, this may short-circuit on pointer-equal
-subtrees, making the comparison sublinear.
+`PartialEq`. Collection fields (both `Vec`/`HashMap` and `imbl::Vector`/
+`imbl::HashMap`) compare element-by-element — O(n) worst case on a hit,
+O(position of first difference) on a miss. `imbl`'s structural sharing does
+not accelerate `==`; it accelerates `Clone` (O(1)) and mutation (O(log n)).
 
 The user's compute function runs **without holding any borrow on the cache**.
 This is important for reentrancy: a memo body can safely call another memo on
@@ -195,13 +205,61 @@ returns are appropriate, or wrap the output in `Rc`/`Arc` for cheap cloning.
 ### Multi-lens memos
 
 When a memo takes multiple lens parameters, the cache lives in the first
-parameter's atom. The stored input is a tuple of owned snapshots, one per
-lens. On each call, every lens is compared against its stored snapshot;
-if any differ, the memo recomputes.
+lens's atom. The stored input is a single struct (`__Drv{MemoName}Input`)
+holding an owned snapshot per lens. On each call, every lens is compared
+against its stored snapshot; if any differ, the memo recomputes.
 
 This handles two cases uniformly:
 - Lenses from different atoms (e.g., `fn header(tabs: &TabsLens, user: &UserLens)`)
 - Multiple lenses from the same atom (e.g., `fn foo(a: &LensA, b: &LensB)` called as `foo(&app, &app)`)
+
+### Value parameters
+
+Memos can mix lens parameters with owned value parameters:
+
+```rust
+#[drv::memo]
+fn compute(lens: &MyLens, thing: usize, other: String) -> Output { ... }
+```
+
+Value parameters participate in the cache key just like lens fields — the
+snapshot struct holds them alongside the lens snapshots, each compared by
+`PartialEq` on every call. Declared order is preserved; the cache location
+is still pinned to the first lens parameter's atom, regardless of whether
+value params come before or after it.
+
+Requirements on value types: `PartialEq + Clone + Send + 'static`. They are
+cloned into storage on cache miss.
+
+### Reference value parameters (`&str`, `&[u8]`, ...)
+
+Non-lens reference parameters (e.g., `&str`, `&[u8]`, `&Path`) are stored via
+[`ToOwned`](https://doc.rust-lang.org/std/borrow/trait.ToOwned.html): the
+storage type is `<T as ToOwned>::Owned`, the store operation is
+`<T as ToOwned>::to_owned(param)`, and comparison happens between the borrow
+(e.g., `&str`) and the owned form (`String`) via standard `PartialEq` impls.
+
+Classification in the macro:
+- `&Ident` where `Ident` names a known lens or atom → lens parameter.
+- `&Ident` where `Ident` is *not* a known lens or atom → promoted to a
+  reference value parameter (this is what lets `foo: &str` work; `str` isn't
+  a registered lens, so it falls through to `ToOwned`).
+- `&NonIdent` (like `&[u8]`, `&dyn Trait`) → reference value parameter directly.
+- Non-reference types → owned value parameter.
+
+To catch typos early (e.g., `foo: &MyLen` meant as `&MyLens`), the memo macro
+emits a compile-time assertion at the function's definition site:
+
+```rust
+const _: fn() = || {
+    fn __drv_assert_to_owned<T: ?Sized + ::std::borrow::ToOwned>() {}
+    __drv_assert_to_owned::<MyLen>();
+};
+```
+
+If `MyLen` doesn't exist, the error (`cannot find type 'MyLen' in this scope`)
+points at the user's parameter — not at generated code. If it exists but
+doesn't implement `ToOwned`, the trait-bound error points at the same place.
 
 ## Chaining and transitive memoization
 
@@ -249,17 +307,43 @@ each atom:
 
 ```rust
 // Generated by drv::assemble!()
+
+// Per-memo input snapshot (fields for each declared parameter, in order).
+#[derive(Default)]
+pub struct __DrvVisibleLinesInput {
+    lens: __DrvVisibleLens,
+}
+
+#[derive(Default)]
+pub struct __DrvStatusBarInput {
+    lens: __DrvStatusBarLens,
+}
+
+// Per-atom state: one (input, output) pair per memo targeting the atom.
 #[derive(Default)]
 pub struct __DrvEditorState {
-    visible_lines_input: Option<__DrvVisibleLens>,
+    visible_lines_input: Option<__DrvVisibleLinesInput>,
     visible_lines_output: Option<Vec<String>>,
-    status_bar_input: Option<__DrvStatusBarLens>,
+    status_bar_input: Option<__DrvStatusBarInput>,
     status_bar_output: Option<StatusBar>,
     // ... one pair per memo targeting Editor
 }
 
 impl drv::Atom for Editor {
     type State = __DrvEditorState;
+}
+```
+
+For a memo with mixed parameters like
+`fn compute(lens: &MyLens, thing: usize, prefix: &str) -> Output`,
+the input struct carries one field per declared parameter:
+
+```rust
+#[derive(Default)]
+pub struct __DrvComputeInput {
+    lens: __DrvMyLens,
+    thing: usize,
+    prefix: <str as ::std::borrow::ToOwned>::Owned,  // = String
 }
 ```
 
