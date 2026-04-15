@@ -242,6 +242,28 @@ fn summary_label_full(s: &ItemsSummary) -> String {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 9. REENTRANCY — a memo body calling another memo on the same atom
+//    should panic at RefCell::borrow_mut() on the inner call.
+// ══════════════════════════════════════════════════════════════════════
+
+#[drv::atom]
+pub struct Reentrant {
+    pub value: u32,
+}
+
+#[drv::memo]
+fn inner_memo(r: &Reentrant) -> u32 {
+    r.value * 2
+}
+
+#[drv::memo]
+fn outer_memo(r: &Reentrant) -> u32 {
+    // Reentrant: while outer_memo holds the RefMut on r.__drv, we call
+    // inner_memo which also tries to borrow_mut the same RefCell.
+    inner_memo(r) + 1
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ASSEMBLE — must come after all declarations
 // ══════════════════════════════════════════════════════════════════════
 
@@ -602,6 +624,21 @@ fn atom_as_memo_input() {
 
     s.current = "world".into();
     assert_eq!(summary_label_full(&s), "10: world");
+}
+
+#[test]
+fn reentrant_memo_is_safe() {
+    // A memo body that calls another memo on the same atom must not panic.
+    // The generated code releases the RefCell borrow before invoking the
+    // user's compute, so reentrant memo calls are safe.
+    let r = Reentrant {
+        value: 5,
+        ..Default::default()
+    };
+    // outer = inner(r) + 1 = (5 * 2) + 1 = 11
+    assert_eq!(outer_memo(&r), 11);
+    // Second call hits cache.
+    assert_eq!(outer_memo(&r), 11);
 }
 
 // ══════════════════════════════════════════════════════════════════════

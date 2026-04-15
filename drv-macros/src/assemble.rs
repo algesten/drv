@@ -283,16 +283,29 @@ fn generate_memo_fn(
 
             #(#conversions)*
 
-            let mut __state = ::core::cell::RefCell::borrow_mut(&#cache_expr.inner);
+            // Short shared borrow to check cache hit. If fresh, return a clone
+            // of the cached output and release the borrow before returning.
+            {
+                let __state = ::core::cell::RefCell::borrow(&#cache_expr.inner);
+                if __state.#input_field.as_ref().is_some_and(|#fresh_pattern| #fresh_check) {
+                    return <#output_ty as ::core::clone::Clone>::clone(
+                        __state.#output_field.as_ref().unwrap()
+                    );
+                }
+            }
 
-            let __fresh = __state.#input_field.as_ref().is_some_and(|#fresh_pattern| #fresh_check);
+            // Cache miss: compute with NO borrow held — reentrant memo calls
+            // on the same atom (even the same memo) are safe.
+            let __out = __compute(#(#compute_args),*);
 
-            if !__fresh {
-                let __out = __compute(#(#compute_args),*);
-                __state.#output_field = Some(__out);
+            // Short exclusive borrow to store the new snapshot + output.
+            {
+                let mut __state = ::core::cell::RefCell::borrow_mut(&#cache_expr.inner);
+                __state.#output_field = Some(<#output_ty as ::core::clone::Clone>::clone(&__out));
                 __state.#input_field = Some(#snapshot_build);
             }
-            <#output_ty as ::core::clone::Clone>::clone(__state.#output_field.as_ref().unwrap())
+
+            __out
         }
     }
 }

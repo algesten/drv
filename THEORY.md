@@ -165,19 +165,27 @@ The evaluation flow:
 ```
 call memo(&atom)
   → convert &atom into the lens (auto via Into)
-  → borrow atom.__drv mutably
+  → take a short shared borrow of atom.__drv
   → compare each lens field against the cached snapshot
-    → all equal: clone and return the cached output (FAST PATH)
-    → any differ:
-        → run the memo function with the new lens
+    → all equal: clone the cached output, DROP the borrow, return it (FAST PATH)
+    → any differ: drop the borrow
+        → run the memo function with the new lens  [no borrow held]
+        → take a short exclusive borrow of atom.__drv
         → clone the lens fields into an owned snapshot
-        → store new snapshot + output in the cache
-        → clone and return the new output
+        → clone the output into storage
+        → drop the borrow
+        → return the computed output
 ```
 
 The fast path does no heap allocation at all. The comparison is field-by-field
 `PartialEq`. For `imbl` collections, this may short-circuit on pointer-equal
 subtrees, making the comparison sublinear.
+
+The user's compute function runs **without holding any borrow on the cache**.
+This is important for reentrancy: a memo body can safely call another memo on
+the same atom without triggering a `RefCell` double-borrow panic. The memo can
+even call itself indirectly (through another memo) — each call scopes its own
+short borrow around the cache check and the cache write.
 
 The return value is returned by value (`Clone::clone` of the cached output).
 For cheap types (`usize`, `String`, `imbl` collections), this is effectively
@@ -264,8 +272,12 @@ across threads.
 No heap allocation, no type erasure, no `Box`. The state struct is inlined
 directly into the atom. Access cost on the hot path:
 
-- `RefCell::borrow_mut()` — a single atomic-like flag check
+- `RefCell::borrow()` — a single atomic-like flag check
 - Direct field access into `A::State` — known offset, no downcast
+
+On cache miss, one additional `RefCell::borrow_mut()` is taken (after the user's
+compute function returns) to store the new snapshot. The borrow is never held
+across user code.
 
 No `HashMap` lookup, no `TypeId` compare, no subscription table, no graph
 traversal.
