@@ -173,7 +173,8 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
         output.extend(quote! {
             impl PartialEq for #struct_name {
                 fn eq(&self, other: &Self) -> bool {
-                    #(self.#f1 == other.#f2)&&*
+                    use ::drv::FastEqFallback as _;
+                    #(::drv::FastEq(&self.#f1).fast_eq(&other.#f2))&&*
                 }
             }
         });
@@ -272,7 +273,8 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
         output.extend(quote! {
             impl ::core::cmp::PartialEq<#snapshot_ident> for #struct_name {
                 fn eq(&self, other: &#snapshot_ident) -> bool {
-                    #(self.#fe1 == other.#fe2)&&*
+                    use ::drv::FastEqFallback as _;
+                    #(::drv::FastEq(&self.#fe1).fast_eq(&other.#fe2))&&*
                 }
             }
         });
@@ -338,7 +340,8 @@ pub(crate) fn generate_lens_types(
         // Cross-type PartialEq: lens (refs) vs owned snapshot.
         impl<'drv> ::core::cmp::PartialEq<#snapshot_ident> for #lens_ident<'drv> {
             fn eq(&self, other: &#snapshot_ident) -> bool {
-                #(*self.#fn3 == other.#fn4)&&*
+                use ::drv::FastEqFallback as _;
+                #(::drv::FastEq(self.#fn3).fast_eq(&other.#fn4))&&*
             }
         }
 

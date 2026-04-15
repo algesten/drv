@@ -303,6 +303,29 @@ fn with_bytes(lens: &BaseLens, bytes: &[u8]) -> usize {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 11. FastEq ptr_eq — Arc<T> field should short-circuit equality via
+//     Arc::ptr_eq, so cloning the atom and calling the memo again hits
+//     the fast path even when T: !PartialEq would otherwise be O(n).
+// ══════════════════════════════════════════════════════════════════════
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+#[drv::atom]
+pub struct ArcAtom {
+    #[drv::lens(ArcLens)]
+    pub data: Arc<Vec<u32>>,
+}
+
+static ARC_MEMO_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo]
+fn arc_sum(lens: &ArcLens) -> u32 {
+    ARC_MEMO_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    lens.data.iter().sum()
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ASSEMBLE — must come after all declarations
 // ══════════════════════════════════════════════════════════════════════
 
@@ -787,4 +810,43 @@ fn atoms_are_send() {
     assert_send::<Counter>();
     assert_send::<AppState>();
     assert_send::<ItemsSummary>();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// FastEq ptr_eq fast path (Arc)
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn arc_ptr_eq_fast_path() {
+    ARC_MEMO_COMPUTES.store(0, Ordering::SeqCst);
+
+    let data = Arc::new(vec![1u32, 2, 3, 4, 5]);
+    let mut a = ArcAtom {
+        data: data.clone(),
+        ..Default::default()
+    };
+    assert_eq!(arc_sum(&a), 15);
+    assert_eq!(ARC_MEMO_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Identical Arc — should hit the cache (trivially).
+    assert_eq!(arc_sum(&a), 15);
+    assert_eq!(ARC_MEMO_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Replace with a *different* Arc that has *identical* contents.
+    // The generic PartialEq would still see equality (O(n)), and the
+    // ptr_eq short-circuit is an optimisation — both paths must skip recompute.
+    a.data = Arc::new(vec![1u32, 2, 3, 4, 5]);
+    assert_eq!(arc_sum(&a), 15);
+    assert_eq!(ARC_MEMO_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Contents differ — must recompute.
+    a.data = Arc::new(vec![1u32, 2, 3, 4, 5, 6]);
+    assert_eq!(arc_sum(&a), 21);
+    assert_eq!(ARC_MEMO_COMPUTES.load(Ordering::SeqCst), 2);
+
+    // Same Arc pointer as the most recent snapshot — ptr_eq wins, no recompute.
+    let p = a.data.clone();
+    a.data = p;
+    assert_eq!(arc_sum(&a), 21);
+    assert_eq!(ARC_MEMO_COMPUTES.load(Ordering::SeqCst), 2);
 }

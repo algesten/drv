@@ -357,32 +357,47 @@ pairwise (just like `Vec`/`HashMap`), with no pointer-equality
 short-circuit — so cache-hit comparison is O(n) regardless of whether
 nothing, some, or everything changed.
 
-| Type | Clone | PartialEq | Mutation |
-|------|-------|-----------|---------|
-| `Vec<T>` | O(n) | O(n) | O(1) amortized |
-| `HashMap<K,V>` | O(n) | O(n) | O(1) amortized |
-| `imbl::Vector<T>` | **O(1)** | O(n) | O(log n) |
-| `imbl::HashMap<K,V>` | **O(1)** | O(n) | O(log n) |
+| Type | Clone | Cache hit (same pointer) | Cache hit (equal contents) | Mutation |
+|------|-------|--------------------------|----------------------------|----------|
+| `Vec<T>` | O(n) | O(n) | O(n) | O(1) amortized |
+| `HashMap<K,V>` | O(n) | O(n) | O(n) | O(1) amortized |
+| `Arc<T>` | **O(1)** | **O(1)** | O(eq of T) | n/a |
+| `imbl::Vector<T>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
+| `imbl::HashMap<K,V>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
+| `rpds::HashTrieMap<K,V>` (`rpds` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
 
-For both kinds of collection, `==` short-circuits on the first differing
-element, so returning `false` is often faster than returning `true`.
+- **Clone is O(1) for `Arc`, `imbl`, and `rpds`**: bumps a reference count
+  on the root node. This makes snapshot creation on cache miss nearly free.
+- **`drv` adds a pointer-equality fast path to the cache check.** When the
+  stored snapshot and the current atom field point at the *same* node,
+  comparison returns in constant time regardless of size. This kicks in
+  automatically for `Arc<T>` and — when the `imbl` / `rpds` features are
+  enabled — for the persistent collections that expose `ptr_eq`. The fast
+  path triggers when the field was cloned (or left untouched) between runs;
+  two independently constructed collections with equal contents fall back
+  to element-wise comparison.
+- **Element-wise comparison short-circuits on the first difference**, so
+  cache *misses* are O(position of first difference); a confirmed hit with
+  no pointer sharing is full O(n).
+- **Mutation is O(log n) for `imbl` and `rpds`**: the trade-off. For
+  typical sizes, negligible.
 
-- **Clone is O(1) for `imbl`**: bumps a reference count on the root node.
-  This makes snapshot creation on cache miss nearly free.
-- **PartialEq walks elements pairwise for both `imbl` and std**: no
-  structural-sharing optimization happens in `==`. The comparison is
-  O(position of first difference) on miss, O(n) on a confirmed hit.
-- **Mutation is O(log n) for `imbl`**: the trade-off. For typical sizes,
-  negligible.
+**Practical upshot:** use `imbl` / `rpds` (or wrap a `Vec`/`HashMap` in
+`Arc`) when you expect large collections to stay put between cache hits —
+the cache check becomes a single pointer compare. For atoms where the
+collection changes every frame, `Vec`/`HashMap` are often fine.
 
-**Practical upshot:** use `imbl` when you expect frequent cache misses
-(so snapshot cost matters) or when your atom's collection is modified
-often (so `Clone`-on-write under interior mutation matters). For atoms
-where the collection changes rarely, `Vec`/`HashMap` are often fine.
+### Enabling the fast path for `imbl` and `rpds`
 
-If you need truly O(1) comparison on unchanged collections, wrap the
-field in `Arc<T>` and compare via `Arc::ptr_eq` in a custom `PartialEq`
-wrapper — `drv` does not provide this out of the box.
+The pointer-equality fast path for persistent collections is opt-in via
+Cargo features:
+
+```toml
+[dependencies]
+drv = { version = "0.1", features = ["imbl", "rpds"] }
+```
+
+`Arc<T>` works without any feature flag.
 
 ### Rule of thumb
 
@@ -452,3 +467,5 @@ drv::assemble!();
   setup — just call the memo.
 - **Free functions, not methods.** Memos are ordinary functions. Call sites
   don't need to know any generated type names.
+
+License: MIT OR Apache-2.0

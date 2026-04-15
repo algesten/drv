@@ -255,7 +255,11 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                     quote! { #pname == __prev.#field }
                 }
                 MemoParamKind::Value { .. } => {
-                    quote! { #pname == __prev.#field }
+                    // FastEq enables ptr_eq short-circuit for Arc/Rc/imbl/rpds.
+                    quote! { {
+                        use ::drv::FastEqFallback as _;
+                        ::drv::FastEq(&#pname).fast_eq(&__prev.#field)
+                    } }
                 }
                 MemoParamKind::ValueRef { .. } => {
                     // &T vs <T as ToOwned>::Owned: relies on PartialEq impls

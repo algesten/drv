@@ -397,32 +397,47 @@
 //! short-circuit — so cache-hit comparison is O(n) regardless of whether
 //! nothing, some, or everything changed.
 //!
-//! | Type | Clone | PartialEq | Mutation |
-//! |------|-------|-----------|---------|
-//! | `Vec<T>` | O(n) | O(n) | O(1) amortized |
-//! | `HashMap<K,V>` | O(n) | O(n) | O(1) amortized |
-//! | `imbl::Vector<T>` | **O(1)** | O(n) | O(log n) |
-//! | `imbl::HashMap<K,V>` | **O(1)** | O(n) | O(log n) |
+//! | Type | Clone | Cache hit (same pointer) | Cache hit (equal contents) | Mutation |
+//! |------|-------|--------------------------|----------------------------|----------|
+//! | `Vec<T>` | O(n) | O(n) | O(n) | O(1) amortized |
+//! | `HashMap<K,V>` | O(n) | O(n) | O(n) | O(1) amortized |
+//! | `Arc<T>` | **O(1)** | **O(1)** | O(eq of T) | n/a |
+//! | `imbl::Vector<T>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
+//! | `imbl::HashMap<K,V>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
+//! | `rpds::HashTrieMap<K,V>` (`rpds` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
 //!
-//! For both kinds of collection, `==` short-circuits on the first differing
-//! element, so returning `false` is often faster than returning `true`.
+//! - **Clone is O(1) for `Arc`, `imbl`, and `rpds`**: bumps a reference count
+//!   on the root node. This makes snapshot creation on cache miss nearly free.
+//! - **`drv` adds a pointer-equality fast path to the cache check.** When the
+//!   stored snapshot and the current atom field point at the *same* node,
+//!   comparison returns in constant time regardless of size. This kicks in
+//!   automatically for `Arc<T>` and — when the `imbl` / `rpds` features are
+//!   enabled — for the persistent collections that expose `ptr_eq`. The fast
+//!   path triggers when the field was cloned (or left untouched) between runs;
+//!   two independently constructed collections with equal contents fall back
+//!   to element-wise comparison.
+//! - **Element-wise comparison short-circuits on the first difference**, so
+//!   cache *misses* are O(position of first difference); a confirmed hit with
+//!   no pointer sharing is full O(n).
+//! - **Mutation is O(log n) for `imbl` and `rpds`**: the trade-off. For
+//!   typical sizes, negligible.
 //!
-//! - **Clone is O(1) for `imbl`**: bumps a reference count on the root node.
-//!   This makes snapshot creation on cache miss nearly free.
-//! - **PartialEq walks elements pairwise for both `imbl` and std**: no
-//!   structural-sharing optimization happens in `==`. The comparison is
-//!   O(position of first difference) on miss, O(n) on a confirmed hit.
-//! - **Mutation is O(log n) for `imbl`**: the trade-off. For typical sizes,
-//!   negligible.
+//! **Practical upshot:** use `imbl` / `rpds` (or wrap a `Vec`/`HashMap` in
+//! `Arc`) when you expect large collections to stay put between cache hits —
+//! the cache check becomes a single pointer compare. For atoms where the
+//! collection changes every frame, `Vec`/`HashMap` are often fine.
 //!
-//! **Practical upshot:** use `imbl` when you expect frequent cache misses
-//! (so snapshot cost matters) or when your atom's collection is modified
-//! often (so `Clone`-on-write under interior mutation matters). For atoms
-//! where the collection changes rarely, `Vec`/`HashMap` are often fine.
+//! ## Enabling the fast path for `imbl` and `rpds`
 //!
-//! If you need truly O(1) comparison on unchanged collections, wrap the
-//! field in `Arc<T>` and compare via `Arc::ptr_eq` in a custom `PartialEq`
-//! wrapper — `drv` does not provide this out of the box.
+//! The pointer-equality fast path for persistent collections is opt-in via
+//! Cargo features:
+//!
+//! ```toml
+//! [dependencies]
+//! drv = { version = "0.1", features = ["imbl", "rpds"] }
+//! ```
+//!
+//! `Arc<T>` works without any feature flag.
 //!
 //! ## Rule of thumb
 //!
@@ -570,6 +585,135 @@ impl<A: Atom> PartialOrd for Cache<A> {
 impl<A: Atom> Ord for Cache<A> {
     fn cmp(&self, _: &Self) -> std::cmp::Ordering {
         std::cmp::Ordering::Equal
+    }
+}
+
+/// Internal helper used by generated code to pick between a pointer-equality
+/// fast path (for `Arc<T>` and, under the `imbl` / `rpds` features,
+/// persistent collections that expose `ptr_eq`) and the regular `PartialEq`
+/// path. Not intended for direct use — `drv` wires this into `#[drv::atom]`
+/// and `#[drv::memo]` automatically.
+#[doc(hidden)]
+pub struct FastEq<'a, T: ?Sized>(pub &'a T);
+
+/// Fallback trait for [`FastEq::fast_eq`]. Exists so generated code can call
+/// `fast_eq` uniformly regardless of whether `T` has a specialized inherent
+/// impl. Not intended for direct use.
+#[doc(hidden)]
+pub trait FastEqFallback<T: ?Sized> {
+    fn fast_eq(&self, other: &T) -> bool;
+}
+
+impl<T: PartialEq + ?Sized> FastEqFallback<T> for FastEq<'_, T> {
+    fn fast_eq(&self, other: &T) -> bool {
+        self.0 == other
+    }
+}
+
+// Arc<T>: always available, std.
+impl<T: PartialEq + ?Sized> FastEq<'_, std::sync::Arc<T>> {
+    pub fn fast_eq(&self, other: &std::sync::Arc<T>) -> bool {
+        std::sync::Arc::ptr_eq(self.0, other) || **self.0 == **other
+    }
+}
+
+// imbl collections: behind `feature = "imbl"`.
+#[cfg(feature = "imbl")]
+mod fasteq_imbl {
+    use super::FastEq;
+    use std::hash::{BuildHasher, Hash};
+
+    use imbl::shared_ptr::SharedPointerKind;
+    use imbl::{GenericHashMap, GenericHashSet, GenericVector};
+
+    impl<T: PartialEq + Clone, P: SharedPointerKind> FastEq<'_, GenericVector<T, P>> {
+        pub fn fast_eq(&self, other: &GenericVector<T, P>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
+    }
+
+    impl<K, V, S, P> FastEq<'_, GenericHashMap<K, V, S, P>>
+    where
+        K: Hash + Eq + Clone,
+        V: PartialEq + Clone,
+        S: BuildHasher + Clone,
+        P: SharedPointerKind,
+    {
+        pub fn fast_eq(&self, other: &GenericHashMap<K, V, S, P>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
+    }
+
+    impl<K, V> FastEq<'_, imbl::OrdMap<K, V>>
+    where
+        K: Ord + Clone,
+        V: PartialEq + Clone,
+    {
+        pub fn fast_eq(&self, other: &imbl::OrdMap<K, V>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
+    }
+
+    impl<T, S, P> FastEq<'_, GenericHashSet<T, S, P>>
+    where
+        T: Hash + Eq + Clone,
+        S: BuildHasher + Clone,
+        P: SharedPointerKind,
+    {
+        pub fn fast_eq(&self, other: &GenericHashSet<T, S, P>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
+    }
+
+    impl<T: Ord + Clone> FastEq<'_, imbl::OrdSet<T>> {
+        pub fn fast_eq(&self, other: &imbl::OrdSet<T>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
+    }
+}
+
+// rpds collections: behind `feature = "rpds"`.
+//
+// Only the trie/tree-based collections expose `ptr_eq` in rpds 1.x; `rpds::Vector`
+// and `rpds::List` do not, so they fall through to the generic FastEqFallback
+// impl (plain `PartialEq`, O(n)). Users who need O(1) cache-hit comparison on
+// a Vec-like field can wrap it in `Arc<...>` — `FastEq<'_, Arc<T>>` short-circuits
+// via `Arc::ptr_eq`.
+#[cfg(feature = "rpds")]
+mod fasteq_rpds {
+    use super::FastEq;
+    use std::hash::Hash;
+
+    impl<K, V> FastEq<'_, rpds::HashTrieMap<K, V>>
+    where
+        K: Hash + Eq,
+        V: PartialEq,
+    {
+        pub fn fast_eq(&self, other: &rpds::HashTrieMap<K, V>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
+    }
+
+    impl<K, V> FastEq<'_, rpds::RedBlackTreeMap<K, V>>
+    where
+        K: Ord,
+        V: PartialEq,
+    {
+        pub fn fast_eq(&self, other: &rpds::RedBlackTreeMap<K, V>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
+    }
+
+    impl<T: Hash + Eq> FastEq<'_, rpds::HashTrieSet<T>> {
+        pub fn fast_eq(&self, other: &rpds::HashTrieSet<T>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
+    }
+
+    impl<T: Ord> FastEq<'_, rpds::RedBlackTreeSet<T>> {
+        pub fn fast_eq(&self, other: &rpds::RedBlackTreeSet<T>) -> bool {
+            self.0.ptr_eq(other) || self.0 == other
+        }
     }
 }
 
