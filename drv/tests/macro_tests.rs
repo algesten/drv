@@ -264,6 +264,34 @@ fn outer_memo(r: &Reentrant) -> u32 {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 10. MIXED PARAMS — memos taking lens and value parameters together.
+// ══════════════════════════════════════════════════════════════════════
+
+#[drv::atom]
+pub struct MixedAtom {
+    #[drv::lens(BaseLens)]
+    pub base: u32,
+}
+
+// Value param AFTER a lens param.
+#[drv::memo]
+fn with_value_after(lens: &BaseLens, multiplier: u32) -> u32 {
+    *lens.base * multiplier
+}
+
+// Value param BEFORE a lens param — order must be preserved.
+#[drv::memo]
+fn with_value_before(multiplier: u32, lens: &BaseLens) -> u32 {
+    multiplier * *lens.base
+}
+
+// Multiple value params mixed with a lens.
+#[drv::memo]
+fn multi_value(offset: u32, lens: &BaseLens, scale: u32) -> u32 {
+    offset + (*lens.base * scale)
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ASSEMBLE — must come after all declarations
 // ══════════════════════════════════════════════════════════════════════
 
@@ -639,6 +667,59 @@ fn reentrant_memo_is_safe() {
     assert_eq!(outer_memo(&r), 11);
     // Second call hits cache.
     assert_eq!(outer_memo(&r), 11);
+}
+
+// ── Mixed lens + value parameter tests ──
+
+#[test]
+fn mixed_value_after_lens() {
+    let a = MixedAtom {
+        base: 10,
+        ..Default::default()
+    };
+    assert_eq!(with_value_after(&a, 3), 30);
+    // Same multiplier: cache hit.
+    assert_eq!(with_value_after(&a, 3), 30);
+    // Different multiplier: recomputes.
+    assert_eq!(with_value_after(&a, 4), 40);
+}
+
+#[test]
+fn mixed_value_before_lens() {
+    let a = MixedAtom {
+        base: 10,
+        ..Default::default()
+    };
+    assert_eq!(with_value_before(5, &a), 50);
+    // Same call: cache hit.
+    assert_eq!(with_value_before(5, &a), 50);
+    // Different value: recomputes.
+    assert_eq!(with_value_before(7, &a), 70);
+}
+
+#[test]
+fn mixed_multi_value() {
+    let a = MixedAtom {
+        base: 10,
+        ..Default::default()
+    };
+    // offset=1, scale=3: 1 + (10 * 3) = 31
+    assert_eq!(multi_value(1, &a, 3), 31);
+    assert_eq!(multi_value(1, &a, 3), 31); // hit
+    assert_eq!(multi_value(2, &a, 3), 32); // different offset
+    assert_eq!(multi_value(2, &a, 5), 52); // different scale
+}
+
+#[test]
+fn mixed_lens_change_invalidates() {
+    let mut a = MixedAtom {
+        base: 10,
+        ..Default::default()
+    };
+    assert_eq!(with_value_after(&a, 2), 20);
+    // Change the lens's field — cache should invalidate.
+    a.base = 100;
+    assert_eq!(with_value_after(&a, 2), 200);
 }
 
 // ══════════════════════════════════════════════════════════════════════

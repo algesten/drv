@@ -48,16 +48,27 @@ pub struct LensField {
 pub struct MemoRegistration {
     pub fn_name: String,
     pub vis_tokens: String,
-    pub lens_params: Vec<MemoLensParam>,
+    /// Parameters in declared order (mix of lens and value).
+    pub params: Vec<MemoParam>,
     pub output_ty_tokens: String,
     /// The function body tokens (as a string), to be re-parsed by assemble.
     pub body_tokens: String,
 }
 
 #[derive(Clone)]
-pub struct MemoLensParam {
-    pub param_name: String,
-    pub lens_name: String,
+pub enum MemoParam {
+    /// A `&LensName` parameter. Contributes to the cache key via the lens's
+    /// field-by-field comparison.
+    Lens {
+        param_name: String,
+        lens_name: String,
+    },
+    /// An owned value parameter. Contributes to the cache key via PartialEq
+    /// and is stored via Clone.
+    Value {
+        param_name: String,
+        ty_tokens: String,
+    },
 }
 
 impl Registry {
