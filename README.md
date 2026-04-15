@@ -343,19 +343,33 @@ machine instructions. No special consideration needed.
 `String`, `PathBuf`, small `Vec<T>` with a handful of elements — comparison
 is O(n) but n is small. Perfectly fine.
 
-### Large collections: use `imbl`
+### Large collections: use `imbl` (or `rpds`, or `Arc`)
 
 An atom tracking 50 open buffers in a `HashMap<Path, Buffer>` compares the
 entire map on every access — O(n). Every memoized call pays full traversal
 cost, defeating the point.
 
-[imbl](https://docs.rs/imbl) provides **persistent** (structurally-shared)
-collections. Its main advantage for memoization is that **`Clone` is
-O(1)** — cache-miss snapshots are nearly free regardless of size. Its
-`PartialEq`, however, is implemented by iterating and comparing elements
-pairwise (just like `Vec`/`HashMap`), with no pointer-equality
-short-circuit — so cache-hit comparison is O(n) regardless of whether
-nothing, some, or everything changed.
+The fix is a type with **O(1) `Clone` and O(1) equality when the value
+hasn't been mutated**. `drv` recognises three families automatically and
+short-circuits the cache check with a pointer compare:
+
+- **`Arc<T>`** — works out of the box, no feature flag needed.
+- **[`imbl`](https://docs.rs/imbl) persistent collections** — enable the
+  `imbl` feature. Covers `Vector`, `HashMap`, `OrdMap`, `HashSet`, `OrdSet`.
+- **[`rpds`](https://docs.rs/rpds) persistent collections** — enable the
+  `rpds` feature. Covers `HashTrieMap`, `RedBlackTreeMap`, `HashTrieSet`,
+  `RedBlackTreeSet`.
+
+```toml
+[dependencies]
+drv = { version = "0.1", features = ["imbl"] }  # or "rpds", or both
+```
+
+With the feature on, a 10,000-entry `imbl::HashMap` that hasn't been
+touched since the last memo call compares in **constant time**. If it was
+mutated, the check falls back to element-wise `==`, which itself
+short-circuits on the first difference. There is no scenario where you
+pay *more* than plain `Vec`/`HashMap` would.
 
 | Type | Clone | Cache hit (same pointer) | Cache hit (equal contents) | Mutation |
 |------|-------|--------------------------|----------------------------|----------|
@@ -366,44 +380,18 @@ nothing, some, or everything changed.
 | `imbl::HashMap<K,V>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
 | `rpds::HashTrieMap<K,V>` (`rpds` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
 
-- **Clone is O(1) for `Arc`, `imbl`, and `rpds`**: bumps a reference count
-  on the root node. This makes snapshot creation on cache miss nearly free.
-- **`drv` adds a pointer-equality fast path to the cache check.** When the
-  stored snapshot and the current atom field point at the *same* node,
-  comparison returns in constant time regardless of size. This kicks in
-  automatically for `Arc<T>` and — when the `imbl` / `rpds` features are
-  enabled — for the persistent collections that expose `ptr_eq`. The fast
-  path triggers when the field was cloned (or left untouched) between runs;
-  two independently constructed collections with equal contents fall back
-  to element-wise comparison.
-- **Element-wise comparison short-circuits on the first difference**, so
-  cache *misses* are O(position of first difference); a confirmed hit with
-  no pointer sharing is full O(n).
-- **Mutation is O(log n) for `imbl` and `rpds`**: the trade-off. For
-  typical sizes, negligible.
-
-**Practical upshot:** use `imbl` / `rpds` (or wrap a `Vec`/`HashMap` in
-`Arc`) when you expect large collections to stay put between cache hits —
-the cache check becomes a single pointer compare. For atoms where the
-collection changes every frame, `Vec`/`HashMap` are often fine.
-
-### Enabling the fast path for `imbl` and `rpds`
-
-The pointer-equality fast path for persistent collections is opt-in via
-Cargo features:
-
-```toml
-[dependencies]
-drv = { version = "0.1", features = ["imbl", "rpds"] }
-```
-
-`Arc<T>` works without any feature flag.
+*"Same pointer"* is the common case: the atom cloned its field into the
+snapshot on the last cache miss, and nothing has mutated it since — so the
+two point at the same underlying node. *"Equal contents"* is the worst case,
+when the collection was rebuilt from scratch but happens to compare equal.
 
 ### Rule of thumb
 
 - **< 50 elements?** `Vec`/`HashMap` are fine.
-- **50+ or expensive-to-compare elements?** Use `imbl`.
-- **Deeply nested?** Flatten into the atom, or wrap the outer collection in `imbl`.
+- **50+ or expensive-to-compare elements?** Use `imbl` or `rpds` with the
+  matching feature flag — you get O(1) cache-hit comparison for free.
+- **Single large blob of data you never mutate piece-wise?** Wrap it in
+  `Arc<T>`; `drv` uses `Arc::ptr_eq` automatically.
 
 ### Example
 
