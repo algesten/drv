@@ -255,7 +255,7 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                     quote! { #pname == __prev.#field }
                 }
                 MemoParamKind::Value { .. } => {
-                    // FastEq enables ptr_eq short-circuit for Arc/Rc/imbl/rpds.
+                    // FastEq enables ptr_eq short-circuit for Arc and imbl.
                     quote! { {
                         use ::drv::FastEqFallback as _;
                         ::drv::FastEq(&#pname).fast_eq(&__prev.#field)

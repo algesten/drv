@@ -343,26 +343,23 @@ machine instructions. No special consideration needed.
 `String`, `PathBuf`, small `Vec<T>` with a handful of elements — comparison
 is O(n) but n is small. Perfectly fine.
 
-### Large collections: use `imbl` (or `rpds`, or `Arc`)
+### Large collections: use `imbl` or `Arc`
 
 An atom tracking 50 open buffers in a `HashMap<Path, Buffer>` compares the
 entire map on every access — O(n). Every memoized call pays full traversal
 cost, defeating the point.
 
 The fix is a type with **O(1) `Clone` and O(1) equality when the value
-hasn't been mutated**. `drv` recognises three families automatically and
+hasn't been mutated**. `drv` recognises two families automatically and
 short-circuits the cache check with a pointer compare:
 
 - **`Arc<T>`** — works out of the box, no feature flag needed.
 - **[`imbl`](https://docs.rs/imbl) persistent collections** — enable the
   `imbl` feature. Covers `Vector`, `HashMap`, `OrdMap`, `HashSet`, `OrdSet`.
-- **[`rpds`](https://docs.rs/rpds) persistent collections** — enable the
-  `rpds` feature. Covers `HashTrieMap`, `RedBlackTreeMap`, `HashTrieSet`,
-  `RedBlackTreeSet`.
 
 ```toml
 [dependencies]
-drv = { version = "0.1", features = ["imbl"] }  # or "rpds", or both
+drv = { version = "0.1", features = ["imbl"] }
 ```
 
 With the feature on, a 10,000-entry `imbl::HashMap` that hasn't been
@@ -378,7 +375,6 @@ pay *more* than plain `Vec`/`HashMap` would.
 | `Arc<T>` | **O(1)** | **O(1)** | O(eq of T) | n/a |
 | `imbl::Vector<T>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
 | `imbl::HashMap<K,V>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
-| `rpds::HashTrieMap<K,V>` (`rpds` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
 
 *"Same pointer"* is the common case: the atom cloned its field into the
 snapshot on the last cache miss, and nothing has mutated it since — so the
@@ -388,8 +384,8 @@ when the collection was rebuilt from scratch but happens to compare equal.
 ### Rule of thumb
 
 - **< 50 elements?** `Vec`/`HashMap` are fine.
-- **50+ or expensive-to-compare elements?** Use `imbl` or `rpds` with the
-  matching feature flag — you get O(1) cache-hit comparison for free.
+- **50+ or expensive-to-compare elements?** Use `imbl` with the
+  `imbl` feature — you get O(1) cache-hit comparison for free.
 - **Single large blob of data you never mutate piece-wise?** Wrap it in
   `Arc<T>`; `drv` uses `Arc::ptr_eq` automatically.
 

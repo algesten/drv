@@ -383,26 +383,23 @@
 //! `String`, `PathBuf`, small `Vec<T>` with a handful of elements — comparison
 //! is O(n) but n is small. Perfectly fine.
 //!
-//! ## Large collections: use `imbl` (or `rpds`, or `Arc`)
+//! ## Large collections: use `imbl` or `Arc`
 //!
 //! An atom tracking 50 open buffers in a `HashMap<Path, Buffer>` compares the
 //! entire map on every access — O(n). Every memoized call pays full traversal
 //! cost, defeating the point.
 //!
 //! The fix is a type with **O(1) `Clone` and O(1) equality when the value
-//! hasn't been mutated**. `drv` recognises three families automatically and
+//! hasn't been mutated**. `drv` recognises two families automatically and
 //! short-circuits the cache check with a pointer compare:
 //!
 //! - **`Arc<T>`** — works out of the box, no feature flag needed.
 //! - **[`imbl`](https://docs.rs/imbl) persistent collections** — enable the
 //!   `imbl` feature. Covers `Vector`, `HashMap`, `OrdMap`, `HashSet`, `OrdSet`.
-//! - **[`rpds`](https://docs.rs/rpds) persistent collections** — enable the
-//!   `rpds` feature. Covers `HashTrieMap`, `RedBlackTreeMap`, `HashTrieSet`,
-//!   `RedBlackTreeSet`.
 //!
 //! ```toml
 //! [dependencies]
-//! drv = { version = "0.1", features = ["imbl"] }  # or "rpds", or both
+//! drv = { version = "0.1", features = ["imbl"] }
 //! ```
 //!
 //! With the feature on, a 10,000-entry `imbl::HashMap` that hasn't been
@@ -418,7 +415,6 @@
 //! | `Arc<T>` | **O(1)** | **O(1)** | O(eq of T) | n/a |
 //! | `imbl::Vector<T>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
 //! | `imbl::HashMap<K,V>` (`imbl` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
-//! | `rpds::HashTrieMap<K,V>` (`rpds` feature) | **O(1)** | **O(1)** | O(n) | O(log n) |
 //!
 //! *"Same pointer"* is the common case: the atom cloned its field into the
 //! snapshot on the last cache miss, and nothing has mutated it since — so the
@@ -428,8 +424,8 @@
 //! ## Rule of thumb
 //!
 //! - **< 50 elements?** `Vec`/`HashMap` are fine.
-//! - **50+ or expensive-to-compare elements?** Use `imbl` or `rpds` with the
-//!   matching feature flag — you get O(1) cache-hit comparison for free.
+//! - **50+ or expensive-to-compare elements?** Use `imbl` with the
+//!   `imbl` feature — you get O(1) cache-hit comparison for free.
 //! - **Single large blob of data you never mutate piece-wise?** Wrap it in
 //!   `Arc<T>`; `drv` uses `Arc::ptr_eq` automatically.
 //!
@@ -577,10 +573,10 @@ impl<A: Atom> Ord for Cache<A> {
 }
 
 /// Internal helper used by generated code to pick between a pointer-equality
-/// fast path (for `Arc<T>` and, under the `imbl` / `rpds` features,
-/// persistent collections that expose `ptr_eq`) and the regular `PartialEq`
-/// path. Not intended for direct use — `drv` wires this into `#[drv::atom]`
-/// and `#[drv::memo]` automatically.
+/// fast path (for `Arc<T>` and, under the `imbl` feature, `imbl`'s persistent
+/// collections) and the regular `PartialEq` path. Not intended for direct
+/// use — `drv` wires this into `#[drv::atom]` and `#[drv::memo]`
+/// automatically.
 #[doc(hidden)]
 pub struct FastEq<'a, T: ?Sized>(pub &'a T);
 
@@ -655,51 +651,6 @@ mod fasteq_imbl {
 
     impl<T: Ord + Clone> FastEq<'_, imbl::OrdSet<T>> {
         pub fn fast_eq(&self, other: &imbl::OrdSet<T>) -> bool {
-            self.0.ptr_eq(other) || self.0 == other
-        }
-    }
-}
-
-// rpds collections: behind `feature = "rpds"`.
-//
-// Only the trie/tree-based collections expose `ptr_eq` in rpds 1.x; `rpds::Vector`
-// and `rpds::List` do not, so they fall through to the generic FastEqFallback
-// impl (plain `PartialEq`, O(n)). Users who need O(1) cache-hit comparison on
-// a Vec-like field can wrap it in `Arc<...>` — `FastEq<'_, Arc<T>>` short-circuits
-// via `Arc::ptr_eq`.
-#[cfg(feature = "rpds")]
-mod fasteq_rpds {
-    use super::FastEq;
-    use std::hash::Hash;
-
-    impl<K, V> FastEq<'_, rpds::HashTrieMap<K, V>>
-    where
-        K: Hash + Eq,
-        V: PartialEq,
-    {
-        pub fn fast_eq(&self, other: &rpds::HashTrieMap<K, V>) -> bool {
-            self.0.ptr_eq(other) || self.0 == other
-        }
-    }
-
-    impl<K, V> FastEq<'_, rpds::RedBlackTreeMap<K, V>>
-    where
-        K: Ord,
-        V: PartialEq,
-    {
-        pub fn fast_eq(&self, other: &rpds::RedBlackTreeMap<K, V>) -> bool {
-            self.0.ptr_eq(other) || self.0 == other
-        }
-    }
-
-    impl<T: Hash + Eq> FastEq<'_, rpds::HashTrieSet<T>> {
-        pub fn fast_eq(&self, other: &rpds::HashTrieSet<T>) -> bool {
-            self.0.ptr_eq(other) || self.0 == other
-        }
-    }
-
-    impl<T: Ord> FastEq<'_, rpds::RedBlackTreeSet<T>> {
-        pub fn fast_eq(&self, other: &rpds::RedBlackTreeSet<T>) -> bool {
             self.0.ptr_eq(other) || self.0 == other
         }
     }
