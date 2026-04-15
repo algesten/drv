@@ -1,0 +1,19 @@
+[package]
+name = "drv"
+description = "Memoized derivations over plain Rust structs"
+readme = "../README.md"
+keywords = ["memoization", "incremental", "derive", "lens", "reactive"]
+categories = ["caching", "data-structures", "rust-patterns"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+drv-macros = { version = "=0.1.0", path = "../drv-macros" }
+
+[dev-dependencies]
+imbl = "7.0.0"

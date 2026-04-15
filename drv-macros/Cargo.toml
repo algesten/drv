@@ -1,0 +1,20 @@
+[package]
+name = "drv-macros"
+description = "Proc macros for drv"
+keywords = ["memoization", "incremental", "derive", "lens", "macro"]
+categories = ["caching", "data-structures", "rust-patterns"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
