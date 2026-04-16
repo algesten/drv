@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Fields, Ident, ItemStruct};
 
-use crate::atom::generate_lens_types;
+use crate::atom::generate_lens_types_with;
 use crate::registry::{self, LensField, LensRegistration};
 
 pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::Error> {
@@ -44,17 +44,43 @@ pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::E
         }
     })?;
 
-    // Check if all fields match the atom. If so, standard lens. If not, factory.
-    let all_match = fields.iter().all(|field| {
+    // Check if all fields match the atom. Accept both `T` and `&T` when atom has `T`.
+    // Track which fields the user wrote as explicit references.
+    let mut force_ref: Vec<bool> = Vec::new();
+    let mut all_match = true;
+    for field in fields {
         let field_name = field.ident.as_ref().unwrap();
-        let field_ty_tokens = registry::type_to_tokens(&field.ty);
-        atom.fields.iter().any(|af| {
+        let field_ty = &field.ty;
+        let field_ty_tokens = registry::type_to_tokens(field_ty);
+
+        // Direct match: lens type == atom type
+        let direct = atom.fields.iter().any(|af| {
             field_name == af.name.as_str() && registry::types_match(&af.ty_tokens, &field_ty_tokens)
-        })
-    });
+        });
+        if direct {
+            force_ref.push(false);
+            continue;
+        }
+
+        // Reference match: lens has &T, atom has T
+        if let syn::Type::Reference(r) = field_ty {
+            let inner_tokens = registry::type_to_tokens(&r.elem);
+            let ref_match = atom.fields.iter().any(|af| {
+                field_name == af.name.as_str()
+                    && registry::types_match(&af.ty_tokens, &inner_tokens)
+            });
+            if ref_match {
+                force_ref.push(true);
+                continue;
+            }
+        }
+
+        all_match = false;
+        break;
+    }
 
     if all_match {
-        expand_standard(atom_name, lens_name, fields, &atom)
+        expand_standard(atom_name, lens_name, fields, &atom, &force_ref)
     } else {
         expand_factory(atom_name, lens_name, &item, fields)
     }
@@ -65,47 +91,30 @@ fn expand_standard(
     lens_name: &Ident,
     fields: &syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
     atom: &registry::AtomRegistration,
+    force_ref: &[bool],
 ) -> Result<TokenStream, syn::Error> {
-    // Validate each field exists on the atom with matching type (for good errors).
+    // Validate each field. Already verified by the all_match check above,
+    // but re-validate here for precise error messages on name mismatches.
     let mut lens_fields = Vec::new();
     registry::with(|reg| {
         let atom_name_str = atom_name.to_string();
-        for field in fields {
+        for (i, field) in fields.iter().enumerate() {
             let field_name = field.ident.as_ref().unwrap();
-            let field_ty = &field.ty;
-            let field_ty_tokens = registry::type_to_tokens(field_ty);
             let atom_field = atom.fields.iter().find(|af| field_name == af.name.as_str());
-            match atom_field {
-                None => {
-                    let available = reg.atom_field_names(&atom_name_str);
-                    return Err(syn::Error::new_spanned(
+            if atom_field.is_none() {
+                let available = reg.atom_field_names(&atom_name_str);
+                return Err(syn::Error::new_spanned(
+                    field_name,
+                    format!(
+                        "field '{}' does not exist on atom '{}'\n\
+                         available fields: {}",
                         field_name,
-                        format!(
-                            "field '{}' does not exist on atom '{}'\n\
-                             available fields: {}",
-                            field_name,
-                            atom_name,
-                            available.join(", ")
-                        ),
-                    ));
-                }
-                Some(af) => {
-                    if !registry::types_match(&af.ty_tokens, &field_ty_tokens) {
-                        return Err(syn::Error::new_spanned(
-                            field_ty,
-                            format!(
-                                "type mismatch for field '{}': lens has '{}' but atom '{}' has '{}'\n\
-                                 hint: the type must be spelled identically in both the atom and the lens",
-                                field_name,
-                                field_ty_tokens,
-                                atom_name,
-                                af.ty_tokens,
-                            ),
-                        ));
-                    }
-                }
+                        atom_name,
+                        available.join(", ")
+                    ),
+                ));
             }
-            let _ = field_ty_tokens;
+            let _ = i; // force_ref already validated the type match
             lens_fields.push(LensField {
                 name: field_name.to_string(),
                 ty_tokens: None,
@@ -137,20 +146,38 @@ fn expand_standard(
 
     // We ignore the user-provided struct body and generate our own borrow lens.
     // The user's struct definition is purely a specification — we generate
-    // both the borrow-lens and snapshot types.
+    // both the borrow-lens and snapshot types. For fields the user wrote as
+    // `&T` (when atom has `T`), we strip the `&` and use force_ref so the
+    // generated lens keeps them as references.
     let field_names: Vec<Ident> = fields
         .iter()
         .map(|f| f.ident.as_ref().unwrap().clone())
         .collect();
-    let field_types: Vec<syn::Type> = fields.iter().map(|f| f.ty.clone()).collect();
+    let field_types: Vec<syn::Type> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if force_ref.get(i).copied().unwrap_or(false) {
+                // User wrote &T — strip the & to get the atom's type T
+                if let syn::Type::Reference(r) = &f.ty {
+                    (*r.elem).clone()
+                } else {
+                    f.ty.clone()
+                }
+            } else {
+                f.ty.clone()
+            }
+        })
+        .collect();
 
     let snapshot_ident = format_ident!("__Drv{}", lens_name);
-    let output = generate_lens_types(
+    let output = generate_lens_types_with(
         lens_name,
         &snapshot_ident,
         atom_name,
         &field_names,
         &field_types,
+        force_ref,
     );
     Ok(output)
 }

@@ -27,8 +27,8 @@ pub struct Editor {
 fn visible_lines(lens: &VisibleLines) -> Vec<String> {
     lens.content
         .iter()
-        .skip(*lens.scroll_row as usize)
-        .take(*lens.viewport_rows as usize)
+        .skip(lens.scroll_row as usize)
+        .take(lens.viewport_rows as usize)
         .cloned()
         .collect()
 }
@@ -60,7 +60,7 @@ struct NotificationLens {
 
 #[drv::memo]
 fn notification_badge(lens: &NotificationLens) -> String {
-    if *lens.notification_count == 0 {
+    if lens.notification_count == 0 {
         format!("{}: no notifications", lens.user_name)
     } else {
         format!("{}: {} new", lens.user_name, lens.notification_count)
@@ -91,7 +91,7 @@ pub struct Summary {
 
 #[drv::memo]
 fn doubled_total(lens: &CountLens) -> usize {
-    *lens.total * 2
+    lens.total * 2
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -117,7 +117,7 @@ pub struct GameState {
 
 #[drv::memo]
 fn player_distance(lens: &PlayerLens) -> f32 {
-    (*lens.player_x * *lens.player_x + *lens.player_y * *lens.player_y).sqrt()
+    (lens.player_x * lens.player_x + lens.player_y * lens.player_y).sqrt()
 }
 
 #[drv::memo]
@@ -168,7 +168,7 @@ pub struct Counter {
 
 #[drv::memo]
 fn is_positive(lens: &ValueLens) -> bool {
-    *lens.value > 0
+    lens.value > 0
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -276,19 +276,19 @@ pub struct MixedAtom {
 // Value param AFTER a lens param.
 #[drv::memo]
 fn with_value_after(lens: &BaseLens, multiplier: u32) -> u32 {
-    *lens.base * multiplier
+    lens.base * multiplier
 }
 
 // Value param BEFORE a lens param — order must be preserved.
 #[drv::memo]
 fn with_value_before(multiplier: u32, lens: &BaseLens) -> u32 {
-    multiplier * *lens.base
+    multiplier * lens.base
 }
 
 // Multiple value params mixed with a lens.
 #[drv::memo]
 fn multi_value(offset: u32, lens: &BaseLens, scale: u32) -> u32 {
-    offset + (*lens.base * scale)
+    offset + (lens.base * scale)
 }
 
 // Reference value params — `&str` and `&[u8]` stored via ToOwned.
@@ -299,7 +299,7 @@ fn with_str(lens: &BaseLens, prefix: &str) -> String {
 
 #[drv::memo]
 fn with_bytes(lens: &BaseLens, bytes: &[u8]) -> usize {
-    (*lens.base as usize) + bytes.len()
+    (lens.base as usize) + bytes.len()
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -341,6 +341,30 @@ pub struct Outer {
     pub inner: Inner,
     pub name: String,
     pub count: u32,
+}
+
+// Standalone lens with mixed owned/reference fields for the same Copy type.
+// `count: u32` (owned, auto-detected Copy) and `count_ref: &u32` would need
+// a different field name. Instead, test with a separate atom:
+#[drv::atom]
+pub struct CopyTest {
+    pub x: u32,
+    pub y: u32,
+    pub label: String,
+}
+
+// x is owned (u32 = copy primitive, auto-detected).
+// y is forced to reference via &u32 in the lens spec.
+#[drv::lens(CopyTest)]
+struct CopyMixLens {
+    pub x: u32,
+    pub y: &u32,
+}
+
+#[drv::memo]
+fn copy_mix_sum(lens: &CopyMixLens) -> u32 {
+    // x is u32 (no deref needed), y is &u32 (deref needed)
+    lens.x + *lens.y
 }
 
 // Factory lens: field names differ, types differ, reaches into nested struct.
@@ -993,4 +1017,20 @@ fn factory_lens_mixed_with_regular() {
 fn factory_lens_send() {
     fn assert_send<T: Send>() {}
     assert_send::<Outer>();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Copy-by-value + explicit &T in standalone lens
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn copy_by_value_in_lens() {
+    // Standalone lens with x: u32 (owned, no deref) and y: &u32 (reference, deref).
+    // Both styles work in the same lens.
+    let a = CopyTest {
+        x: 10,
+        y: 20,
+        ..Default::default()
+    };
+    assert_eq!(copy_mix_sum(&a), 30);
 }

@@ -54,7 +54,14 @@ At the end of your crate, `drv::assemble!()` stitches everything together.
 
 ## Declaring lenses
 
-There are two ways to declare a lens. Both produce identical generated code.
+There are three ways to declare a lens.
+
+In all generated lenses, built-in scalar primitives (`u32`, `bool`, `f64`,
+`usize`, etc.) are stored **by value** — `lens.x` gives `u32` directly, no
+dereference needed. All other types are borrowed as `&T`. User-defined
+`Copy` types are *not* auto-detected (the proc macro can only recognise
+language built-ins); use a factory lens for full control over field
+representation.
 
 ### Inline: annotate fields on the atom
 
@@ -249,7 +256,7 @@ cache key just like lens fields — any change triggers a recompute.
 ```rust
 #[drv::memo]
 fn labeled(lens: &CountLens, label: &str, multiplier: u32) -> String {
-    format!("{}={}", label, *lens.count * multiplier)
+    format!("{}={}", label, lens.count * multiplier)
 }
 ```
 
@@ -309,7 +316,7 @@ pub struct Stats {
 
 #[drv::memo]
 fn average(lens: &AverageLens) -> u32 {
-    if *lens.count == 0 { 0 } else { *lens.total / *lens.count }
+    if lens.count == 0 { 0 } else { lens.total / lens.count }
 }
 ```
 
@@ -369,8 +376,9 @@ Atom fields must implement `PartialEq + Clone + Debug + Default + Send`.
 
 ### What runs when
 
-Constructing a lens from an atom is free (zero-copy — the lens holds
-references into the atom). What runs on each call:
+Constructing a lens from an atom is nearly free — built-in primitives are
+copied (trivial), other fields are borrowed by reference. What runs on
+each call:
 
 - **Every call — `PartialEq` on each lens field.** Used to check whether
   the input has changed since the last call.

@@ -310,8 +310,14 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
 
 /// Generate the user-facing lens + internal owned snapshot + PartialEq + From.
 ///
-/// Lens fields are always `&'drv T` — zero-copy.
-/// User bodies need to deref where values are required (e.g. `*lens.scroll_row as usize`).
+/// Built-in scalar primitives (u8–u128, i8–i128, usize, isize, f32, f64,
+/// bool, char) are stored by value in the lens for ergonomics (`lens.x`
+/// instead of `*lens.x`). All other types — including user-defined Copy
+/// types — are borrowed (`&'drv T`), because the proc macro cannot query
+/// trait implementations at expansion time.
+/// Per-field control: should this field be a reference in the lens?
+/// `None` means auto-detect (copy primitives → owned, others → ref).
+/// `Some(true)` forces a reference, `Some(false)` forces owned.
 pub(crate) fn generate_lens_types(
     lens_ident: &Ident,
     snapshot_ident: &Ident,
@@ -319,46 +325,83 @@ pub(crate) fn generate_lens_types(
     field_names: &[Ident],
     field_types: &[syn::Type],
 ) -> TokenStream {
-    let fn1 = field_names.iter();
-    let ft1 = field_types.iter();
-    let fn2 = field_names.iter();
-    let ft2 = field_types.iter();
-    let fn3 = field_names.iter();
-    let fn4 = field_names.iter();
-    let fn5 = field_names.iter();
-    let fn6 = field_names.iter();
-    let fn7 = field_names.iter();
+    generate_lens_types_with(
+        lens_ident,
+        snapshot_ident,
+        atom_ident,
+        field_names,
+        field_types,
+        &[],
+    )
+}
+
+pub(crate) fn generate_lens_types_with(
+    lens_ident: &Ident,
+    snapshot_ident: &Ident,
+    atom_ident: &Ident,
+    field_names: &[Ident],
+    field_types: &[syn::Type],
+    force_ref: &[bool],
+) -> TokenStream {
+    let mut struct_fields = Vec::new();
+    let mut snap_fields = Vec::new();
+    let mut eq_checks = Vec::new();
+    let mut from_fields = Vec::new();
+    let mut snap_stores = Vec::new();
+
+    for (i, (name, ty)) in field_names.iter().zip(field_types.iter()).enumerate() {
+        let is_ref = force_ref.get(i).copied().unwrap_or(false);
+        if !is_ref && is_copy_primitive(ty) {
+            // Owned field — copy from atom, no deref needed by user.
+            struct_fields.push(quote! { pub #name: #ty });
+            snap_fields.push(quote! { pub #name: #ty });
+            eq_checks.push(quote! {
+                (::drv::FastEq(&self.#name).fast_eq(&other.#name))
+            });
+            from_fields.push(quote! { #name: source.#name });
+            snap_stores.push(quote! { #name: self.#name.clone() });
+        } else {
+            // Reference field — borrow from atom, zero-copy.
+            struct_fields.push(quote! { pub #name: &'drv #ty });
+            snap_fields.push(quote! { pub #name: #ty });
+            eq_checks.push(quote! {
+                (::drv::FastEq(self.#name).fast_eq(&other.#name))
+            });
+            from_fields.push(quote! { #name: &source.#name });
+            snap_stores.push(quote! { #name: (*self.#name).clone() });
+        }
+    }
 
     quote! {
-        // User-facing lens — all fields are references, zero-copy.
+        // User-facing lens — Copy-type fields by value, others by reference.
         #[derive(Copy, Clone, Debug)]
         pub struct #lens_ident<'drv> {
             #[doc(hidden)]
             pub __drv: &'drv ::drv::Cache<#atom_ident>,
-            #(pub #fn1: &'drv #ft1,)*
+            #(#struct_fields,)*
         }
 
         // Internal owned snapshot for cache storage.
         #[doc(hidden)]
         #[derive(Default)]
         pub struct #snapshot_ident {
-            #(pub #fn2: #ft2,)*
+            #(#snap_fields,)*
         }
 
-        // Cross-type PartialEq: lens (refs) vs owned snapshot.
+        // PartialEq: lens vs owned snapshot.
         impl<'drv> ::core::cmp::PartialEq<#snapshot_ident> for #lens_ident<'drv> {
             fn eq(&self, other: &#snapshot_ident) -> bool {
                 use ::drv::FastEqFallback as _;
-                #(::drv::FastEq(self.#fn3).fast_eq(&other.#fn4))&&*
+                #(#eq_checks)&&*
             }
         }
 
-        // From<&Atom> for the lens — borrow each field, no cloning.
+        // From<&Atom> for the lens — copy primitives, borrow the rest.
         impl<'drv> ::core::convert::From<&'drv #atom_ident> for #lens_ident<'drv> {
             fn from(source: &'drv #atom_ident) -> Self {
                 #lens_ident {
                     __drv: &source.__drv,
-                    #(#fn5: &source.#fn6,)*
+                    #(#from_fields,)*
                 }
             }
         }
@@ -368,11 +411,38 @@ pub(crate) fn generate_lens_types(
             #[doc(hidden)]
             pub fn __drv_snapshot(&self) -> #snapshot_ident {
                 #snapshot_ident {
-                    #(#fn7: (*self.#fn7).clone(),)*
+                    #(#snap_stores,)*
                 }
             }
         }
     }
+}
+
+/// Returns true if the type is a known Copy primitive.
+pub(crate) fn is_copy_primitive(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(p) = ty {
+        if let Some(ident) = p.path.get_ident() {
+            return matches!(
+                ident.to_string().as_str(),
+                "u8" | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "usize"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "isize"
+                    | "f32"
+                    | "f64"
+                    | "bool"
+                    | "char"
+            );
+        }
+    }
+    false
 }
 
 fn parse_atom_attr(attr: TokenStream) -> Result<Vec<syn::Path>, syn::Error> {
