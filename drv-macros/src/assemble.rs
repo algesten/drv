@@ -8,6 +8,22 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
     registry::with(|reg| {
         let mut output = TokenStream::new();
 
+        // Validate: every factory lens must have a matching #[drv::factory] impl.
+        for lens in &reg.lenses {
+            if lens.is_factory && !reg.factory_exists(&lens.name) {
+                return Err(syn::Error::new(
+                    Span::call_site(),
+                    format!(
+                        "factory lens '{}' requires a `#[drv::factory]` annotated \
+                         `impl From<&{}> for {}`\n\
+                         hint: if this should be a standard lens, ensure all field \
+                         names and types match atom '{}'",
+                        lens.name, lens.atom_name, lens.name, lens.atom_name
+                    ),
+                ));
+            }
+        }
+
         // Build per-memo info, group by primary atom (first lens param).
         let memos: Vec<MemoInfo> = reg
             .memos

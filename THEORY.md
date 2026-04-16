@@ -43,19 +43,30 @@ database (EDB)**.
 
 ### Lens
 
-A lens is a struct whose fields are a strict subset of an atom's fields — same
-names, same types. It declares "this computation depends on exactly these
-fields and no others."
-
-The lens serves two purposes:
+A lens is a struct that declares the inputs a computation depends on. It
+serves two purposes:
 
 1. **Dependency declaration.** The set of fields in the lens is the set of
-   fields the computation reads. This is verified at compile time. There is no
-   way to accidentally depend on a field that isn't declared.
+   values the computation reads. There is no way to accidentally depend on
+   a value that isn't declared.
 
-2. **Change detection.** Each lens field is compared against the corresponding
-   atom field via `PartialEq`. If all fields match, the cached result is
+2. **Change detection.** Each lens field is compared against the stored
+   snapshot via `PartialEq`. If all fields match, the cached result is
    returned.
+
+There are two kinds of lens:
+
+**Standard lenses** have fields that are a strict subset of an atom's
+fields — same names, same types. The macro verifies this at compile time
+and auto-generates the projection.
+
+**Factory lenses** have user-defined fields that may differ from the atom
+in name, type, or nesting depth. The user writes the `From<&Atom>`
+conversion (annotated with `#[drv::factory]`), and the macro generates
+the snapshot and comparison logic. This allows reaching into nested
+structs, borrowing `&str` from `String` fields, or projecting computed
+values. Factory lenses are detected automatically when the lens struct's
+fields don't match the atom.
 
 In FP optics, a lens is a composable accessor into a product type. Here we use
 only the "getter" half (projection). In database terms, the lens is a **view
@@ -66,7 +77,10 @@ The connection to the incremental computation literature is precise: the lens
 is a **verifying trace** (Build Systems a la Carte, Mokhov et al. 2018). The
 trace records which inputs were read; the rebuilder compares the trace against
 current values to decide whether to recompute. In `drv`, the trace is the
-lens struct itself, and the comparison is `PartialEq`.
+lens struct itself, and the comparison is `PartialEq`. For factory lenses,
+the trace is the *projected* values — the comparison happens on the lens
+output, not on the raw atom fields. This means changes to atom fields that
+produce the same projected values do not trigger recomputation.
 
 The atom itself can also be used as a lens — the "identity lens" over all data
 fields. This is a convenience for computations that genuinely depend on
@@ -104,13 +118,17 @@ struct MyLens {
 }
 ```
 
-This type is the dependency. The compiler verifies it (field names and types
-must match the atom). The runtime uses it (field-by-field `PartialEq`). There
-is nothing else — no tracking table, no subscription list, no proxy object.
+This type is the dependency. For standard lenses, the compiler verifies it
+(field names and types must match the atom). For factory lenses, the user
+writes the projection and the compiler verifies the `From` impl compiles.
+The runtime uses the lens for field-by-field `PartialEq`. There is nothing
+else — no tracking table, no subscription list, no proxy object.
 
 This is a form of **static dependency analysis** achieved through the type
-system rather than program analysis. The programmer writes the projection;
-the compiler verifies it; the runtime executes it. Each layer has a clear role.
+system rather than program analysis. The programmer writes the projection
+(either declaratively via matching field names, or explicitly via a `From`
+impl); the compiler verifies it; the runtime executes it. Each layer has a
+clear role.
 
 In the terminology of "A Theory of Changes for Higher-Order Languages" (Cai
 et al., PLDI 2014), a lens is a projection function, and its **derivative**

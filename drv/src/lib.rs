@@ -108,6 +108,70 @@
 //! Use standalone lenses when the lens is defined closer to the memo that consumes
 //! it, or when the atom is in another module and you don't want to modify it.
 //!
+//! ## Factory: custom projection with `#[drv::factory]`
+//!
+//! When you need lens fields that don't match the atom — different names, different
+//! types, or reaching into nested structs — use a factory lens. You declare the lens
+//! struct with `#[drv::lens(Atom)]` and write your own `From` impl annotated with
+//! `#[drv::factory]`:
+//!
+//! ```rust
+//! #[derive(Debug, Clone, PartialEq, Default)]
+//! pub struct Inner {
+//!     pub x: u32,
+//!     pub label: String,
+//! }
+//!
+//! #[drv::atom]
+//! pub struct Container {
+//!     pub inner: Inner,
+//!     pub name: String,
+//!     pub count: u32,
+//! }
+//!
+//! // Fields don't match the atom — this becomes a factory lens.
+//! #[drv::lens(Container)]
+//! struct ProjectedLens<'a> {
+//!     pub x: u32,            // owned copy of a nested field
+//!     pub name: &'a str,     // borrow &str from a String field
+//! }
+//!
+//! // You write the projection. drv::factory injects the cache reference.
+//! #[drv::factory]
+//! impl<'a> From<&'a Container> for ProjectedLens<'a> {
+//!     fn from(v: &'a Container) -> Self {
+//!         Self {
+//!             x: v.inner.x,
+//!             name: &v.name,
+//!         }
+//!     }
+//! }
+//!
+//! #[drv::memo]
+//! fn display(lens: &ProjectedLens) -> String {
+//!     format!("{}={}", lens.name, lens.x)
+//! }
+//!
+//! # drv::assemble!();
+//! # fn main() {
+//! let c = Container {
+//!     inner: Inner { x: 42, label: "ignored".into() },
+//!     name: "hello".into(),
+//!     ..Default::default()
+//! };
+//! assert_eq!(display(&c), "hello=42");
+//! # }
+//! ```
+//!
+//! The macro detects factory mode automatically when the lens struct's fields don't
+//! match the atom. It keeps your struct definition (adding only a hidden `__drv`
+//! field), generates the snapshot and comparison logic, and rewrites your `From` impl
+//! to inject the cache reference. Factory lenses require a lifetime parameter on the
+//! struct (for the cache reference).
+//!
+//! Factory lenses work identically with memos — cache hits, misses, multi-lens
+//! parameters, and value parameters all behave the same as standard lenses.
+//!
 //! # Calling memos
 //!
 //! `#[drv::memo]` generates a free function with the same name. The function
@@ -659,5 +723,6 @@ mod fasteq_imbl {
 // Re-export proc macros.
 pub use drv_macros::assemble;
 pub use drv_macros::atom;
+pub use drv_macros::factory;
 pub use drv_macros::lens;
 pub use drv_macros::memo;

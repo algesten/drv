@@ -1,0 +1,202 @@
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::{Expr, ExprStruct, Ident, ItemImpl, Pat};
+
+use crate::registry::{self, FactoryRegistration};
+
+pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
+    // Extract lens name from the Self type (e.g., MyLens<'a>).
+    let lens_name = extract_lens_name(&item)?;
+
+    // Extract atom name from the From trait (e.g., From<&'a Bar> → Bar).
+    let atom_name = extract_atom_name(&item)?;
+
+    // Extract the parameter name from the from() method (e.g., `v` in `fn from(v: &Bar)`).
+    let param_name = extract_from_param_name(&item)?;
+
+    // Validate and register.
+    registry::with(|reg| {
+        let lens_name_str = lens_name.to_string();
+        let atom_name_str = atom_name.to_string();
+
+        // Verify the lens is registered as a factory lens.
+        let lens = reg.find_lens(&lens_name_str);
+        match lens {
+            Some(l) if l.is_factory && l.atom_name == atom_name_str => {}
+            Some(l) if !l.is_factory => {
+                return Err(syn::Error::new_spanned(
+                    &item.self_ty,
+                    format!(
+                        "lens '{}' is a standard lens, not a factory lens -- \
+                         #[drv::factory] is only for lenses whose fields don't match the atom",
+                        lens_name_str
+                    ),
+                ));
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    &item.self_ty,
+                    format!(
+                        "factory lens '{}' for atom '{}' not found -- \
+                         #[drv::lens({})] must appear before #[drv::factory]",
+                        lens_name_str, atom_name_str, atom_name_str
+                    ),
+                ));
+            }
+        }
+
+        // Register that the factory impl exists.
+        reg.factory_impls.push(FactoryRegistration {
+            lens_name: lens_name_str,
+            atom_name: atom_name_str,
+        });
+
+        Ok(())
+    })?;
+
+    // Rewrite the From body: inject `__drv: &v.__drv` into struct construction.
+    inject_drv_field(&mut item, &param_name)?;
+
+    Ok(quote! { #item })
+}
+
+/// Extract the lens name from `impl ... for LensName<'a>`.
+fn extract_lens_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
+    if let syn::Type::Path(p) = item.self_ty.as_ref() {
+        if let Some(seg) = p.path.segments.last() {
+            return Ok(seg.ident.clone());
+        }
+    }
+    Err(syn::Error::new_spanned(
+        &item.self_ty,
+        "#[drv::factory] expects `impl From<&Atom> for LensName<'_>`",
+    ))
+}
+
+/// Extract the atom name from `impl From<&'a AtomName> for ...`.
+fn extract_atom_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
+    let trait_path = match &item.trait_ {
+        Some((_, path, _)) => path,
+        None => {
+            return Err(syn::Error::new_spanned(
+                item,
+                "#[drv::factory] must be on a `From` impl",
+            ));
+        }
+    };
+
+    // The trait path should be `From<&'a AtomName>`.
+    let last_seg = trait_path.segments.last().ok_or_else(|| {
+        syn::Error::new_spanned(trait_path, "#[drv::factory] expects `From<&Atom>`")
+    })?;
+
+    if last_seg.ident != "From" {
+        return Err(syn::Error::new_spanned(
+            &last_seg.ident,
+            "#[drv::factory] must be on a `From` impl",
+        ));
+    }
+
+    // Extract the generic argument: From<&'a AtomName>.
+    if let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments {
+        if let Some(syn::GenericArgument::Type(syn::Type::Reference(r))) = args.args.first() {
+            if let syn::Type::Path(p) = r.elem.as_ref() {
+                if let Some(seg) = p.path.segments.last() {
+                    return Ok(seg.ident.clone());
+                }
+            }
+        }
+    }
+
+    Err(syn::Error::new_spanned(
+        trait_path,
+        "#[drv::factory] expects `From<&AtomName>` or `From<&'a AtomName>`",
+    ))
+}
+
+/// Extract the parameter name from `fn from(v: &Bar) -> Self`.
+fn extract_from_param_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
+    for impl_item in &item.items {
+        if let syn::ImplItem::Fn(method) = impl_item {
+            if method.sig.ident == "from" {
+                if let Some(syn::FnArg::Typed(pat_ty)) = method.sig.inputs.first() {
+                    if let Pat::Ident(pat_ident) = pat_ty.pat.as_ref() {
+                        return Ok(pat_ident.ident.clone());
+                    }
+                }
+            }
+        }
+    }
+    Err(syn::Error::new_spanned(
+        item,
+        "#[drv::factory] could not find `fn from(param: &Atom)` in impl",
+    ))
+}
+
+/// Walk the from() body and inject `__drv: &param.__drv` into struct literals.
+fn inject_drv_field(item: &mut ItemImpl, param_name: &Ident) -> Result<(), syn::Error> {
+    for impl_item in &mut item.items {
+        if let syn::ImplItem::Fn(method) = impl_item {
+            if method.sig.ident == "from" {
+                inject_drv_in_block(&mut method.block, param_name);
+                return Ok(());
+            }
+        }
+    }
+    Err(syn::Error::new_spanned(
+        &*item,
+        "#[drv::factory] could not find `fn from` in impl",
+    ))
+}
+
+/// Recursively walk a block and inject __drv into any struct literal expressions.
+fn inject_drv_in_block(block: &mut syn::Block, param_name: &Ident) {
+    for stmt in &mut block.stmts {
+        inject_drv_in_stmt(stmt, param_name);
+    }
+}
+
+fn inject_drv_in_stmt(stmt: &mut syn::Stmt, param_name: &Ident) {
+    match stmt {
+        syn::Stmt::Expr(expr, _) => inject_drv_in_expr(expr, param_name),
+        syn::Stmt::Local(local) => {
+            if let Some(init) = &mut local.init {
+                inject_drv_in_expr(&mut init.expr, param_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inject_drv_in_expr(expr: &mut Expr, param_name: &Ident) {
+    match expr {
+        Expr::Struct(s) => inject_drv_in_struct_expr(s, param_name),
+        Expr::Block(b) => inject_drv_in_block(&mut b.block, param_name),
+        Expr::Return(r) => {
+            if let Some(e) = &mut r.expr {
+                inject_drv_in_expr(e, param_name);
+            }
+        }
+        Expr::If(i) => {
+            inject_drv_in_block(&mut i.then_branch, param_name);
+            if let Some((_, else_branch)) = &mut i.else_branch {
+                inject_drv_in_expr(else_branch, param_name);
+            }
+        }
+        Expr::Match(m) => {
+            for arm in &mut m.arms {
+                inject_drv_in_expr(&mut arm.body, param_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inject_drv_in_struct_expr(s: &mut ExprStruct, param_name: &Ident) {
+    // Only inject into struct literals that look like Self { ... } or LensName { ... }.
+    // We inject `__drv: &param.__drv` as the first field.
+    let drv_field: syn::FieldValue = syn::parse_quote! {
+        __drv: &#param_name.__drv
+    };
+    s.fields.insert(0, drv_field);
+}

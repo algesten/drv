@@ -326,6 +326,55 @@ fn arc_sum(lens: &ArcLens) -> u32 {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 12. FACTORY LENSES — user-defined From impl with arbitrary field
+//     names/types and nested struct access.
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Inner {
+    pub value: u32,
+    pub label: String,
+}
+
+#[drv::atom]
+pub struct Outer {
+    pub inner: Inner,
+    pub name: String,
+    pub count: u32,
+}
+
+// Factory lens: field names differ, types differ, reaches into nested struct.
+#[drv::lens(Outer)]
+struct FactoryLens<'a> {
+    pub inner_value: u32,  // owned, from inner.value
+    pub name_ref: &'a str, // borrow &str from String
+}
+
+#[drv::factory]
+impl<'a> From<&'a Outer> for FactoryLens<'a> {
+    fn from(v: &'a Outer) -> Self {
+        Self {
+            inner_value: v.inner.value,
+            name_ref: &v.name,
+        }
+    }
+}
+
+static FACTORY_MEMO_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo]
+fn factory_derived(lens: &FactoryLens) -> String {
+    FACTORY_MEMO_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    format!("{}={}", lens.name_ref, lens.inner_value)
+}
+
+// Factory lens used together with a regular lens in a multi-lens memo.
+#[drv::memo]
+fn factory_plus_regular(fl: &FactoryLens, bl: &BaseLens) -> String {
+    format!("{}-{}", fl.name_ref, bl.base)
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ASSEMBLE — must come after all declarations
 // ══════════════════════════════════════════════════════════════════════
 
@@ -849,4 +898,99 @@ fn arc_ptr_eq_fast_path() {
     a.data = p;
     assert_eq!(arc_sum(&a), 21);
     assert_eq!(ARC_MEMO_COMPUTES.load(Ordering::SeqCst), 2);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Factory lens tests
+// ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn factory_lens_basic() {
+    let a = Outer {
+        inner: Inner {
+            value: 42,
+            label: "hello".into(),
+        },
+        name: "test".into(),
+        ..Default::default()
+    };
+    assert_eq!(factory_derived(&a), "test=42");
+}
+
+#[test]
+fn factory_lens_cache_hit() {
+    let mut a = Outer {
+        inner: Inner {
+            value: 10,
+            label: "x".into(),
+        },
+        name: "foo".into(),
+        ..Default::default()
+    };
+    assert_eq!(factory_derived(&a), "foo=10");
+    let count_after_first = FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst);
+
+    // Change a field the factory lens doesn't project → cache hit.
+    a.count = 999;
+    assert_eq!(factory_derived(&a), "foo=10");
+    assert_eq!(
+        FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst),
+        count_after_first
+    );
+
+    // Change inner.label — also not projected → cache hit.
+    a.inner.label = "changed".into();
+    assert_eq!(factory_derived(&a), "foo=10");
+    assert_eq!(
+        FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst),
+        count_after_first
+    );
+}
+
+#[test]
+fn factory_lens_cache_miss() {
+    let mut a = Outer {
+        inner: Inner {
+            value: 10,
+            label: "x".into(),
+        },
+        name: "foo".into(),
+        ..Default::default()
+    };
+    assert_eq!(factory_derived(&a), "foo=10");
+    let c0 = FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst);
+
+    // Change inner.value — projected as inner_value → cache miss.
+    a.inner.value = 20;
+    assert_eq!(factory_derived(&a), "foo=20");
+    let c1 = FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst);
+    assert_eq!(c1, c0 + 1);
+
+    // Change name — projected as name_ref → cache miss.
+    a.name = "bar".into();
+    assert_eq!(factory_derived(&a), "bar=20");
+    assert_eq!(FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst), c1 + 1);
+}
+
+#[test]
+fn factory_lens_mixed_with_regular() {
+    let outer = Outer {
+        inner: Inner {
+            value: 5,
+            label: "x".into(),
+        },
+        name: "hello".into(),
+        ..Default::default()
+    };
+    let mixed = MixedAtom {
+        base: 7,
+        ..Default::default()
+    };
+    assert_eq!(factory_plus_regular(&outer, &mixed), "hello-7");
+}
+
+#[test]
+fn factory_lens_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Outer>();
 }

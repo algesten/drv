@@ -112,9 +112,13 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
                     .iter()
                     .map(|(name, _ty)| LensField {
                         name: name.to_string(),
+                        ty_tokens: None,
+                        is_ref: false,
+                        referent_tokens: None,
                     })
                     .collect(),
                 is_identity: false,
+                is_factory: false,
             });
         }
 
@@ -289,9 +293,13 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
                         .iter()
                         .map(|n| LensField {
                             name: n.to_string(),
+                            ty_tokens: None,
+                            is_ref: false,
+                            referent_tokens: None,
                         })
                         .collect(),
                     is_identity: true,
+                    is_factory: false,
                 });
             }
         });
