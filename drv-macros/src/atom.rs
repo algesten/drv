@@ -118,7 +118,7 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
                     })
                     .collect(),
                 is_identity: false,
-                is_factory: false,
+                is_proj: false,
             });
         }
 
@@ -299,7 +299,7 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
                         })
                         .collect(),
                     is_identity: true,
-                    is_factory: false,
+                    is_proj: false,
                 });
             }
         });

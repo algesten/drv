@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Expr, ExprStruct, Ident, ItemImpl, Pat};
 
-use crate::registry::{self, FactoryRegistration};
+use crate::registry::{self, ProjRegistration};
 
 pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
     // Extract lens name from the Self type (e.g., MyLens<'a>).
@@ -19,16 +19,17 @@ pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
         let lens_name_str = lens_name.to_string();
         let atom_name_str = atom_name.to_string();
 
-        // Verify the lens is registered as a factory lens.
+        // Verify the lens expects a user-written projection.
         let lens = reg.find_lens(&lens_name_str);
         match lens {
-            Some(l) if l.is_factory && l.atom_name == atom_name_str => {}
-            Some(l) if !l.is_factory => {
+            Some(l) if l.is_proj && l.atom_name == atom_name_str => {}
+            Some(l) if !l.is_proj => {
                 return Err(syn::Error::new_spanned(
                     &item.self_ty,
                     format!(
-                        "lens '{}' is a standard lens, not a factory lens -- \
-                         #[drv::factory] is only for lenses whose fields don't match the atom",
+                        "lens '{}' is a standard lens and does not need a \
+                         projection impl -- #[drv::proj] is only for lenses \
+                         whose fields don't match the atom",
                         lens_name_str
                     ),
                 ));
@@ -37,16 +38,16 @@ pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
                 return Err(syn::Error::new_spanned(
                     &item.self_ty,
                     format!(
-                        "factory lens '{}' for atom '{}' not found -- \
-                         #[drv::lens({})] must appear before #[drv::factory]",
+                        "lens '{}' for atom '{}' not found -- \
+                         #[drv::lens({})] must appear before #[drv::proj]",
                         lens_name_str, atom_name_str, atom_name_str
                     ),
                 ));
             }
         }
 
-        // Register that the factory impl exists.
-        reg.factory_impls.push(FactoryRegistration {
+        // Register that the projection impl exists.
+        reg.proj_impls.push(ProjRegistration {
             lens_name: lens_name_str,
             atom_name: atom_name_str,
         });
@@ -69,7 +70,7 @@ fn extract_lens_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
     }
     Err(syn::Error::new_spanned(
         &item.self_ty,
-        "#[drv::factory] expects `impl From<&Atom> for LensName<'_>`",
+        "#[drv::proj] expects `impl From<&Atom> for LensName<'_>`",
     ))
 }
 
@@ -80,20 +81,21 @@ fn extract_atom_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
         None => {
             return Err(syn::Error::new_spanned(
                 item,
-                "#[drv::factory] must be on a `From` impl",
+                "#[drv::proj] must be on a `From` impl",
             ));
         }
     };
 
     // The trait path should be `From<&'a AtomName>`.
-    let last_seg = trait_path.segments.last().ok_or_else(|| {
-        syn::Error::new_spanned(trait_path, "#[drv::factory] expects `From<&Atom>`")
-    })?;
+    let last_seg = trait_path
+        .segments
+        .last()
+        .ok_or_else(|| syn::Error::new_spanned(trait_path, "#[drv::proj] expects `From<&Atom>`"))?;
 
     if last_seg.ident != "From" {
         return Err(syn::Error::new_spanned(
             &last_seg.ident,
-            "#[drv::factory] must be on a `From` impl",
+            "#[drv::proj] must be on a `From` impl",
         ));
     }
 
@@ -110,7 +112,7 @@ fn extract_atom_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
 
     Err(syn::Error::new_spanned(
         trait_path,
-        "#[drv::factory] expects `From<&AtomName>` or `From<&'a AtomName>`",
+        "#[drv::proj] expects `From<&AtomName>` or `From<&'a AtomName>`",
     ))
 }
 
@@ -129,7 +131,7 @@ fn extract_from_param_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
     }
     Err(syn::Error::new_spanned(
         item,
-        "#[drv::factory] could not find `fn from(param: &Atom)` in impl",
+        "#[drv::proj] could not find `fn from(param: &Atom)` in impl",
     ))
 }
 
@@ -145,7 +147,7 @@ fn inject_drv_field(item: &mut ItemImpl, param_name: &Ident) -> Result<(), syn::
     }
     Err(syn::Error::new_spanned(
         &*item,
-        "#[drv::factory] could not find `fn from` in impl",
+        "#[drv::proj] could not find `fn from` in impl",
     ))
 }
 

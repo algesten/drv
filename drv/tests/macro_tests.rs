@@ -367,15 +367,15 @@ fn copy_mix_sum(lens: &CopyMixLens) -> u32 {
     lens.x + *lens.y
 }
 
-// Factory lens: field names differ, types differ, reaches into nested struct.
+// Projection lens: field names differ, types differ, reaches into nested struct.
 #[drv::lens(Outer)]
-struct FactoryLens<'a> {
+struct ProjLens<'a> {
     pub inner_value: u32,  // owned, from inner.value
     pub name_ref: &'a str, // borrow &str from String
 }
 
-#[drv::factory]
-impl<'a> From<&'a Outer> for FactoryLens<'a> {
+#[drv::proj]
+impl<'a> From<&'a Outer> for ProjLens<'a> {
     fn from(v: &'a Outer) -> Self {
         Self {
             inner_value: v.inner.value,
@@ -385,29 +385,29 @@ impl<'a> From<&'a Outer> for FactoryLens<'a> {
 }
 
 #[drv::memo]
-fn factory_derived(lens: &FactoryLens) -> String {
+fn proj_derived(lens: &ProjLens) -> String {
     format!("{}={}", lens.name_ref, lens.inner_value)
 }
 
-static FACTORY_HIT_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+static PROJ_HIT_COMPUTES: AtomicUsize = AtomicUsize::new(0);
 
 #[drv::memo]
-fn factory_derived_for_hit(lens: &FactoryLens) -> String {
-    FACTORY_HIT_COMPUTES.fetch_add(1, Ordering::SeqCst);
+fn proj_derived_for_hit(lens: &ProjLens) -> String {
+    PROJ_HIT_COMPUTES.fetch_add(1, Ordering::SeqCst);
     format!("{}={}", lens.name_ref, lens.inner_value)
 }
 
-static FACTORY_MISS_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+static PROJ_MISS_COMPUTES: AtomicUsize = AtomicUsize::new(0);
 
 #[drv::memo]
-fn factory_derived_for_miss(lens: &FactoryLens) -> String {
-    FACTORY_MISS_COMPUTES.fetch_add(1, Ordering::SeqCst);
+fn proj_derived_for_miss(lens: &ProjLens) -> String {
+    PROJ_MISS_COMPUTES.fetch_add(1, Ordering::SeqCst);
     format!("{}={}", lens.name_ref, lens.inner_value)
 }
 
-// Factory lens used together with a regular lens in a multi-lens memo.
+// Projection lens used together with a regular lens in a multi-lens memo.
 #[drv::memo]
-fn factory_plus_regular(fl: &FactoryLens, bl: &BaseLens) -> String {
+fn proj_plus_regular(fl: &ProjLens, bl: &BaseLens) -> String {
     format!("{}-{}", fl.name_ref, bl.base)
 }
 
@@ -938,11 +938,11 @@ fn arc_ptr_eq_fast_path() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Factory lens tests
+// Projection lens tests
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn factory_lens_basic() {
+fn proj_lens_basic() {
     let a = Outer {
         inner: Inner {
             value: 42,
@@ -951,11 +951,11 @@ fn factory_lens_basic() {
         name: "test".into(),
         ..Default::default()
     };
-    assert_eq!(factory_derived(&a), "test=42");
+    assert_eq!(proj_derived(&a), "test=42");
 }
 
 #[test]
-fn factory_lens_cache_hit() {
+fn proj_lens_cache_hit() {
     let mut a = Outer {
         inner: Inner {
             value: 10,
@@ -964,22 +964,22 @@ fn factory_lens_cache_hit() {
         name: "foo".into(),
         ..Default::default()
     };
-    assert_eq!(factory_derived_for_hit(&a), "foo=10");
-    assert_eq!(FACTORY_HIT_COMPUTES.load(Ordering::SeqCst), 1);
+    assert_eq!(proj_derived_for_hit(&a), "foo=10");
+    assert_eq!(PROJ_HIT_COMPUTES.load(Ordering::SeqCst), 1);
 
-    // Change a field the factory lens doesn't project → cache hit.
+    // Change a field the lens doesn't project → cache hit.
     a.count = 999;
-    assert_eq!(factory_derived_for_hit(&a), "foo=10");
-    assert_eq!(FACTORY_HIT_COMPUTES.load(Ordering::SeqCst), 1);
+    assert_eq!(proj_derived_for_hit(&a), "foo=10");
+    assert_eq!(PROJ_HIT_COMPUTES.load(Ordering::SeqCst), 1);
 
     // Change inner.label — also not projected → cache hit.
     a.inner.label = "changed".into();
-    assert_eq!(factory_derived_for_hit(&a), "foo=10");
-    assert_eq!(FACTORY_HIT_COMPUTES.load(Ordering::SeqCst), 1);
+    assert_eq!(proj_derived_for_hit(&a), "foo=10");
+    assert_eq!(PROJ_HIT_COMPUTES.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn factory_lens_cache_miss() {
+fn proj_lens_cache_miss() {
     let mut a = Outer {
         inner: Inner {
             value: 10,
@@ -988,22 +988,22 @@ fn factory_lens_cache_miss() {
         name: "foo".into(),
         ..Default::default()
     };
-    assert_eq!(factory_derived_for_miss(&a), "foo=10");
-    assert_eq!(FACTORY_MISS_COMPUTES.load(Ordering::SeqCst), 1);
+    assert_eq!(proj_derived_for_miss(&a), "foo=10");
+    assert_eq!(PROJ_MISS_COMPUTES.load(Ordering::SeqCst), 1);
 
     // Change inner.value — projected as inner_value → cache miss.
     a.inner.value = 20;
-    assert_eq!(factory_derived_for_miss(&a), "foo=20");
-    assert_eq!(FACTORY_MISS_COMPUTES.load(Ordering::SeqCst), 2);
+    assert_eq!(proj_derived_for_miss(&a), "foo=20");
+    assert_eq!(PROJ_MISS_COMPUTES.load(Ordering::SeqCst), 2);
 
     // Change name — projected as name_ref → cache miss.
     a.name = "bar".into();
-    assert_eq!(factory_derived_for_miss(&a), "bar=20");
-    assert_eq!(FACTORY_MISS_COMPUTES.load(Ordering::SeqCst), 3);
+    assert_eq!(proj_derived_for_miss(&a), "bar=20");
+    assert_eq!(PROJ_MISS_COMPUTES.load(Ordering::SeqCst), 3);
 }
 
 #[test]
-fn factory_lens_mixed_with_regular() {
+fn proj_lens_mixed_with_regular() {
     let outer = Outer {
         inner: Inner {
             value: 5,
@@ -1016,11 +1016,11 @@ fn factory_lens_mixed_with_regular() {
         base: 7,
         ..Default::default()
     };
-    assert_eq!(factory_plus_regular(&outer, &mixed), "hello-7");
+    assert_eq!(proj_plus_regular(&outer, &mixed), "hello-7");
 }
 
 #[test]
-fn factory_lens_send() {
+fn proj_lens_send() {
     fn assert_send<T: Send>() {}
     assert_send::<Outer>();
 }

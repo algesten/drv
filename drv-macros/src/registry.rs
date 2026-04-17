@@ -16,7 +16,7 @@ pub struct Registry {
     pub atoms: Vec<AtomRegistration>,
     pub lenses: Vec<LensRegistration>,
     pub memos: Vec<MemoRegistration>,
-    pub factory_impls: Vec<FactoryRegistration>,
+    pub proj_impls: Vec<ProjRegistration>,
 }
 
 #[derive(Clone)]
@@ -38,16 +38,17 @@ pub struct LensRegistration {
     pub fields: Vec<LensField>,
     /// True if this is an "identity lens" — the lens IS the atom (all fields).
     pub is_identity: bool,
-    /// True if this is a "factory lens" — user writes their own From impl.
-    pub is_factory: bool,
+    /// True if this lens uses a user-written `#[drv::proj]` projection impl
+    /// instead of a macro-generated one.
+    pub is_proj: bool,
 }
 
 #[derive(Clone)]
 pub struct LensField {
     pub name: String,
-    // Fields below are populated for factory lenses. Not read from the
-    // registry directly — factory lens code gen happens at #[drv::lens] time,
-    // not at assemble!() time. Retained for potential future use.
+    // Fields below are populated for lenses with a #[drv::proj] impl. Not read
+    // from the registry directly — code gen happens at #[drv::lens] time, not
+    // at assemble!() time. Retained for potential future use.
     #[allow(dead_code)]
     pub ty_tokens: Option<String>,
     #[allow(dead_code)]
@@ -57,7 +58,7 @@ pub struct LensField {
 }
 
 #[derive(Clone)]
-pub struct FactoryRegistration {
+pub struct ProjRegistration {
     pub lens_name: String,
     #[allow(dead_code)]
     pub atom_name: String,
@@ -115,8 +116,8 @@ impl Registry {
         self.atoms.iter().any(|a| a.name == name)
     }
 
-    pub fn factory_exists(&self, lens_name: &str) -> bool {
-        self.factory_impls.iter().any(|f| f.lens_name == lens_name)
+    pub fn proj_exists(&self, lens_name: &str) -> bool {
+        self.proj_impls.iter().any(|p| p.lens_name == lens_name)
     }
 
     pub fn atom_field_names(&self, atom_name: &str) -> Vec<String> {

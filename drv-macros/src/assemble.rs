@@ -8,13 +8,13 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
     registry::with(|reg| {
         let mut output = TokenStream::new();
 
-        // Validate: every factory lens must have a matching #[drv::factory] impl.
+        // Validate: every lens marked as is_proj must have a matching #[drv::proj] impl.
         for lens in &reg.lenses {
-            if lens.is_factory && !reg.factory_exists(&lens.name) {
+            if lens.is_proj && !reg.proj_exists(&lens.name) {
                 return Err(syn::Error::new(
                     Span::call_site(),
                     format!(
-                        "factory lens '{}' requires a `#[drv::factory]` annotated \
+                        "lens '{}' requires a `#[drv::proj]` annotated \
                          `impl From<&{}> for {}`\n\
                          hint: if this should be a standard lens, ensure all field \
                          names and types match atom '{}'",

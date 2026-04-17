@@ -73,15 +73,15 @@ set of language primitives that are always `Copy` and always trivially cheap
 to copy. A user-defined `#[derive(Copy)] struct Foo(u32)` looks like any
 other path type to the macro, and so must be written as `&Foo`. For fields
 that should be owned clones, computed values, or different types from the
-atom, use a factory lens.
+atom, write a custom projection with `#[drv::proj]`.
 
-**Factory lenses** have user-defined fields that may differ from the atom
-in name, type, or nesting depth. The user writes the `From<&Atom>`
-conversion (annotated with `#[drv::factory]`), and the macro generates
-the snapshot and comparison logic. This allows reaching into nested
-structs, borrowing `&str` from `String` fields, or projecting computed
-values. Factory lenses are detected automatically when the lens struct's
-fields don't match the atom.
+**Lenses with a `#[drv::proj]` impl** have user-defined fields that may
+differ from the atom in name, type, or nesting depth. The user writes the
+`From<&Atom>` conversion (annotated with `#[drv::proj]`), and the macro
+generates the snapshot and comparison logic. This allows reaching into
+nested structs, borrowing `&str` from `String` fields, or projecting
+computed values. This mode is triggered automatically when the lens
+struct's fields don't match the atom.
 
 In FP optics, a lens is a composable accessor into a product type. Here we use
 only the "getter" half (projection). In database terms, the lens is a **view
@@ -92,10 +92,11 @@ The connection to the incremental computation literature is precise: the lens
 is a **verifying trace** (Build Systems a la Carte, Mokhov et al. 2018). The
 trace records which inputs were read; the rebuilder compares the trace against
 current values to decide whether to recompute. In `drv`, the trace is the
-lens struct itself, and the comparison is `PartialEq`. For factory lenses,
-the trace is the *projected* values — the comparison happens on the lens
-output, not on the raw atom fields. This means changes to atom fields that
-produce the same projected values do not trigger recomputation.
+lens struct itself, and the comparison is `PartialEq`. For lenses with a
+custom `#[drv::proj]` projection, the trace is the *projected* values —
+the comparison happens on the lens output, not on the raw atom fields. This
+means changes to atom fields that produce the same projected values do not
+trigger recomputation.
 
 The atom itself can also be used as a lens — the "identity lens" over all data
 fields. This is a convenience for computations that genuinely depend on
@@ -134,8 +135,9 @@ struct MyLens {
 ```
 
 This type is the dependency. For standard lenses, the compiler verifies it
-(field names and types must match the atom). For factory lenses, the user
-writes the projection and the compiler verifies the `From` impl compiles.
+(field names and types must match the atom). For lenses with a `#[drv::proj]`
+impl, the user writes the projection and the compiler verifies the `From`
+impl compiles.
 The runtime uses the lens for field-by-field `PartialEq`. There is nothing
 else — no tracking table, no subscription list, no proxy object.
 

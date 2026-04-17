@@ -2,9 +2,9 @@
 
 mod assemble;
 mod atom;
-mod factory;
 mod lens;
 mod memo;
+mod proj;
 mod registry;
 
 use proc_macro::TokenStream;
@@ -56,18 +56,18 @@ pub fn memo(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Mark a `From` impl as a factory for a factory lens.
+/// Mark a `From` impl as the projection function for a lens.
 ///
 /// When a `#[drv::lens(Atom)]` struct has fields that don't match the atom
-/// (different names, different types, nested access), it becomes a factory lens.
-/// The user provides the `From<&Atom>` conversion, and this attribute injects
-/// the hidden `__drv` cache reference into the struct construction.
+/// (different names, different types, nested access), the user writes the
+/// `From<&Atom>` conversion explicitly. This attribute injects the hidden
+/// `__drv` cache reference into the struct construction.
 ///
-/// Usage: `#[drv::factory]` on `impl<'a> From<&'a Atom> for MyLens<'a> { ... }`
+/// Usage: `#[drv::proj]` on `impl<'a> From<&'a Atom> for MyLens<'a> { ... }`
 #[proc_macro_attribute]
-pub fn factory(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn proj(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = syn::parse_macro_input!(item as syn::ItemImpl);
-    match factory::expand(item) {
+    match proj::expand(item) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }

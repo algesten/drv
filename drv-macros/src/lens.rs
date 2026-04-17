@@ -70,8 +70,8 @@ pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::E
                     "field '{}' has a non-Copy type — standalone lenses only \
                      store Copy primitives by value\n\
                      hint: prefix the type with `&` to borrow from the atom, \
-                     or declare a factory lens (field types differ from atom) \
-                     to own a clone",
+                     or declare a custom projection via #[drv::proj] (field \
+                     types differ from atom) to own a clone",
                     field_name
                 ),
             ));
@@ -98,7 +98,7 @@ pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::E
         validate_standard_generics(&item, fields, &force_ref)?;
         expand_standard(atom_name, lens_name, fields, &atom, &force_ref)
     } else {
-        expand_factory(atom_name, lens_name, &item, fields)
+        expand_proj(atom_name, lens_name, &item, fields)
     }
 }
 
@@ -227,7 +227,7 @@ fn expand_standard(
             atom_name: atom_name.to_string(),
             fields: lens_fields,
             is_identity: false,
-            is_factory: false,
+            is_proj: false,
         });
 
         Ok(())
@@ -271,13 +271,14 @@ fn expand_standard(
     Ok(output)
 }
 
-fn expand_factory(
+fn expand_proj(
     atom_name: &Ident,
     lens_name: &Ident,
     item: &ItemStruct,
     fields: &syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
 ) -> Result<TokenStream, syn::Error> {
-    // Register as factory lens with full type info.
+    // Register as a proj-lens with full type info; a matching
+    // `#[drv::proj]` impl is required later.
     registry::with(|reg| {
         if reg.lens_name_exists(&lens_name.to_string()) {
             return Err(syn::Error::new_spanned(
@@ -314,7 +315,7 @@ fn expand_factory(
             atom_name: atom_name.to_string(),
             fields: lens_fields,
             is_identity: false,
-            is_factory: true,
+            is_proj: true,
         });
 
         Ok(())
@@ -333,7 +334,8 @@ fn expand_factory(
         None => {
             return Err(syn::Error::new_spanned(
                 &item.ident,
-                "factory lens requires a lifetime parameter (e.g., `struct MyLens<'a> { ... }`)\n\
+                "lens with a #[drv::proj] impl requires a lifetime parameter \
+                 (e.g., `struct MyLens<'a> { ... }`)\n\
                  hint: the cache reference `__drv` borrows from the source atom",
             ));
         }
@@ -367,7 +369,7 @@ fn expand_factory(
     };
 
     // Generate snapshot struct, PartialEq, __drv_snapshot.
-    output.extend(generate_factory_lens_types(
+    output.extend(generate_proj_lens_types(
         lens_name,
         &snapshot_ident,
         fields,
@@ -377,8 +379,9 @@ fn expand_factory(
     Ok(output)
 }
 
-/// Generate snapshot struct, PartialEq, and __drv_snapshot for a factory lens.
-fn generate_factory_lens_types(
+/// Generate snapshot struct, PartialEq, and __drv_snapshot for a lens that uses
+/// a user-written `#[drv::proj]` projection.
+fn generate_proj_lens_types(
     lens_ident: &Ident,
     snapshot_ident: &Ident,
     fields: &syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
@@ -428,7 +431,7 @@ fn generate_factory_lens_types(
             #(#snap_fields,)*
         }
 
-        // Cross-type PartialEq: factory lens vs owned snapshot.
+        // Cross-type PartialEq: proj lens vs owned snapshot.
         impl<#lifetime> ::core::cmp::PartialEq<#snapshot_ident> for #lens_ident<#lifetime> {
             fn eq(&self, other: &#snapshot_ident) -> bool {
                 #(#eq_checks)&&*

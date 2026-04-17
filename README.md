@@ -60,8 +60,8 @@ In all generated lenses, built-in scalar primitives (`u32`, `bool`, `f64`,
 `usize`, etc.) are stored **by value** — `lens.x` gives `u32` directly, no
 dereference needed. All other types are borrowed as `&T`. User-defined
 `Copy` types are *not* auto-detected (the proc macro can only recognise
-language built-ins); use a factory lens for full control over field
-representation.
+language built-ins); for full control over field representation, declare
+the projection explicitly with `#[drv::proj]`.
 
 ### Inline: annotate fields on the atom
 
@@ -107,18 +107,18 @@ Only built-in primitive Copy types (`u8`..`u128`, `i8`..`i128`, `usize`, `isize`
 as `&'a T`. The lens struct must be valid Rust on its own (the
 `#[drv::lens(...)]` attribute is a no-op when stripped), so any reference
 field requires a lifetime parameter declared on the struct. If you need a
-clone (or a projection into a nested struct, or a different type), declare
-a factory lens instead.
+clone (or a projection into a nested struct, or a different type), write
+a custom projection with `#[drv::proj]` instead.
 
 Use standalone lenses when the lens is defined closer to the memo that consumes
 it, or when the atom is in another module and you don't want to modify it.
 
-### Factory: custom projection with `#[drv::factory]`
+### Custom projection with `#[drv::proj]`
 
 When you need lens fields that don't match the atom — different names, different
-types, or reaching into nested structs — use a factory lens. You declare the lens
-struct with `#[drv::lens(Atom)]` and write your own `From` impl annotated with
-`#[drv::factory]`:
+types, or reaching into nested structs — write the projection yourself. You declare
+the lens struct with `#[drv::lens(Atom)]` and annotate the `From` impl with
+`#[drv::proj]`:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -134,15 +134,15 @@ pub struct Container {
     pub count: u32,
 }
 
-// Fields don't match the atom — this becomes a factory lens.
+// Fields don't match the atom — we provide our own projection.
 #[drv::lens(Container)]
 struct ProjectedLens<'a> {
     pub x: u32,            // owned copy of a nested field
     pub name: &'a str,     // borrow &str from a String field
 }
 
-// You write the projection. drv::factory injects the cache reference.
-#[drv::factory]
+// The projection function. drv::proj injects the cache reference.
+#[drv::proj]
 impl<'a> From<&'a Container> for ProjectedLens<'a> {
     fn from(v: &'a Container) -> Self {
         Self {
@@ -165,14 +165,14 @@ let c = Container {
 assert_eq!(display(&c), "hello=42");
 ```
 
-The macro detects factory mode automatically when the lens struct's fields don't
+The macro switches to this mode automatically when the lens struct's fields don't
 match the atom. It keeps your struct definition (adding only a hidden `__drv`
 field), generates the snapshot and comparison logic, and rewrites your `From` impl
-to inject the cache reference. Factory lenses require a lifetime parameter on the
-struct (for the cache reference).
+to inject the cache reference. Lenses with a `#[drv::proj]` impl require a lifetime
+parameter on the struct (for the cache reference).
 
-Factory lenses work identically with memos — cache hits, misses, multi-lens
-parameters, and value parameters all behave the same as standard lenses.
+They work identically with memos — cache hits, misses, multi-lens parameters,
+and value parameters all behave the same as standard lenses.
 
 ## Calling memos
 
