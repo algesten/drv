@@ -1,0 +1,6 @@
+error: field 'items' has a non-Copy type — standalone lenses only store Copy primitives by value
+       hint: prefix the type with `&` to borrow from the atom, or declare a factory lens (field types differ from atom) to own a clone
+  --> tests/compile_fail/standalone_vec_owned.rs:12:16
+   |
+12 |     pub items: Vec<u32>,
+   |                ^^^^^^^^

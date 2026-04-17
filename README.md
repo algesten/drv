@@ -96,11 +96,19 @@ that every field name and type matches the atom:
 
 ```rust
 #[drv::lens(AppState)]
-struct MyLens {
-    pub items: Vec<u32>,
+struct MyLens<'a> {
+    pub items: &'a Vec<u32>,
     pub viewport_rows: u32,
 }
 ```
+
+Only built-in primitive Copy types (`u8`..`u128`, `i8`..`i128`, `usize`, `isize`, `f32`,
+`f64`, `bool`, `char`) may appear by value — any other type must be written
+as `&'a T`. The lens struct must be valid Rust on its own (the
+`#[drv::lens(...)]` attribute is a no-op when stripped), so any reference
+field requires a lifetime parameter declared on the struct. If you need a
+clone (or a projection into a nested struct, or a different type), declare
+a factory lens instead.
 
 Use standalone lenses when the lens is defined closer to the memo that consumes
 it, or when the atom is in another module and you don't want to modify it.
@@ -288,8 +296,8 @@ pub struct Game {
 
 // Lens over Game → produces Stats (itself an atom).
 #[drv::lens(Game)]
-struct HitsLens {
-    pub hits: Vec<u32>,
+struct HitsLens<'a> {
+    pub hits: &'a Vec<u32>,
 }
 
 #[drv::memo]

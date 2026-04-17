@@ -59,20 +59,21 @@ There are two kinds of lens:
 **Standard lenses** have fields that are a strict subset of an atom's
 fields — same names, same types. The macro verifies this at compile time
 and auto-generates the projection. Built-in scalar primitives (`u8`–`u128`,
-`i8`–`i128`, `usize`, `isize`, `f32`, `f64`, `bool`, `char`) are copied
-by value into the lens, so `lens.x` gives `u32` directly with no
-dereference needed. All other types — including user-defined `Copy` types —
-are borrowed as `&'drv T`. In a standalone lens declaration, the user can
-write `&T` explicitly to force a reference even for a built-in primitive.
+`i8`–`i128`, `usize`, `isize`, `f32`, `f64`, `bool`, `char`) may be declared
+by value, so `lens.x` gives `u32` directly with no dereference needed. All
+other types must be declared as `&'a T` — the lens struct itself must be
+valid Rust, so any reference field requires a lifetime parameter on the
+struct (`struct MyLens<'a> { ... }`). A built-in primitive may also be
+written as `&'a T` to force a reference.
 
 The restriction to built-in primitives is deliberate: the proc macro cannot
 query trait implementations (like `Copy`) at expansion time — it only sees
-syntax. Rather than guessing based on heuristics or requiring the user to
-annotate every field, `drv` recognises the fixed set of language primitives
-that are always `Copy` and always trivially cheap to copy. A user-defined
-`#[derive(Copy)] struct Foo(u32)` looks like any other path type to the
-macro, so it stays as `&'drv Foo`. For full control over field
-representation, use a factory lens.
+syntax. Rather than guessing based on heuristics, `drv` recognises the fixed
+set of language primitives that are always `Copy` and always trivially cheap
+to copy. A user-defined `#[derive(Copy)] struct Foo(u32)` looks like any
+other path type to the macro, and so must be written as `&Foo`. For fields
+that should be owned clones, computed values, or different types from the
+atom, use a factory lens.
 
 **Factory lenses** have user-defined fields that may differ from the atom
 in name, type, or nesting depth. The user writes the `From<&Atom>`
@@ -205,7 +206,7 @@ The evaluation flow:
 ```
 call memo(&atom)
   → convert &atom into the lens (auto via Into):
-      Copy primitives are copied by value, others borrowed by reference
+      built-in primitive Copy types are copied by value, others borrowed by reference
   → take a short shared borrow of atom.__drv
   → compare each lens field against the cached snapshot
     → all equal: clone the cached output, DROP the borrow, return it (FAST PATH)

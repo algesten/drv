@@ -53,8 +53,8 @@ pub struct Dashboard {
 }
 
 #[drv::lens(Dashboard)]
-struct NotificationLens {
-    pub user_name: String,
+struct NotificationLens<'a> {
+    pub user_name: &'a String,
     pub notification_count: u32,
 }
 
@@ -68,8 +68,8 @@ fn notification_badge(lens: &NotificationLens) -> String {
 }
 
 #[drv::lens(Dashboard)]
-struct ItemsLens {
-    pub items: ImVector<String>,
+struct ItemsLens<'a> {
+    pub items: &'a ImVector<String>,
 }
 
 #[drv::memo]
@@ -176,13 +176,13 @@ fn is_positive(lens: &ValueLens) -> bool {
 // ══════════════════════════════════════════════════════════════════════
 
 #[drv::lens(Editor)]
-struct EditorTabsLens {
-    pub tabs: ImVector<String>,
+struct EditorTabsLens<'a> {
+    pub tabs: &'a ImVector<String>,
 }
 
 #[drv::lens(Dashboard)]
-struct DashboardUserLens {
-    pub user_name: String,
+struct DashboardUserLens<'a> {
+    pub user_name: &'a String,
 }
 
 #[drv::memo]
@@ -356,9 +356,9 @@ pub struct CopyTest {
 // x is owned (u32 = copy primitive, auto-detected).
 // y is forced to reference via &u32 in the lens spec.
 #[drv::lens(CopyTest)]
-struct CopyMixLens {
+struct CopyMixLens<'a> {
     pub x: u32,
-    pub y: &u32,
+    pub y: &'a u32,
 }
 
 #[drv::memo]

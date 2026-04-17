@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Fields, Ident, ItemStruct};
 
-use crate::atom::generate_lens_types_with;
+use crate::atom::{generate_lens_types_with, is_copy_primitive};
 use crate::registry::{self, LensField, LensRegistration};
 
 pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::Error> {
@@ -44,7 +44,8 @@ pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::E
         }
     })?;
 
-    // Check if all fields match the atom. Accept both `T` and `&T` when atom has `T`.
+    // Check if all fields match the atom. Accept `T` only for Copy primitives,
+    // and `&T` for any type where the atom has `T`.
     // Track which fields the user wrote as explicit references.
     let mut force_ref: Vec<bool> = Vec::new();
     let mut all_match = true;
@@ -53,13 +54,27 @@ pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::E
         let field_ty = &field.ty;
         let field_ty_tokens = registry::type_to_tokens(field_ty);
 
-        // Direct match: lens type == atom type
+        // Direct match: lens type == atom type. Only allowed for Copy primitives —
+        // non-Copy types must be written as `&T` to make the borrow explicit.
         let direct = atom.fields.iter().any(|af| {
             field_name == af.name.as_str() && registry::types_match(&af.ty_tokens, &field_ty_tokens)
         });
         if direct {
-            force_ref.push(false);
-            continue;
+            if is_copy_primitive(field_ty) {
+                force_ref.push(false);
+                continue;
+            }
+            return Err(syn::Error::new_spanned(
+                field_ty,
+                format!(
+                    "field '{}' has a non-Copy type — standalone lenses only \
+                     store Copy primitives by value\n\
+                     hint: prefix the type with `&` to borrow from the atom, \
+                     or declare a factory lens (field types differ from atom) \
+                     to own a clone",
+                    field_name
+                ),
+            ));
         }
 
         // Reference match: lens has &T, atom has T
@@ -80,10 +95,84 @@ pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::E
     }
 
     if all_match {
+        validate_standard_generics(&item, fields, &force_ref)?;
         expand_standard(atom_name, lens_name, fields, &atom, &force_ref)
     } else {
         expand_factory(atom_name, lens_name, &item, fields)
     }
+}
+
+/// A standalone lens must be valid Rust on its own (the attribute is a no-op when
+/// stripped). So reference fields need a lifetime parameter declared on the struct,
+/// and that lifetime must be the one used on every reference. Lenses with no
+/// reference fields must not declare a lifetime (it would be unused).
+fn validate_standard_generics(
+    item: &ItemStruct,
+    fields: &syn::punctuated::Punctuated<syn::Field, syn::Token![,]>,
+    force_ref: &[bool],
+) -> Result<(), syn::Error> {
+    let has_refs = force_ref.iter().any(|&b| b);
+    let lifetimes: Vec<_> = item.generics.lifetimes().collect();
+
+    if item.generics.type_params().next().is_some() || item.generics.const_params().next().is_some()
+    {
+        return Err(syn::Error::new_spanned(
+            &item.generics,
+            "standalone lens cannot have type or const generic parameters",
+        ));
+    }
+
+    if has_refs {
+        if lifetimes.is_empty() {
+            return Err(syn::Error::new_spanned(
+                &item.ident,
+                "standalone lens with reference fields requires a lifetime parameter\n\
+                 hint: declare it as `struct MyLens<'a> { pub x: &'a T, ... }`",
+            ));
+        }
+        if lifetimes.len() > 1 {
+            return Err(syn::Error::new_spanned(
+                &item.generics,
+                "standalone lens must declare exactly one lifetime parameter",
+            ));
+        }
+        let expected = &lifetimes[0].lifetime;
+        for (i, field) in fields.iter().enumerate() {
+            if force_ref[i] {
+                if let syn::Type::Reference(r) = &field.ty {
+                    match &r.lifetime {
+                        Some(actual) if actual.ident == expected.ident => {}
+                        Some(actual) => {
+                            return Err(syn::Error::new_spanned(
+                                actual,
+                                format!(
+                                    "reference field lifetime must match the struct's \
+                                     parameter `'{}`",
+                                    expected.ident
+                                ),
+                            ));
+                        }
+                        None => {
+                            return Err(syn::Error::new_spanned(
+                                r.and_token,
+                                format!(
+                                    "reference field requires an explicit lifetime `'{}`",
+                                    expected.ident
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    } else if !lifetimes.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &item.generics,
+            "standalone lens declares a lifetime parameter but has no reference fields",
+        ));
+    }
+
+    Ok(())
 }
 
 fn expand_standard(
