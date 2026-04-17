@@ -384,11 +384,24 @@ impl<'a> From<&'a Outer> for FactoryLens<'a> {
     }
 }
 
-static FACTORY_MEMO_COMPUTES: AtomicUsize = AtomicUsize::new(0);
-
 #[drv::memo]
 fn factory_derived(lens: &FactoryLens) -> String {
-    FACTORY_MEMO_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    format!("{}={}", lens.name_ref, lens.inner_value)
+}
+
+static FACTORY_HIT_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo]
+fn factory_derived_for_hit(lens: &FactoryLens) -> String {
+    FACTORY_HIT_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    format!("{}={}", lens.name_ref, lens.inner_value)
+}
+
+static FACTORY_MISS_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo]
+fn factory_derived_for_miss(lens: &FactoryLens) -> String {
+    FACTORY_MISS_COMPUTES.fetch_add(1, Ordering::SeqCst);
     format!("{}={}", lens.name_ref, lens.inner_value)
 }
 
@@ -951,24 +964,18 @@ fn factory_lens_cache_hit() {
         name: "foo".into(),
         ..Default::default()
     };
-    assert_eq!(factory_derived(&a), "foo=10");
-    let count_after_first = FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst);
+    assert_eq!(factory_derived_for_hit(&a), "foo=10");
+    assert_eq!(FACTORY_HIT_COMPUTES.load(Ordering::SeqCst), 1);
 
     // Change a field the factory lens doesn't project → cache hit.
     a.count = 999;
-    assert_eq!(factory_derived(&a), "foo=10");
-    assert_eq!(
-        FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst),
-        count_after_first
-    );
+    assert_eq!(factory_derived_for_hit(&a), "foo=10");
+    assert_eq!(FACTORY_HIT_COMPUTES.load(Ordering::SeqCst), 1);
 
     // Change inner.label — also not projected → cache hit.
     a.inner.label = "changed".into();
-    assert_eq!(factory_derived(&a), "foo=10");
-    assert_eq!(
-        FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst),
-        count_after_first
-    );
+    assert_eq!(factory_derived_for_hit(&a), "foo=10");
+    assert_eq!(FACTORY_HIT_COMPUTES.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -981,19 +988,18 @@ fn factory_lens_cache_miss() {
         name: "foo".into(),
         ..Default::default()
     };
-    assert_eq!(factory_derived(&a), "foo=10");
-    let c0 = FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst);
+    assert_eq!(factory_derived_for_miss(&a), "foo=10");
+    assert_eq!(FACTORY_MISS_COMPUTES.load(Ordering::SeqCst), 1);
 
     // Change inner.value — projected as inner_value → cache miss.
     a.inner.value = 20;
-    assert_eq!(factory_derived(&a), "foo=20");
-    let c1 = FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst);
-    assert_eq!(c1, c0 + 1);
+    assert_eq!(factory_derived_for_miss(&a), "foo=20");
+    assert_eq!(FACTORY_MISS_COMPUTES.load(Ordering::SeqCst), 2);
 
     // Change name — projected as name_ref → cache miss.
     a.name = "bar".into();
-    assert_eq!(factory_derived(&a), "bar=20");
-    assert_eq!(FACTORY_MEMO_COMPUTES.load(Ordering::SeqCst), c1 + 1);
+    assert_eq!(factory_derived_for_miss(&a), "bar=20");
+    assert_eq!(FACTORY_MISS_COMPUTES.load(Ordering::SeqCst), 3);
 }
 
 #[test]
