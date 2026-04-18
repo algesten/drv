@@ -5,14 +5,8 @@ use drv::Atom;
 
 /// Holds only the traits drv genuinely requires for lens participation:
 /// `PartialEq + Clone` (+ `Debug` for the lens struct's derive).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LensReady(pub u32);
-
-impl Default for LensReady {
-    fn default() -> Self {
-        LensReady(0)
-    }
-}
 
 /// Deliberately bare — no `PartialEq`, no `Clone`, no `Debug`, no `Default`.
 /// Safe to place on an atom as long as no memo consumes the identity lens and

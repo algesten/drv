@@ -1,10 +1,10 @@
-error[E0277]: the trait bound `Foo: Sealed` is not satisfied
+error[E0277]: the trait bound `Foo: drv::__sealed::Sealed` is not satisfied
   --> tests/compile_fail/external_atomized_impl.rs:10:24
    |
 10 | impl drv::Atomized for Foo {
    |                        ^^^ unsatisfied trait bound
    |
-help: the trait `Sealed` is not implemented for `Foo`
+help: the trait `drv::__sealed::Sealed` is not implemented for `Foo`
   --> tests/compile_fail/external_atomized_impl.rs:6:1
    |
  6 | pub struct Foo {
