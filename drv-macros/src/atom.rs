@@ -220,6 +220,7 @@ pub(crate) fn generate_lens_types_with(
     let mut eq_checks = Vec::new();
     let mut from_fields = Vec::new();
     let mut snap_stores = Vec::new();
+    let mut name_copies = Vec::new();
 
     for (i, (name, ty)) in field_names.iter().zip(field_types.iter()).enumerate() {
         let is_ref = force_ref.get(i).copied().unwrap_or(false);
@@ -244,6 +245,9 @@ pub(crate) fn generate_lens_types_with(
             from_fields.push(quote! { #name: &(*source).#name });
             snap_stores.push(quote! { #name: (*self.#name).clone() });
         }
+        // Copy-by-field for the reference-clone `From<&Lens>` impl. Works for
+        // scalars and refs alike — every field of the lens is Copy.
+        name_copies.push(quote! { #name: source.#name });
     }
 
     let base = quote! {
@@ -275,6 +279,18 @@ pub(crate) fn generate_lens_types_with(
             pub fn __drv_snapshot(&self) -> #snapshot_ident {
                 #snapshot_ident {
                     #(#snap_stores,)*
+                }
+            }
+        }
+
+        // Reference-clone: lets a memo body pass `&Lens` to a sibling memo
+        // whose outer sig takes `impl Into<Lens<'_>>`. Fields are all Copy
+        // (scalars, refs, or `&Cache`), so the copy is cheap.
+        impl<'drv> ::core::convert::From<&#lens_ident<'drv>> for #lens_ident<'drv> {
+            fn from(source: &#lens_ident<'drv>) -> Self {
+                #lens_ident {
+                    __drv: source.__drv,
+                    #(#name_copies,)*
                 }
             }
         }

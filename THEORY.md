@@ -247,10 +247,12 @@ This gives a hard re-entrancy guarantee: a memo can re-enter the same
 `Atom<T>`'s cache from anywhere — recursively, through a captured wrapper
 reference in a closure, through user-controlled call paths that loop back
 into another memo — without triggering a `RefCell` double-borrow panic.
-The `Cache` uses `RefCell` (so `Atom<T>` is `Send` whenever `T: Send` but
-`!Sync`) on the assumption that all access is single-threaded, and the
-borrow-scoping rule above means the in-thread re-entry case is safe by
-construction.
+The common case is direct: a memo body receives `&Lens` (or `&Atom<T>`
+for an identity-lens memo) and can invoke sibling memos on the same atom
+by passing that reference straight through. The `Cache` uses `RefCell`
+(so `Atom<T>` is `Send` whenever `T: Send` but `!Sync`) on the assumption
+that all access is single-threaded, and the borrow-scoping rule above
+means the in-thread re-entry case is safe by construction.
 
 The return value is returned by value (`Clone::clone` of the cached output).
 For cheap types (`usize`, `String`, `imbl` collections), this is effectively

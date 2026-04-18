@@ -267,11 +267,7 @@ fn inner_memo(r: &Reentrant) -> u32 {
 
 #[drv::memo]
 fn outer_memo(r: &Reentrant) -> u32 {
-    // Under the Atom<T> wrapper design, a memo body holds `&MyStruct`, not
-    // `&Atom<MyStruct>`, so it cannot invoke another memo on the same atom
-    // from within — re-entrancy of that kind isn't expressible. Left as a
-    // pure function for the outer memo to exercise the caching path.
-    r.value * 2 + 1
+    inner_memo(r) + 1
 }
 
 // ══════════════════════════════════════════════════════════════════════

@@ -1,5 +1,5 @@
 use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote, ToTokens};
+use quote::{format_ident, quote};
 use syn::Ident;
 
 use crate::registry::{self, MemoParam};
@@ -223,29 +223,6 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
     let body: TokenStream = memo.body_tokens.parse().expect("body should parse");
     let input_struct = input_struct_ident(&memo.fn_name);
 
-    // __compute fn signature: preserves the user's original signature.
-    let compute_params: Vec<TokenStream> = memo
-        .params
-        .iter()
-        .map(|p| {
-            let pname = Ident::new(&p.param_name, Span::call_site());
-            match &p.kind {
-                MemoParamKind::Lens { lens_type, .. } => {
-                    quote! { #pname: &#lens_type }
-                }
-                MemoParamKind::Value { ty_tokens } => {
-                    let ty: syn::Type = syn::parse_str(ty_tokens).expect("value type should parse");
-                    quote! { #pname: #ty }
-                }
-                MemoParamKind::ValueRef { referent_tokens } => {
-                    let referent: syn::Type =
-                        syn::parse_str(referent_tokens).expect("referent type should parse");
-                    quote! { #pname: &#referent }
-                }
-            }
-        })
-        .collect();
-
     // Outer fn params, in declared order. Collect lifetime params as we go.
     let mut lifetime_params: Vec<TokenStream> = Vec::new();
     let outer_params: Vec<TokenStream> = memo
@@ -290,12 +267,18 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
         quote! { <#(#lifetime_params),*> }
     };
 
-    // Inside the function: convert each lens param into the lens value.
-    // - Regular lens: shadow `pname` with the converted lens, so downstream
-    //   references (cache, fresh-check, snapshot, compute) all see the lens.
-    // - Identity lens: keep `pname` as the atom reference (needed for the
-    //   user's `__compute`), and bind a sibling `__drvl_<pname>` to the
-    //   identity-lens view used by the cache machinery.
+    // Inside the function, rebind each lens param so the user's body sees the
+    // type they declared:
+    // - Regular lens: convert `impl Into<Lens>` to an owned `Lens` under a
+    //   hidden name, then rebind `pname` to `&Lens`. The body sees `&Lens`
+    //   (matching the user's declared signature) and can pass it to sibling
+    //   memos whose outer sig is `impl Into<Lens>` via the auto-generated
+    //   `From<&Lens> for Lens`.
+    // - Identity lens: keep `pname` as `&Atom<T>` (matching the user's body
+    //   by way of `Atom<T>: Deref<Target = T>`; re-entry `bar(a)` works
+    //   directly because sibling identity memos also take `&Atom<T>`). Bind
+    //   a sibling `__drvl_<pname>` for the cache machinery's freshness and
+    //   snapshot paths.
     let lens_expr = |p: &MemoParamLocal| -> TokenStream {
         let pname = Ident::new(&p.param_name, Span::call_site());
         match &p.kind {
@@ -323,7 +306,11 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                     quote! { let #v: #lens_ident<'_> = #pname.into(); }
                 }
                 MemoParamKind::Lens { .. } => {
-                    quote! { let #pname: _ = #pname.into(); }
+                    let owned = format_ident!("__drvl_owned_{}", p.param_name);
+                    quote! {
+                        let #owned = #pname.into();
+                        let #pname = &#owned;
+                    }
                 }
                 MemoParamKind::Value { .. } => quote! {},
                 MemoParamKind::ValueRef { .. } => quote! {},
@@ -349,9 +336,13 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
             let field = Ident::new(&p.param_name, Span::call_site());
             match &p.kind {
                 MemoParamKind::Lens { .. } => {
-                    // Regular and identity lenses both compare as `lens == prev.field`.
+                    // Method-call form works uniformly: for regular lenses
+                    // `#lens: &Lens` (after the `&` rebind) auto-matches `&self`;
+                    // for identity lenses `#lens: IdentityLens` auto-refs. The
+                    // only `eq` on the lens is `PartialEq<Snapshot>::eq`, so
+                    // there's no ambiguity.
                     let lens = lens_expr(p);
-                    quote! { #lens == __prev.#field }
+                    quote! { #lens.eq(&__prev.#field) }
                 }
                 MemoParamKind::Value { .. } => {
                     // FastEq enables ptr_eq short-circuit for Arc and imbl.
@@ -369,6 +360,23 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
         })
         .collect();
 
+    // Pre-body clones of owned value params, so the snapshot can be built
+    // after the body runs even if the body moved the param.
+    let value_snap_bindings: Vec<TokenStream> = memo
+        .params
+        .iter()
+        .filter_map(|p| match &p.kind {
+            MemoParamKind::Value { .. } => {
+                let pname = Ident::new(&p.param_name, Span::call_site());
+                let snap = format_ident!("__drv_snap_{}", p.param_name);
+                Some(quote! {
+                    let #snap = <_ as ::core::clone::Clone>::clone(&#pname);
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
     // Build the snapshot at cache-miss storage time.
     let snapshot_fields: Vec<TokenStream> = memo
         .params
@@ -382,7 +390,8 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                     quote! { #field: #lens.__drv_snapshot() }
                 }
                 MemoParamKind::Value { .. } => {
-                    quote! { #field: #pname }
+                    let snap = format_ident!("__drv_snap_{}", p.param_name);
+                    quote! { #field: #snap }
                 }
                 MemoParamKind::ValueRef { referent_tokens } => {
                     // Store the owned form via ToOwned::to_owned(&T) → T::Owned.
@@ -394,41 +403,8 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
         })
         .collect();
 
-    // Compute call args: pass lenses by reference, values by move. For value
-    // params we clone the value so it survives for the snapshot afterwards.
-    let compute_args: Vec<TokenStream> = memo
-        .params
-        .iter()
-        .map(|p| {
-            let pname = Ident::new(&p.param_name, Span::call_site());
-            match &p.kind {
-                MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-                    // #pname: &Atom<Atom>; user __compute takes &Atom, so deref.
-                    quote! { &**#pname }
-                }
-                MemoParamKind::Lens { .. } => {
-                    quote! { &#pname }
-                }
-                MemoParamKind::Value { .. } => {
-                    // Clone to pass to compute; the original is moved into the
-                    // snapshot below.
-                    quote! { #pname.clone() }
-                }
-                MemoParamKind::ValueRef { .. } => {
-                    // Pass the reference through directly; no clone needed
-                    // for the compute call.
-                    quote! { #pname }
-                }
-            }
-        })
-        .collect();
-
     quote! {
         #vis fn #fn_ident #generics (#(#outer_params),*) -> #output_ty {
-            fn __compute(#(#compute_params),*) -> #output_ty {
-                #body
-            }
-
             #(#conversions)*
 
             // Short shared borrow: cache hit returns a clone and releases.
@@ -443,8 +419,12 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                 }
             }
 
-            // Cache miss: compute with no borrow held.
-            let __out = __compute(#(#compute_args),*);
+            // Cache miss: clone any owned value params for the snapshot so the
+            // body is free to move them, then run the body inline with no
+            // cache borrow held. Re-entrancy to sibling memos works because
+            // the body sees `&Lens` (or `&Atom<T>` for identity) directly.
+            #(#value_snap_bindings)*
+            let __out: #output_ty = { #body };
 
             // Short exclusive borrow to store.
             {
@@ -486,15 +466,6 @@ fn build_memo_info(
                 } else {
                     format_ident!("__Drv{}", lens.name)
                 };
-                let lens_type = if lens.is_identity {
-                    // The user's `__compute` receives `&T` (not `&Lens`); the
-                    // identity-lens machinery is used only internally for
-                    // cache lookup / freshness / snapshot.
-                    Ident::new(&lens.atom_name, Span::call_site()).into_token_stream()
-                } else {
-                    let i = Ident::new(&lens.name, Span::call_site());
-                    quote! { #i<'_> }
-                };
 
                 params.push(MemoParamLocal {
                     param_name: param_name.clone(),
@@ -503,7 +474,6 @@ fn build_memo_info(
                         atom_name: lens.atom_name.clone(),
                         is_identity: lens.is_identity,
                         snapshot_ident,
-                        lens_type,
                     },
                 });
             }
@@ -565,7 +535,6 @@ enum MemoParamKind {
         atom_name: String,
         is_identity: bool,
         snapshot_ident: Ident,
-        lens_type: TokenStream,
     },
     Value {
         ty_tokens: String,

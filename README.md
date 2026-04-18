@@ -261,6 +261,38 @@ fn average(s: &Stats) -> u32 {
 Any change to any field of the atom invalidates the cache. Useful when you
 really do depend on everything.
 
+## Memos calling other memos
+
+A memo body may invoke another memo on the same atom — composition across
+derived values, with each memo's cache short-circuiting independently.
+Inner-memo re-entry is safe because the cache's `RefCell` is released
+before the body runs.
+
+```rust
+use drv::Atom;
+
+#[derive(Debug, Clone, PartialEq, Default)]
+#[drv::atom]
+pub struct Counter {
+    pub value: u32,
+}
+
+#[drv::memo]
+fn doubled(c: &Counter) -> u32 {
+    c.value * 2
+}
+
+#[drv::memo]
+fn doubled_plus_one(c: &Counter) -> u32 {
+    doubled(c) + 1   // calls a sibling memo on the same atom
+}
+
+drv::assemble!();
+
+let a = Atom::new(Counter { value: 10 });
+assert_eq!(doubled_plus_one(&a), 21);
+```
+
 ## Multiple lenses
 
 A memo can take lenses from multiple atoms. The cache lives in the first
