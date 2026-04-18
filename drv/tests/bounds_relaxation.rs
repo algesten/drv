@@ -1,8 +1,6 @@
 //! Verify that `#[drv::atom]` alone imposes no field-trait requirements and
 //! that fields outside any consumed lens carry no bounds.
 
-use drv::Atom;
-
 /// Holds only the traits drv genuinely requires for lens participation:
 /// `PartialEq + Clone` (+ `Debug` for the lens struct's derive).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -24,8 +22,8 @@ pub struct RelaxedAtom {
     pub opaque: Opaque,
 }
 
-#[drv::memo]
-fn doubled(lens: &Simple) -> u32 {
+#[drv::memo(single)]
+fn doubled<'a>(lens: impl Into<Simple<'a>>) -> u32 {
     lens.n.0 * 2
 }
 
@@ -33,11 +31,11 @@ drv::assemble!();
 
 #[test]
 fn atom_without_identity_consumer_and_no_bounds_on_unused_field() {
-    let atom = Atom::new(RelaxedAtom {
+    let atom = RelaxedAtom {
         n: LensReady(21),
         opaque: Opaque {
             _private: std::sync::Mutex::new(7),
         },
-    });
+    };
     assert_eq!(doubled(&atom), 42);
 }

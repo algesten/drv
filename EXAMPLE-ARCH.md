@@ -118,17 +118,17 @@ pub struct MicPreference {
 }
 ```
 
-At runtime each atom is held inside a `drv::Atom<T>` wrapper (via
-`Atom::new(MyAtom { ... })`); the wrapper owns the per-instance memoization
-cache. Drivers and the main loop pass `&mut Atom<T>` around, and field
-access (`atom.field`) goes through `Deref`/`DerefMut` to the inner data.
+At runtime each atom is just the plain struct — `MyAtom { ... }`. No
+wrapper, no hidden state. Memoization lives entirely in per-memo thread-
+local caches keyed by input value, so drivers and the main loop simply
+pass `&mut MyAtom` around and mutate fields directly.
 
 Why separate? The device driver should not need to know about user
 preferences. The UI handler should not need to know about OS enumeration.
 Memos bridge them:
 
 ```rust
-#[drv::memo]
+#[drv::memo(single)]
 fn mic_picker(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
     // lenses from two atoms — only the fields this memo reads
 }
@@ -205,7 +205,7 @@ pub struct MicEnumerationDriver {
 impl MicEnumerationDriver {
     /// Called on the main thread each tick. Drains pending events
     /// into the atom. Cheap — just field assignments.
-    pub fn process(&self, inv: &mut drv::Atom<MicInventory>) {
+    pub fn process(&self, inv: &mut MicInventory) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 MicEvent::PermissionGranted => {
@@ -227,7 +227,7 @@ impl MicEnumerationDriver {
     /// Initiate a permission request. The result arrives via rx.
     /// Must write Pending synchronously — without it, the next tick's
     /// query still sees NotAsked and would request permission again.
-    pub fn request_permission(&self, inv: &mut drv::Atom<MicInventory>) {
+    pub fn request_permission(&self, inv: &mut MicInventory) {
         inv.permission = MicPermission::Pending;
         self.platform.request_permission_async();
     }
@@ -249,7 +249,7 @@ pub struct MicStreamDriver {
 }
 
 impl MicStreamDriver {
-    pub fn execute(&self, action: MicAction, cap: &mut drv::Atom<MicCapture>) {
+    pub fn execute(&self, action: MicAction, cap: &mut MicCapture) {
         match action {
             MicAction::Open(id) => {
                 // 1. Sync: update atom immediately
@@ -300,7 +300,7 @@ The "close old stream when switching mics" case is easy to forget.
 ```rust
 /// "What mic should be open right now?"
 /// Multi-lens memo: lenses from two atoms, only the fields that matter.
-#[drv::memo]
+#[drv::memo(single)]
 fn desired_mic(inv: &MicListLens, pref: &MicSelectLens) -> Option<MicId> {
     match (*inv.permission, pref.selected) {
         (MicPermission::Granted, Some(id))
@@ -334,7 +334,7 @@ actually true. The diff is the action.
 
 ```rust
 /// "What should we do about the mic stream?"
-#[drv::memo]
+#[drv::memo(single)]
 fn mic_action(
     inv: &MicListLens,
     pref: &MicSelectLens,
@@ -414,7 +414,7 @@ The bridge converts pull into push.
 Each view has a corresponding memo that produces a view-specific model:
 
 ```rust
-#[drv::memo]
+#[drv::memo(single)]
 fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
     match inv.permission {
         MicPermission::NotAsked => MicPickerModel::NeedPermission,
@@ -428,20 +428,32 @@ fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
 }
 
 // Lenses for participant grid — only the fields this view needs.
-// Standalone lenses borrow non-Copy fields as `&'a T` (only built-in
-// Copy primitives may be stored by value), so the struct needs a lifetime.
-#[drv::lens(RemoteParticipants)]
+// Standalone lenses are a separate struct tagged with `#[drv::lens]`,
+// with a `From<&AtomName>` impl that projects into it.
+#[drv::lens]
 struct GridParticipantsLens<'a> {
     pub participants: &'a imbl::Vector<Participant>,
 }
 
-#[drv::lens(ParticipantSettings)]
+impl<'a> From<&'a RemoteParticipants> for GridParticipantsLens<'a> {
+    fn from(p: &'a RemoteParticipants) -> Self {
+        Self { participants: &p.participants }
+    }
+}
+
+#[drv::lens]
 struct GridSettingsLens<'a> {
     pub muted: &'a imbl::HashSet<ParticipantId>,
     pub pinned: &'a Option<ParticipantId>,
 }
 
-#[drv::memo]
+impl<'a> From<&'a ParticipantSettings> for GridSettingsLens<'a> {
+    fn from(s: &'a ParticipantSettings) -> Self {
+        Self { muted: &s.muted, pinned: &s.pinned }
+    }
+}
+
+#[drv::memo(single)]
 fn participant_grid_model(
     p: &GridParticipantsLens,
     s: &GridSettingsLens,
@@ -567,15 +579,18 @@ Background threads                        UI / Main thread
 
 ### Why atoms stay on the UI thread
 
-- The cache inside each `drv::Atom<T>` wrapper uses `RefCell` (not `Mutex`)
-  — fast, no contention, but makes `Atom<T>` `!Sync` (it is still `Send`
-  whenever `T: Send`).
-- Query/memo computation is cheap (cache hits ~100ns). Hundreds of queries
+- Atoms are plain structs; they're `Send` (or `Sync`) iff `T` is. The
+  memoization caches live in per-memo `thread_local!` slots, so each
+  thread builds its own cache independently — no shared state, no
+  contention.
+- Query/memo computation is cheap (cache hits ~10ns). Hundreds of queries
   per frame is < 1ms.
 - The expensive work (I/O, network, audio processing) is already on
   background threads.
 - Keeping atoms on the UI thread means views can lens directly — no
-  thread-boundary serialization for read access.
+  thread-boundary serialization for read access. An atom *can* move
+  between threads, but the cache doesn't follow; the new thread builds
+  its own on first miss.
 
 ### Communication pattern
 
@@ -646,7 +661,7 @@ per second) don't trigger recomputation of unrelated memos.
 /// "What mic should be open right now?"
 /// Needs permission + available mics + user selection. Does NOT need
 /// last_enumerated, last_changed, or volume_level.
-#[drv::memo]
+#[drv::memo(single)]
 fn desired_mic(inv: &MicListLens, pref: &MicSelectLens) -> Option<MicId> {
     match (*inv.permission, pref.selected) {
         (MicPermission::Granted, Some(id))
@@ -657,7 +672,7 @@ fn desired_mic(inv: &MicListLens, pref: &MicSelectLens) -> Option<MicId> {
 
 /// "What should we do about the mic stream?"
 /// Needs desired state + capture state. Does NOT need volume_level.
-#[drv::memo]
+#[drv::memo(single)]
 fn mic_action(
     inv: &MicListLens,
     pref: &MicSelectLens,
@@ -678,7 +693,7 @@ fn mic_action(
 
 /// "What should the mic picker view show?"
 /// Needs permission + mics + selection. Same fields as desired_mic, different output.
-#[drv::memo]
+#[drv::memo(single)]
 fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
     match inv.permission {
         MicPermission::NotAsked => MicPickerModel::NeedPermission,
@@ -693,14 +708,20 @@ fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
 
 /// "What is the current mic volume?" — depends ONLY on volume_level.
 /// Audio frame updates don't trigger mic_action or mic_picker recomputation.
-#[drv::lens(MicCapture)]
+#[drv::lens]
 struct MicVolumeLens {
     pub volume_level: f32,
 }
 
-#[drv::memo]
+impl From<&MicCapture> for MicVolumeLens {
+    fn from(c: &MicCapture) -> Self {
+        Self { volume_level: c.volume_level }
+    }
+}
+
+#[drv::memo(single)]
 fn mic_volume_display(vol: &MicVolumeLens) -> VolumeLevel {
-    VolumeLevel::from_linear(*vol.volume_level)
+    VolumeLevel::from_linear(vol.volume_level)
 }
 ```
 
@@ -763,7 +784,7 @@ pub struct RemoteStreams {
 ### Queries
 
 ```rust
-#[drv::memo]
+#[drv::memo(single)]
 fn participant_grid(
     p: &RemoteParticipants,
     s: &ParticipantSettings,
@@ -828,12 +849,10 @@ pure functions.
 ### Unit testing a query
 
 ```rust
-use drv::Atom;
-
 #[test]
 fn desired_mic_requires_permission_and_availability() {
-    let mut inv = Atom::new(MicInventory::default());
-    let mut pref = Atom::new(MicPreference::default());
+    let mut inv = MicInventory::default();
+    let mut pref = MicPreference::default();
 
     // No permission → no desired mic
     pref.selected = Some(MicId(1));
@@ -860,16 +879,14 @@ fn desired_mic_requires_permission_and_availability() {
 ### Testing the full action cycle
 
 ```rust
-use drv::Atom;
-
 #[test]
 fn mic_action_produces_correct_diffs() {
-    let mut inv = Atom::new(MicInventory {
+    let mut inv = MicInventory {
         permission: MicPermission::Granted,
         ..Default::default()
-    });
-    let mut pref = Atom::new(MicPreference::default());
-    let mut cap = Atom::new(MicCapture::default());
+    };
+    let mut pref = MicPreference::default();
+    let mut cap = MicCapture::default();
 
     inv.mics.push_back(mic(1));
     inv.mics.push_back(mic(2));

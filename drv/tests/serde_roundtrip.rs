@@ -1,14 +1,13 @@
-//! Verify that `Atom<T>` forwards `Serialize` / `Deserialize` when `T`
-//! implements them, under the `serde` feature.
+//! Verify that `#[drv::atom]` doesn't interfere with user-derived
+//! `Serialize` / `Deserialize` on the atom struct, under the `serde`
+//! feature.
 //!
-//! The impls are trivial delegations to `T`, so this test only needs to prove
-//! the bounds line up — no actual format involved. A function that requires
-//! `Serialize + DeserializeOwned` on `Atom<Counter>` either compiles (the
-//! impls are wired correctly) or doesn't (regression).
+//! Atoms are plain structs now — drv doesn't inject a wrapper or forward
+//! trait impls. This test exists mostly to catch regressions from future
+//! macro changes that might add hidden fields or bounds.
 
 #![cfg(feature = "serde")]
 
-use drv::Atom;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -19,7 +18,7 @@ pub struct Counter {
     pub label: String,
 }
 
-#[drv::memo]
+#[drv::memo(single)]
 fn doubled(lens: &NLens) -> u32 {
     lens.n * 2
 }
@@ -29,15 +28,15 @@ drv::assemble!();
 fn assert_ser_de<T: Serialize + DeserializeOwned>() {}
 
 #[test]
-fn atom_forwards_serde_traits() {
-    assert_ser_de::<Atom<Counter>>();
+fn atom_supports_user_derived_serde() {
+    assert_ser_de::<Counter>();
 
-    // Smoke-test the actual machinery: create an atom, use it, and confirm
-    // the inner state is what we expect. Serialization correctness itself
-    // is guaranteed by `T`'s derived impls.
-    let a = Atom::new(Counter {
+    // Smoke-test: build an atom, roundtrip it via serde_json (only if the
+    // tests bring in the crate themselves) or just exercise the memo to
+    // prove the generated code compiled with serde derives in place.
+    let a = Counter {
         n: 21,
         label: "answer".into(),
-    });
+    };
     assert_eq!(doubled(&a), 42);
 }

@@ -1,5 +1,0 @@
-error: reference field lifetime must match the struct's parameter `'a`
-  --> tests/compile_fail/standalone_wrong_lifetime.rs:13:17
-   |
-13 |     pub items: &'static Vec<u32>,
-   |                 ^^^^^^^

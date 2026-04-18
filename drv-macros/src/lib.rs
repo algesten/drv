@@ -6,7 +6,6 @@ mod assemble;
 mod atom;
 mod lens;
 mod memo;
-mod proj;
 mod registry;
 
 use proc_macro::TokenStream;
@@ -23,27 +22,23 @@ pub fn atom(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 #[proc_macro_attribute]
 pub fn lens(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let atom_name = syn::parse_macro_input!(attr as syn::Ident);
+    // Struct-level `#[drv::lens]` takes no arguments. The atom/lens
+    // association is established by the `From<&AtomName>` impl the user
+    // writes; the macro never inspects it (the type checker does, at
+    // memo call sites).
+    let attr = proc_macro2::TokenStream::from(attr);
     let item = syn::parse_macro_input!(item as syn::ItemStruct);
-    match lens::expand(&atom_name, item) {
+    match lens::expand(attr, item) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
 }
 
 #[proc_macro_attribute]
-pub fn memo(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn memo(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = syn::parse_macro_input!(item as syn::ItemFn);
-    match memo::expand(item) {
-        Ok(tokens) => tokens.into(),
-        Err(err) => err.to_compile_error().into(),
-    }
-}
-
-#[proc_macro_attribute]
-pub fn proj(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let item = syn::parse_macro_input!(item as syn::ItemImpl);
-    match proj::expand(item) {
+    let attr = proc_macro2::TokenStream::from(attr);
+    match memo::expand(attr, item) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }

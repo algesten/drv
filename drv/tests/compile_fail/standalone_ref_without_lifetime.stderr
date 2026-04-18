@@ -1,6 +1,0 @@
-error: standalone lens with reference fields requires a lifetime parameter
-       hint: declare it as `struct MyLens<'a> { pub x: &'a T, ... }`
-  --> tests/compile_fail/standalone_ref_without_lifetime.rs:12:8
-   |
-12 | struct BadLens {
-   |        ^^^^^^^

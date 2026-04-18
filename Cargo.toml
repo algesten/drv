@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["drv", "drv-macros"]
+members = [
+    "drv",
+    "drv-macros",
+    "drv-tests-xcrate/core",
+    "drv-tests-xcrate/consumer",
+]
 
 [workspace.lints.rust]
 dead_code = "forbid"

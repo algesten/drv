@@ -16,7 +16,6 @@ pub struct Registry {
     pub atoms: Vec<AtomRegistration>,
     pub lenses: Vec<LensRegistration>,
     pub memos: Vec<MemoRegistration>,
-    pub proj_impls: Vec<ProjRegistration>,
 }
 
 #[derive(Clone)]
@@ -37,41 +36,56 @@ pub struct LensRegistration {
     pub atom_name: String,
     /// True if this is an "identity lens" — the lens IS the atom (all fields).
     pub is_identity: bool,
-    /// True if this lens *requires* a user-written `#[drv::proj]` projection
-    /// impl because the macro cannot infer one (field names/types don't match
-    /// the atom). Standard lenses have `is_proj: false` — the macro can
-    /// auto-generate a `From` impl, but the user may still override it by
-    /// writing their own `#[drv::proj]` impl.
-    pub is_proj: bool,
-    /// Auto-generated `From<&Atom> for Lens` token string, emitted from
-    /// `assemble!()` unless a user `#[drv::proj]` impl shadows it. `None` for
-    /// proj-required lenses (`is_proj: true`) and identity lenses.
+    /// Auto-generated `From<&Atom> for Lens` token string, emitted by
+    /// `assemble!()` for inline lenses. `None` for standalone lenses
+    /// (the user supplies their own `impl From<...>`) and identity lenses.
     pub from_impl_tokens: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct ProjRegistration {
-    pub lens_name: String,
 }
 
 #[derive(Clone)]
 pub struct MemoRegistration {
     pub fn_name: String,
     pub vis_tokens: String,
+    /// The user's fn generics (lifetimes + type params), preserved verbatim
+    /// so `fn foo<'a>(lens: impl Into<Lens<'a>>) -> R` works.
+    pub generics_tokens: String,
     /// Parameters in declared order (mix of lens and value).
     pub params: Vec<MemoParam>,
     pub output_ty_tokens: String,
     /// The function body tokens (as a string), to be re-parsed by assemble.
     pub body_tokens: String,
+    /// Cache strategy chosen via `#[drv::memo(single)]` or
+    /// `#[drv::memo(lru = N)]`. Every memo must pick one — there is no
+    /// default, so the choice is explicit at the call site.
+    pub cache_strategy: CacheStrategy,
+}
+
+#[derive(Clone, Copy)]
+pub enum CacheStrategy {
+    /// `#[drv::memo(single)]` — one slot. A hit requires the current inputs
+    /// to equal the most recent recompute's inputs; anything else misses.
+    /// Cheap and predictable for memos with a single "live" input state.
+    Single,
+    /// `#[drv::memo(lru = N)]` — N slots evicted least-recently-used. Lets
+    /// recurring input states (ping-pong, undo/redo) stay cached.
+    Lru(usize),
 }
 
 #[derive(Clone)]
 pub enum MemoParam {
-    /// A `&LensName` parameter. Contributes to the cache key via the lens's
-    /// field-by-field comparison.
+    /// A lens parameter — either the literal `&LensName[<'_>]` form
+    /// (body uses it directly) or the `impl Into<LensName<'..>>` sugar
+    /// (body calls `.into()` once before use). Both contribute to the
+    /// cache key via the lens's field-by-field comparison.
     Lens {
         param_name: String,
         lens_name: String,
+        /// The user's original parameter type, emitted verbatim in the
+        /// memo's outer fn signature.
+        ty_tokens: String,
+        /// `true` if `ty_tokens` is `impl Into<Lens<'..>>`; `false` if it
+        /// is `&Lens`. Determines whether the body needs `.into()`.
+        is_impl_into: bool,
     },
     /// An owned value parameter like `u32` or `String`. Contributes to the
     /// cache key via PartialEq; stored via Clone.
@@ -105,22 +119,8 @@ impl Registry {
     pub fn atom_name_exists(&self, name: &str) -> bool {
         self.atoms.iter().any(|a| a.name == name)
     }
-
-    pub fn proj_exists(&self, lens_name: &str) -> bool {
-        self.proj_impls.iter().any(|p| p.lens_name == lens_name)
-    }
-
-    pub fn atom_field_names(&self, atom_name: &str) -> Vec<String> {
-        self.find_atom(atom_name)
-            .map(|a| a.fields.iter().map(|f| f.name.clone()).collect())
-            .unwrap_or_default()
-    }
 }
 
 pub fn type_to_tokens(ty: &syn::Type) -> String {
     quote::quote!(#ty).to_string()
-}
-
-pub fn types_match(a: &str, b: &str) -> bool {
-    a == b
 }

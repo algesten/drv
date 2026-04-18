@@ -1,0 +1,6 @@
+error: #[drv::lens] takes no arguments on a struct — the atom is named by the `impl From<&AtomName>` you write alongside
+       hint: for field-level inline lenses, use #[drv::lens(LensName)] on atom fields instead
+  --> tests/compile_fail/lens_attr_has_args.rs:10:13
+   |
+10 | #[drv::lens(AppState)]
+   |             ^^^^^^^^

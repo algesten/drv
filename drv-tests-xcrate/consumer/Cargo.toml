@@ -1,0 +1,12 @@
+[package]
+name = "drv-tests-xcrate-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+drv = { path = "../../drv" }
+drv-tests-xcrate-core = { path = "../core" }

@@ -38,11 +38,10 @@ projected — and whose atom is never consumed as an identity lens by any memo
 directly (plain field assignment) and serves as the root of the dependency
 graph.
 
-At use, the data struct is wrapped in `Atom<T>`, which owns both the data and
-its memoization cache. Construction is explicit — `Atom::new(MyAtom { ... })`
-— but the wrapper derefs transparently to `T`, so field access reads like
-normal struct access. Cloning an `Atom<T>` clones the data and starts the
-clone with a fresh empty cache.
+At use, the atom is just the struct value itself — no wrapper to construct,
+no cache held alongside the data. Each memo maintains its own thread-local
+cache keyed by input value, so cloning an atom is cheap and sharing-preserving:
+two equal-valued atom instances hit the same cache entries.
 
 In database terms, an atom is a **base table**. In signal frameworks, it is a
 **state signal** or **observable**. In Datalog, it is the **extensional
@@ -61,36 +60,25 @@ serves two purposes:
    snapshot via `PartialEq`. If all fields match, the cached result is
    returned.
 
-There are two kinds of lens:
+There are two forms:
 
-**Standard lenses** have fields that are a strict subset of an atom's
-fields — same names, same types. The macro verifies this at compile time
-and auto-generates the projection. Built-in scalar primitives (`u8`–`u128`,
-`i8`–`i128`, `usize`, `isize`, `f32`, `f64`, `bool`, `char`) may be declared
-by value, so `lens.x` gives `u32` directly with no dereference needed. All
-other types must be declared as `&'a T` — the lens struct itself must be
-valid Rust, so any reference field requires a lifetime parameter on the
-struct (`struct MyLens<'a> { ... }`). A built-in primitive may also be
-written as `&'a T` to force a reference.
+**Inline lenses** (`#[drv::lens(LensName)]` on atom fields): the macro
+aggregates all fields tagged with a given lens name into a generated
+`LensName` struct. Built-in scalar primitives (`u8`–`u128`, `i8`–`i128`,
+`usize`, `isize`, `f32`, `f64`, `bool`, `char`) are stored by value; all
+other fields are borrowed as `&'drv T`. Inline lenses are the simplest form
+and keep the full dependency picture in one place on the atom.
 
-The restriction to built-in primitives is deliberate: the proc macro cannot
-query trait implementations (like `Copy`) at expansion time — it only sees
-syntax. Rather than guessing based on heuristics, `drv` recognises the fixed
-set of language primitives that are always `Copy` and always trivially cheap
-to copy. A user-defined `#[derive(Copy)] struct Foo(u32)` looks like any
-other path type to the macro, and so must be written as `&Foo`. For fields
-that should be owned clones, computed values, or different types from the
-atom, write a custom projection with `#[drv::proj]`.
+**Standalone lenses** (`#[drv::lens]` on a separate struct): a plain
+struct you build and pass to memos. Pairing it with an
+`impl From<&AtomName>` lets memos taking `impl Into<MyLens<'_>>` be
+called as `memo(&atom)`. The fields can have any shape — pulling from
+nested atom fields, borrowing `&str` from `String`, projecting computed
+values, projecting from an atom in another crate.
 
-**Lenses with a `#[drv::proj]` impl** have user-defined fields that may
-differ from the atom in name, type, or nesting depth. The user writes the
-`From<&Atom>` conversion (annotated with `#[drv::proj]`), and the macro
-generates the snapshot and comparison logic. This allows reaching into
-nested structs, borrowing `&str` from `String` fields, or projecting
-computed values. The mode is required when the lens struct's fields don't
-match the atom (the macro has nothing to infer from); it may also be used
-on a lens whose fields *do* match, in which case the auto-generated
-projection is suppressed and the user's `#[drv::proj]` impl takes over.
+Standalone lenses compose across crate boundaries: the atom lives in one
+crate, the lens + memo in another, no registry coordination needed. The
+atom's home crate doesn't need to know about downstream memos.
 
 In FP optics, a lens is a composable accessor into a product type. Here we use
 only the "getter" half (projection). In database terms, the lens is a **view
@@ -101,8 +89,8 @@ The connection to the incremental computation literature is precise: the lens
 is a **verifying trace** (Build Systems a la Carte, Mokhov et al. 2018). The
 trace records which inputs were read; the rebuilder compares the trace against
 current values to decide whether to recompute. In `drv`, the trace is the
-lens struct itself, and the comparison is `PartialEq`. For lenses with a
-custom `#[drv::proj]` projection, the trace is the *projected* values —
+lens struct itself, and the comparison is `PartialEq`. For standalone
+lenses with a custom projection, the trace is the *projected* values —
 the comparison happens on the lens output, not on the raw atom fields. This
 means changes to atom fields that produce the same projected values do not
 trigger recomputation.
@@ -110,15 +98,23 @@ trigger recomputation.
 The atom itself can also be used as a lens — the "identity lens" over all data
 fields. This is a convenience for computations that genuinely depend on
 everything. The identity lens is generated on demand by `drv::assemble!()`,
-only for atoms that some memo actually consumes via `&Atom<T>`: an atom with
-no identity-lens consumer pays no cost for it, and imposes no bounds on
-fields that aren't reached by some other lens.
+only for atoms that some memo actually consumes via `&AtomName` directly:
+an atom with no identity-lens consumer pays no cost for it, and imposes no
+bounds on fields that aren't reached by some other lens.
 
 ### Memo
 
 A memo is a pure function from one or more lenses to an output value. It is
-automatically memoized: the runtime maintains a cache of
-`(last_inputs, last_output)` and skips recomputation when every lens matches.
+automatically memoized. Every memo declares its cache strategy explicitly:
+`#[drv::memo(single)]` for a single-slot last-call cache, or
+`#[drv::memo(lru = N)]` for an N-slot LRU cache. Recomputation is skipped
+when a slot's stored input matches the current one field-by-field.
+
+Memo signatures are emitted verbatim — the macro does not rewrite parameter
+types. A lens parameter can be written as `&MyLens` (honest, caller
+projects), `impl Into<MyLens<'a>>` (ergonomic sugar, caller passes `&atom`),
+or `&MyAtom` (identity lens). Non-lens parameters (owned values, `&str`,
+`&[u8]`, …) pass through unchanged; see *Value parameters* below.
 
 In database terms, a memo is a **materialized view** — a precomputed query
 result that is maintained incrementally. In signal frameworks, it is a
@@ -139,25 +135,29 @@ and cognitive indirection.
 `drv` makes the dependency declaration a **type**:
 
 ```rust
-#[drv::lens(AppState)]
-struct MyLens {
+#[drv::atom]
+pub struct AppState {
+    #[drv::lens(MyLens)]
     pub scroll_row: u32,
+
+    #[drv::lens(MyLens)]
     pub viewport_rows: u32,
+
+    pub cursor_col: u32,  // not in MyLens — changes to it don't invalidate
 }
 ```
 
-This type is the dependency. For standard lenses, the compiler verifies it
-(field names and types must match the atom). For lenses with a `#[drv::proj]`
-impl, the user writes the projection and the compiler verifies the `From`
-impl compiles.
-The runtime uses the lens for field-by-field `PartialEq`. There is nothing
+This type (the generated `MyLens` struct) *is* the dependency. It is
+declared either as inline tags on atom fields (the macro synthesises the
+struct and a `From<&Atom>` projection) or as a standalone struct that
+the user constructs however they like before passing it to a memo. The
+runtime uses the lens for field-by-field `PartialEq`. There is nothing
 else — no tracking table, no subscription list, no proxy object.
 
 This is a form of **static dependency analysis** achieved through the type
-system rather than program analysis. The programmer writes the projection
-(either declaratively via matching field names, or explicitly via a `From`
-impl); the compiler verifies it; the runtime executes it. Each layer has a
-clear role.
+system rather than program analysis. The programmer writes the projection;
+the compiler verifies it; the runtime executes it. Each layer has a clear
+role.
 
 In the terminology of "A Theory of Changes for Higher-Order Languages" (Cai
 et al., PLDI 2014), a lens is a projection function, and its **derivative**
@@ -207,83 +207,129 @@ With `imbl`, it is also efficient.
 Each `#[drv::memo]` function is transformed by the macro into a free function
 with the same name that performs the memoization inline.
 
-The `Atom<A>` wrapper owns both the atom and a `drv::Cache<A>`. `Cache<A: Atom>`
-holds `RefCell<A::State>` — a stack-allocated, interior-mutable state struct
-unique to each atom type. The state type is supplied by the atom's `impl Atom`,
-which `drv::assemble!()` emits. It holds `(input, output)` pairs — one for each
-memo that targets this atom.
+Atoms are plain Rust structs — no wrapper, no hidden fields, no `Atomized`
+trait. Each memo owns its cache in a `thread_local!` static. The declared
+strategy determines `N`: `single` → one slot, `lru = N` → N slots. Both
+share the same slot-array codegen (the enum leaves room for new strategies
+later to diverge).
 
-The evaluation flow:
+```rust
+thread_local! {
+    static __DRV_FOO_CACHE: RefCell<__DrvFooCacheState> = ...;
+}
+
+struct __DrvFooCacheState {
+    slots: [Option<(Input, Output, u64)>; N],  // N from strategy
+    next_stamp: u64,
+}
+```
+
+Slots are keyed by **value**, not by atom identity: the `Input` is a snapshot
+of the lens and value parameters, and lookup is a linear scan with
+`PartialEq<Snapshot>` against each occupied slot. On hit, the slot's LRU
+stamp is bumped to `next_stamp + 1`. On miss, the body runs and installs
+into an empty slot; if none, the slot with the smallest stamp is evicted.
+For `single` (N=1), the scan and the eviction are both over one slot —
+the result is last-call caching.
+
+The memo's parameter type — whatever the user wrote — is emitted verbatim.
+Three shapes are supported:
+
+- `&Lens[<'_>]` — honest signature; caller must have a `&Lens` already.
+  Projection happens at the call site (`(&atom).into()` to get the lens).
+- `impl Into<Lens<'a>>` — ergonomic sugar; caller passes any type
+  convertible to `Lens<'a>` (typically `&atom`, via the auto-generated
+  `From<&Atom>` impl). The body converts once via `.into()`.
+- `&MyAtom` — identity-lens form; caller passes `&atom` directly.
+
+The evaluation flow (same for all three — only the entry step differs):
 
 ```
-call memo(&a)                      // a: &Atom<MyAtom>
-  → convert &drv into the lens (auto via Into):
-      built-in primitive Copy types are copied by value, others borrowed by reference
-  → take a short shared borrow of a.__drv_cache()
-  → compare each lens field against the cached snapshot
-    → all equal: clone the cached output, DROP the borrow, return it (FAST PATH)
-    → any differ: drop the borrow
-        → run the memo function with the new lens  [no borrow held]
+call memo(x)
+  → (entry depends on sig)
+      impl Into<Lens<'a>>     — x.into() produces the Lens
+      &Lens                    — x is already the Lens
+      &Atom                    — x is the atom; an identity-lens view
+                                 is constructed internally for the cache
+  → take a short exclusive borrow on the memo's thread-local cache
+  → linear-scan slots for the first whose stored input matches the current one
+      (field-by-field PartialEq via FastEq, which short-circuits on Arc::ptr_eq
+       and imbl ptr_eq fast paths)
+    → found: bump its stamp, clone the output, DROP the borrow, return it (FAST PATH)
+    → not found: drop the borrow
+        → run the memo function with the lens  [no borrow held]
         → take a short exclusive borrow of the cache
-        → clone the lens fields into an owned snapshot
-        → clone the output into storage
+        → clone the lens fields + value params into an owned snapshot
+        → pick an empty slot or the LRU victim
+        → write the (input, output, stamp) tuple
         → drop the borrow
         → return the computed output
 ```
 
-The fast path does no heap allocation. The comparison is field-by-field
-`PartialEq` via `drv`'s `FastEq` helper, which short-circuits on `Arc::ptr_eq`
-for `Arc<T>` and on the equivalent pointer check for `imbl` persistent
-collections (when the `imbl` feature is enabled). Plain `Vec`/`HashMap`
-fall through to standard element-wise comparison.
+Comparison is field-by-field `PartialEq` via `drv`'s `FastEq` helper, which
+short-circuits on `Arc::ptr_eq` for `Arc<T>` and on the equivalent pointer
+check for `imbl` persistent collections (when the `imbl` feature is enabled).
+Plain `Vec`/`HashMap` fall through to standard element-wise comparison.
 
 The user's compute function runs **without holding any borrow on the cache**.
-The shared borrow taken for the freshness check is dropped before the compute
-body runs (or before the cached output is cloned and returned). On a cache
-miss, a separate `borrow_mut` is taken *after* compute returns, scoped just
-to the store step. The borrow is never held across user code.
+The borrow taken for the lookup scan is dropped before the body runs (or
+before the cached output is cloned and returned). On a cache miss, a separate
+`borrow_mut` is taken *after* compute returns, scoped just to the store step.
+The borrow is never held across user code.
 
-This gives a hard re-entrancy guarantee: a memo can re-enter the same
-`Atom<T>`'s cache from anywhere — recursively, through a captured wrapper
-reference in a closure, through user-controlled call paths that loop back
-into another memo — without triggering a `RefCell` double-borrow panic.
-The common case is direct: a memo body receives `&Lens` (or `&Atom<T>`
-for an identity-lens memo) and can invoke sibling memos on the same atom
-by passing that reference straight through. The `Cache` uses `RefCell`
-(so `Atom<T>` is `Send` whenever `T: Send` but `!Sync`) on the assumption
-that all access is single-threaded, and the borrow-scoping rule above
-means the in-thread re-entry case is safe by construction.
+This gives a hard re-entrancy guarantee: a memo can re-enter its own cache
+or a sibling memo's cache from anywhere — recursively, through a captured
+reference in a closure, through user-controlled call paths that loop back —
+without triggering a `RefCell` double-borrow panic. Each memo's cache is
+independent; inner-memo re-entry operates on a different `RefCell` entirely.
+The common case is direct: a memo body receives `&Lens` (or `&T` for an
+identity-lens memo) and invokes sibling memos by passing that reference
+straight through.
+
+The caches live in thread-locals, so each thread builds up its own cache
+independently. Cross-thread mutation of the atom doesn't affect other
+threads' caches beyond the usual "new value, miss, recompute" path. Atoms
+themselves carry no cache state, so `T: Send` → `atom: Send` trivially.
 
 The return value is returned by value (`Clone::clone` of the cached output).
 For cheap types (`usize`, `String`, `imbl` collections), this is effectively
 free. For expensive types, the programmer should consider whether full-output
 returns are appropriate, or wrap the output in `Rc`/`Arc` for cheap cloning.
 
+### Value-keyed vs per-instance
+
+A consequence of the value-keyed design: two distinct atom instances with
+equal field values hit the same cache slot. Cloning an atom doesn't give
+it a "fresh empty cache" — cache entries are keyed by the input snapshot,
+so equal-valued clones share whatever entries already exist.
+
+This also enables ping-pong hits: if the atom cycles between two input
+states (undo/redo, A↔B toggles), both states stay cached (up to the LRU
+capacity) and subsequent visits are hits rather than misses.
+
 ### Multi-lens memos
 
-When a memo takes multiple lens parameters, the cache lives in the first
-lens's atom. The stored input is a single struct (`__Drv{MemoName}Input`)
-holding an owned snapshot per lens. On each call, every lens is compared
-against its stored snapshot; if any differ, the memo recomputes.
+When a memo takes multiple lens parameters, each is compared field-by-field
+against the slot's snapshot. All parameters must match for a hit.
 
 This handles two cases uniformly:
 - Lenses from different atoms (e.g., `fn header(tabs: &TabsLens, user: &UserLens)`)
-- Multiple lenses from the same atom (e.g., `fn foo(a: &LensA, b: &LensB)` called as `foo(&app, &app)`)
+- Multiple lenses from the same atom (e.g.,
+  `fn foo<'a, 'b>(a: impl Into<LensA<'a>>, b: impl Into<LensB<'b>>)`
+  called as `foo(&app, &app)`)
 
 ### Value parameters
 
 Memos can mix lens parameters with owned value parameters:
 
 ```rust
-#[drv::memo]
-fn compute(lens: &MyLens, thing: usize, other: String) -> Output { ... }
+#[drv::memo(single)]
+fn compute<'a>(lens: impl Into<MyLens<'a>>, thing: usize, other: String) -> Output { ... }
 ```
 
 Value parameters participate in the cache key just like lens fields — the
 snapshot struct holds them alongside the lens snapshots, each compared by
-`PartialEq` on every call. Declared order is preserved; the cache location
-is still pinned to the first lens parameter's atom, regardless of whether
-value params come before or after it.
+`PartialEq` on every call. Declared order is preserved.
 
 Requirements on value types: `PartialEq + Clone + Send + 'static`. They are
 cloned into storage on cache miss.
@@ -341,63 +387,52 @@ output didn't actually change. In `drv`, early cutoff falls out naturally
 from the `PartialEq` check — it doesn't require special support.
 
 For an atom used as a memo output, the programmer constructs it in the memo
-body wrapped in `Atom::new(...)`. The cache is fresh on every recomputation of
-the upstream memo — which is correct because the atom value itself is new.
+body as a plain struct literal. Downstream lenses project from it in exactly
+the same way as any other atom.
 
 ## Memory layout
 
-`Atom<A>` owns both the atom data and its cache:
+An atom is a plain Rust struct. No wrapper. No hidden cache.
 
 ```rust
-pub trait Atomized {
-    type State: Default + Send + 'static;
-}
+#[derive(Debug, Clone, PartialEq, Default)]
+#[drv::atom]
+pub struct Editor { /* user fields */ }
 
-pub struct Cache<A: Atomized> {
-    inner: RefCell<A::State>,
-}
-
-pub struct Atom<T: Atomized> {
-    inner: T,
-    cache: Cache<T>,
-}
+// Construct and mutate directly.
+let mut e = Editor::default();
+e.scroll_row = 5;
 ```
 
-`drv::assemble!()` emits a per-atom state struct and implements `Atomized`
-for each atom:
+Each `#[drv::memo]` owns a thread-local cache whose shape is determined at
+expansion time by the memo's own `(Input, Output)`:
 
 ```rust
-// Generated by drv::assemble!()
+// Generated by drv::assemble!() for
+// `fn visible_lines<'a>(lens: impl Into<VisibleLens<'a>>) -> Vec<String>`
 
-// Per-memo input snapshot (fields for each declared parameter, in order).
-// No Default derive — the input struct is constructed explicitly on cache
-// miss, and the surrounding State uses Option<Input> whose None-default is
-// unconditional in T.
 pub struct __DrvVisibleLinesInput {
-    lens: __DrvVisibleLens,
+    lens: __DrvVisibleLens,  // snapshot of the lens's fields
 }
 
-pub struct __DrvStatusBarInput {
-    lens: __DrvStatusBarLens,
+pub struct __DrvVisibleLinesSlot {
+    input: __DrvVisibleLinesInput,
+    output: Vec<String>,
+    stamp: u64,
 }
 
-// Per-atom state: one (input, output) pair per memo targeting the atom.
-#[derive(Default)]
-pub struct __DrvEditorState {
-    visible_lines_input: Option<__DrvVisibleLinesInput>,
-    visible_lines_output: Option<Vec<String>>,
-    status_bar_input: Option<__DrvStatusBarInput>,
-    status_bar_output: Option<StatusBar>,
-    // ... one pair per memo targeting Editor
+pub struct __DrvVisibleLinesCacheState {
+    slots: [Option<__DrvVisibleLinesSlot>; 16],  // N = cache size
+    next_stamp: u64,
 }
 
-impl drv::Atomized for Editor {
-    type State = __DrvEditorState;
+thread_local! {
+    static __DRV_VISIBLE_LINES_CACHE: RefCell<__DrvVisibleLinesCacheState> = ...;
 }
 ```
 
 For a memo with mixed parameters like
-`fn compute(lens: &MyLens, thing: usize, prefix: &str) -> Output`,
+`fn compute<'a>(lens: impl Into<MyLens<'a>>, thing: usize, prefix: &str) -> Output`,
 the input struct carries one field per declared parameter:
 
 ```rust
@@ -408,30 +443,37 @@ pub struct __DrvComputeInput {
 }
 ```
 
-The associated type `Atomized::State` bridges the ordering mismatch: `Atom<T>`'s
-field type (`Cache<T>`) is known at atom-definition time, while the concrete
-state layout depends on which memos exist and is resolved later via the trait
-impl. The `Send` bound on `State` propagates to `Atom<T>`, so wrapped atoms can
-be moved across threads.
+Access cost on the hot path:
 
-No heap allocation, no type erasure, no `Box`. The state struct is inlined
-directly next to the atom inside `Atom<T>`. Access cost on the hot path:
+- `thread_local!` lookup (`.with`) — one pointer-ish read on most targets
+- `RefCell::borrow_mut()` — a single atomic-like flag check
+- Linear scan over the fixed-size slot array — ~1–3ns per slot with short-
+  circuiting PartialEq (`Arc::ptr_eq` / `imbl::ptr_eq` fast paths)
 
-- `RefCell::borrow()` — a single atomic-like flag check
-- Direct field access into `A::State` — known offset, no downcast
-
-On cache miss, one additional `RefCell::borrow_mut()` is taken (after the user's
-compute function returns) to store the new snapshot. The borrow is never held
-across user code.
+On cache miss, a second `borrow_mut` is taken (after the user's compute
+function returns) to install into an empty slot or evict the LRU victim.
+The borrow is never held across user code.
 
 No `HashMap` lookup, no `TypeId` compare, no subscription table, no graph
 traversal.
 
-The trade-off: every atom instance carries its full state struct inline, so
-atoms get bigger as more memos target them. For applications with a few atoms
-and many memos this is strictly better than heap-allocated type-erased storage.
-For applications creating many atom instances with many memos, the size
-increase may matter.
+The trade-off: each memo's cache holds at most N entries per-thread-per-memo.
+When the working set exceeds N, the oldest-accessed entry is evicted. Every
+memo picks its N explicitly via `#[drv::memo(single)]` (N=1) or
+`#[drv::memo(lru = N)]`.
+
+### Cross-crate
+
+Because each memo's cache lives in a thread-local inside its own crate,
+memos and their atoms are fully decoupled. A crate can:
+
+- define an atom with no memos (the atom is just a struct with a `#[drv::atom]`
+  registration tag);
+- define memos over atoms from other crates by declaring a standalone
+  `#[drv::lens] struct MyLens { ... }` with an
+  `impl From<&foreign_crate::Foo> for MyLens`.
+
+No cross-crate macro coordination is required.
 
 ## Relationship to prior art
 
@@ -501,9 +543,10 @@ incremental update machinery.
   computing a status bar), full recomputation is cheap. For expensive
   derivations over large collections, this may be a bottleneck.
 
-- **Single-crate scope.** All memos for an atom must be in the same crate.
-  Cross-crate memos are not supported. `drv::assemble!()` collects everything
-  within a single compilation unit.
+- **Bounded cache.** Each memo's cache holds at most N slots per-thread,
+  with N chosen at the declaration site: `#[drv::memo(single)]` for N=1
+  or `#[drv::memo(lru = N)]`. Working sets that exceed N trigger LRU
+  eviction; undersize is a per-memo tuning decision, not a global one.
 
 - **Owned returns.** Memos return their output by value (via `Clone`). For
   cheap types this is free; for expensive outputs, wrap in `Rc`/`Arc`.

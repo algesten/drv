@@ -97,7 +97,6 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
                 name: lens_name_str.clone(),
                 atom_name: struct_name.to_string(),
                 is_identity: false,
-                is_proj: false,
                 from_impl_tokens: Some(from_impl.to_string()),
             });
         }
@@ -132,7 +131,8 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
 
     // Generate inline lens structs (borrow view + owned snapshot + PartialEq +
     // __drv_snapshot). The `From` impl is registered for `assemble!()` to emit
-    // so user-written `#[drv::proj]` impls can shadow it.
+    // Inline lenses always get this auto-generated `From` impl — no
+    // override mechanism (standalone lenses cover the custom-projection case).
     for (lens_name_str, lens_fields) in &inline_lenses {
         let lens_ident = Ident::new(lens_name_str, struct_name.span());
         let snapshot_ident = format_ident!("__Drv{}", lens_ident);
@@ -160,7 +160,6 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
                 name: struct_name.to_string(),
                 atom_name: struct_name.to_string(),
                 is_identity: true,
-                is_proj: false,
                 from_impl_tokens: None,
             });
         }
@@ -202,11 +201,10 @@ pub(crate) fn generate_lens_types(
 /// impl between them, and the `__drv_snapshot` method — these are emitted
 /// inline from the `#[drv::atom]` / `#[drv::lens]` expansion.
 ///
-/// `from_impl_tokens` holds the auto-generated `From<&Atom> for Lens` impl.
-/// It is registered in the lens registration and emitted later by
-/// `drv::assemble!()`, so a user-supplied `#[drv::proj]` impl (which also
-/// implements `From<&Atom> for Lens`) can shadow it without a coherence
-/// conflict.
+/// `from_impl_tokens` holds the auto-generated `From<&Atom> for Lens` impl
+/// for inline lenses. It is registered in the lens registration and
+/// emitted later by `drv::assemble!()`. Standalone lenses leave this
+/// `None` — the user writes their own `From` impl.
 pub(crate) fn generate_lens_types_with(
     lens_ident: &Ident,
     snapshot_ident: &Ident,
@@ -252,10 +250,16 @@ pub(crate) fn generate_lens_types_with(
 
     let base = quote! {
         // User-facing lens — Copy-type fields by value, others by reference.
+        // Pure projection: no cache handle on the lens; caches live in
+        // per-memo thread-locals, keyed by input value.
+        //
+        // `PhantomData<&'drv ()>` keeps the lifetime bound even when every
+        // field is stored by value (no reference fields → 'drv would
+        // otherwise be unused → E0392).
         #[derive(Copy, Clone, Debug)]
         pub struct #lens_ident<'drv> {
             #[doc(hidden)]
-            pub __drv: &'drv ::drv::Cache<#atom_ident>,
+            pub __drv_marker: ::core::marker::PhantomData<&'drv ()>,
             #(#struct_fields,)*
         }
 
@@ -285,24 +289,24 @@ pub(crate) fn generate_lens_types_with(
 
         // Reference-clone: lets a memo body pass `&Lens` to a sibling memo
         // whose outer sig takes `impl Into<Lens<'_>>`. Fields are all Copy
-        // (scalars, refs, or `&Cache`), so the copy is cheap.
+        // (scalars or refs), so the copy is cheap.
         impl<'drv> ::core::convert::From<&#lens_ident<'drv>> for #lens_ident<'drv> {
             fn from(source: &#lens_ident<'drv>) -> Self {
                 #lens_ident {
-                    __drv: source.__drv,
+                    __drv_marker: ::core::marker::PhantomData,
                     #(#name_copies,)*
                 }
             }
         }
     };
 
-    // From<&Atom<Atom>> for the lens — copy primitives, borrow the rest.
-    // Emitted from assemble!() unless a user #[drv::proj] shadows it.
+    // From<&Atom> for the lens — copy primitives, borrow the rest.
+    // Emitted from assemble!() for inline lenses.
     let from_impl = quote! {
-        impl<'drv> ::core::convert::From<&'drv ::drv::Atom<#atom_ident>> for #lens_ident<'drv> {
-            fn from(source: &'drv ::drv::Atom<#atom_ident>) -> Self {
+        impl<'drv> ::core::convert::From<&'drv #atom_ident> for #lens_ident<'drv> {
+            fn from(source: &'drv #atom_ident) -> Self {
                 #lens_ident {
-                    __drv: source.__drv_cache(),
+                    __drv_marker: ::core::marker::PhantomData,
                     #(#from_fields,)*
                 }
             }
