@@ -11,9 +11,11 @@ use proc_macro::TokenStream;
 
 /// Mark a struct as an atom — a ground-truth data source.
 ///
-/// All fields must be `pub` and their types must implement
-/// `PartialEq + Clone + Debug + Default + Send`. Fields can be annotated with
-/// `#[drv::lens(Name)]` to declare inline lenses.
+/// Field types must implement `PartialEq + Clone + Debug + Default + Send`.
+/// Fields can be any visibility — Rust's normal privacy rules apply, so a
+/// private field can only be projected into a lens declared in the same
+/// module. Fields can be annotated with `#[drv::lens(Name)]` to declare
+/// inline lenses.
 ///
 /// `Clone`, `PartialEq`, `Debug`, and `Default` are always generated.
 /// Additional derives like `Hash` and `Eq` can be requested via

@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{Fields, Ident, ItemStruct, Visibility};
+use syn::{Fields, Ident, ItemStruct};
 
 use crate::registry::{self, AtomField, AtomRegistration, LensField, LensRegistration};
 
@@ -19,23 +19,6 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
             ));
         }
     };
-
-    for field in fields {
-        if !matches!(&field.vis, Visibility::Public(_)) {
-            let name = field
-                .ident
-                .as_ref()
-                .map(|i| format!("'{}'", i))
-                .unwrap_or_else(|| "unnamed".to_string());
-            return Err(syn::Error::new_spanned(
-                field,
-                format!(
-                    "atom field {} must be pub -- drv needs to project fields into lenses",
-                    name
-                ),
-            ));
-        }
-    }
 
     // Reject #[derive(...)] on the struct.
     for attr in &item.attrs {

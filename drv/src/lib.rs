@@ -9,6 +9,7 @@
 //!
 //! ```rust
 //! #[drv::atom]
+//! // Clone, PartialEq, Debug, Default are auto-generated on atoms.
 //! pub struct Scoreboard {
 //!     #[drv::lens(TotalLens)]
 //!     pub hits: Vec<u32>,
@@ -28,6 +29,8 @@
 //! # fn main() {
 //! let mut game = Scoreboard {
 //!     hits: vec![100, 250, 50],
+//!
+//!     // Atoms have a hidden __drv field for caching lenses
 //!     ..Default::default()
 //! };
 //!
@@ -42,7 +45,9 @@
 //! # The three pieces
 //!
 //! **Atom** — a struct of ground-truth data. Declared with `#[drv::atom]`.
-//! All fields must be `pub` and must implement `PartialEq + Clone + Debug + Default + Send`.
+//! Field types must implement `PartialEq + Clone + Debug + Default + Send`.
+//! Fields can be any visibility — standard Rust rules apply, so a private
+//! field can only be projected into a lens in the same module.
 //!
 //! **Lens** — a projection: a subset of an atom's fields, by name and type.
 //! It declares "this computation depends on exactly these fields and no others."
