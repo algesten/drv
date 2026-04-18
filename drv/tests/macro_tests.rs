@@ -1,4 +1,4 @@
-use drv::Drv;
+use drv::Atom;
 use imbl::HashMap as ImHashMap;
 use imbl::Vector as ImVector;
 
@@ -214,8 +214,8 @@ pub struct AppState {
 }
 
 #[drv::memo]
-fn items_summary(lens: &AppItemsLens) -> Drv<ItemsSummary> {
-    Drv::new(ItemsSummary {
+fn items_summary(lens: &AppItemsLens) -> Atom<ItemsSummary> {
+    Atom::new(ItemsSummary {
         count: lens.items.len(),
         current: lens
             .selected
@@ -267,10 +267,10 @@ fn inner_memo(r: &Reentrant) -> u32 {
 
 #[drv::memo]
 fn outer_memo(r: &Reentrant) -> u32 {
-    // Under the Drv<T> wrapper design, a memo body holds `&Atom`, not
-    // `&Drv<Atom>`, so it cannot invoke another memo on the same atom from
-    // within — re-entrancy of that kind isn't expressible. Left as a pure
-    // function for the outer memo to exercise the caching path.
+    // Under the Atom<T> wrapper design, a memo body holds `&MyStruct`, not
+    // `&Atom<MyStruct>`, so it cannot invoke another memo on the same atom
+    // from within — re-entrancy of that kind isn't expressible. Left as a
+    // pure function for the outer memo to exercise the caching path.
     r.value * 2 + 1
 }
 
@@ -438,7 +438,7 @@ drv::assemble!();
 
 #[test]
 fn inline_lens_memoizes_on_irrelevant_change() {
-    let mut state = Drv::new(Editor {
+    let mut state = Atom::new(Editor {
         scroll_row: 0,
         viewport_rows: 2,
         content: ImVector::from(vec!["aaa".into(), "bbb".into(), "ccc".into()]),
@@ -458,7 +458,7 @@ fn inline_lens_memoizes_on_irrelevant_change() {
 
 #[test]
 fn inline_lens_recomputes_on_relevant_change() {
-    let mut state = Drv::new(Editor {
+    let mut state = Atom::new(Editor {
         scroll_row: 0,
         viewport_rows: 2,
         content: ImVector::from(vec!["aaa".into(), "bbb".into(), "ccc".into()]),
@@ -475,7 +475,7 @@ fn inline_lens_recomputes_on_relevant_change() {
 
 #[test]
 fn field_in_multiple_lenses() {
-    let state = Drv::new(Editor {
+    let state = Atom::new(Editor {
         viewport_rows: 2,
         content: ImVector::from(vec!["aaa".into(), "bbb".into()]),
         tabs: ImVector::from(vec!["main.rs".into()]),
@@ -491,7 +491,7 @@ fn field_in_multiple_lenses() {
 
 #[test]
 fn standalone_lens_basic() {
-    let mut state = Drv::new(Dashboard {
+    let mut state = Atom::new(Dashboard {
         user_name: "alice".into(),
         notification_count: 3,
         theme: "dark".into(),
@@ -514,7 +514,7 @@ fn standalone_lens_basic() {
 
 #[test]
 fn standalone_lens_imbl_vector() {
-    let mut state = Drv::new(Dashboard {
+    let mut state = Atom::new(Dashboard {
         items: ImVector::from(vec!["a".into(), "b".into(), "c".into()]),
         ..Default::default()
     });
@@ -532,7 +532,7 @@ fn standalone_lens_imbl_vector() {
 
 #[test]
 fn chaining_memo_output_as_atom() {
-    let mut summary = Drv::new(Summary {
+    let mut summary = Atom::new(Summary {
         total: 5,
         label: "test".into(),
     });
@@ -551,7 +551,7 @@ fn chaining_memo_output_as_atom() {
 
 #[test]
 fn multiple_lenses_same_atom_independent() {
-    let mut state = Drv::new(GameState {
+    let mut state = Atom::new(GameState {
         player_x: 3.0,
         player_y: 4.0,
         score: 100,
@@ -584,7 +584,7 @@ fn multiple_lenses_same_atom_independent() {
 
 #[test]
 fn imbl_hashmap_structural_sharing() {
-    let mut state = Drv::new(BufferStore {
+    let mut state = Atom::new(BufferStore {
         buffers: ImHashMap::unit(
             "main.rs".into(),
             BufferData {
@@ -618,14 +618,14 @@ fn imbl_hashmap_structural_sharing() {
 
 #[test]
 fn imbl_hashmap_no_active_buffer() {
-    let state = Drv::<BufferStore>::default();
+    let state = Atom::<BufferStore>::default();
     let content = active_content(&state);
     assert_eq!(content, None);
 }
 
 #[test]
 fn single_field_lens() {
-    let mut state = Drv::new(Counter {
+    let mut state = Atom::new(Counter {
         value: 5,
         ..Default::default()
     });
@@ -643,14 +643,14 @@ fn single_field_lens() {
 
 #[test]
 fn empty_content_visible_lines() {
-    let state = Drv::<Editor>::default();
+    let state = Atom::<Editor>::default();
     let result = visible_lines(&state);
     assert!(result.is_empty());
 }
 
 #[test]
 fn scroll_past_end() {
-    let state = Drv::new(Editor {
+    let state = Atom::new(Editor {
         scroll_row: 100,
         viewport_rows: 10,
         content: ImVector::from(vec!["only line".into()]),
@@ -663,7 +663,7 @@ fn scroll_past_end() {
 
 #[test]
 fn repeated_eval_same_state_no_recompute() {
-    let state = Drv::new(Counter {
+    let state = Atom::new(Counter {
         value: 42,
         ..Default::default()
     });
@@ -675,12 +675,12 @@ fn repeated_eval_same_state_no_recompute() {
 
 #[test]
 fn multi_lens_basic() {
-    let editor = Drv::new(Editor {
+    let editor = Atom::new(Editor {
         tabs: ImVector::from(vec!["a.rs".into(), "b.rs".into()]),
         ..Default::default()
     });
 
-    let dashboard = Drv::new(Dashboard {
+    let dashboard = Atom::new(Dashboard {
         user_name: "alice".into(),
         ..Default::default()
     });
@@ -691,12 +691,12 @@ fn multi_lens_basic() {
 
 #[test]
 fn multi_lens_memoizes_on_irrelevant_change() {
-    let mut editor = Drv::new(Editor {
+    let mut editor = Atom::new(Editor {
         tabs: ImVector::from(vec!["a.rs".into()]),
         ..Default::default()
     });
 
-    let dashboard = Drv::new(Dashboard {
+    let dashboard = Atom::new(Dashboard {
         user_name: "bob".into(),
         notification_count: 5,
         theme: "dark".into(),
@@ -715,12 +715,12 @@ fn multi_lens_memoizes_on_irrelevant_change() {
 
 #[test]
 fn multi_lens_recomputes_on_relevant_change() {
-    let mut editor = Drv::new(Editor {
+    let mut editor = Atom::new(Editor {
         tabs: ImVector::from(vec!["a.rs".into()]),
         ..Default::default()
     });
 
-    let dashboard = Drv::new(Dashboard {
+    let dashboard = Atom::new(Dashboard {
         user_name: "carol".into(),
         ..Default::default()
     });
@@ -731,7 +731,7 @@ fn multi_lens_recomputes_on_relevant_change() {
     let header = combined_header(&editor, &dashboard);
     assert_eq!(header, "carol: 3 tabs open");
 
-    let dashboard2 = Drv::new(Dashboard {
+    let dashboard2 = Atom::new(Dashboard {
         user_name: "dave".into(),
         ..Default::default()
     });
@@ -741,7 +741,7 @@ fn multi_lens_recomputes_on_relevant_change() {
 
 #[test]
 fn two_level_chaining() {
-    let mut app = Drv::new(AppState {
+    let mut app = Atom::new(AppState {
         items: ImVector::from(vec!["foo".into(), "bar".into(), "baz".into()]),
         selected: Some(1),
         ..Default::default()
@@ -771,7 +771,7 @@ fn two_level_chaining() {
 
 #[test]
 fn atom_as_memo_input() {
-    let mut s = Drv::new(ItemsSummary {
+    let mut s = Atom::new(ItemsSummary {
         count: 5,
         current: "hello".into(),
     });
@@ -790,7 +790,7 @@ fn outer_memo_caches() {
     // The generated wrapper releases the cache borrow before running the
     // user's compute function, keeping the RefCell invariants intact even
     // if the compute itself reborrows (via some other code path).
-    let r = Drv::new(Reentrant { value: 5 });
+    let r = Atom::new(Reentrant { value: 5 });
     assert_eq!(outer_memo(&r), 11);
     assert_eq!(outer_memo(&r), 11); // cache hit
 }
@@ -799,7 +799,7 @@ fn outer_memo_caches() {
 
 #[test]
 fn mixed_value_after_lens() {
-    let a = Drv::new(MixedAtom { base: 10 });
+    let a = Atom::new(MixedAtom { base: 10 });
     assert_eq!(with_value_after(&a, 3), 30);
     // Same multiplier: cache hit.
     assert_eq!(with_value_after(&a, 3), 30);
@@ -809,7 +809,7 @@ fn mixed_value_after_lens() {
 
 #[test]
 fn mixed_value_before_lens() {
-    let a = Drv::new(MixedAtom { base: 10 });
+    let a = Atom::new(MixedAtom { base: 10 });
     assert_eq!(with_value_before(5, &a), 50);
     // Same call: cache hit.
     assert_eq!(with_value_before(5, &a), 50);
@@ -819,7 +819,7 @@ fn mixed_value_before_lens() {
 
 #[test]
 fn mixed_multi_value() {
-    let a = Drv::new(MixedAtom { base: 10 });
+    let a = Atom::new(MixedAtom { base: 10 });
     // offset=1, scale=3: 1 + (10 * 3) = 31
     assert_eq!(multi_value(1, &a, 3), 31);
     assert_eq!(multi_value(1, &a, 3), 31); // hit
@@ -829,7 +829,7 @@ fn mixed_multi_value() {
 
 #[test]
 fn mixed_lens_change_invalidates() {
-    let mut a = Drv::new(MixedAtom { base: 10 });
+    let mut a = Atom::new(MixedAtom { base: 10 });
     assert_eq!(with_value_after(&a, 2), 20);
     // Change the lens's field — cache should invalidate.
     a.base = 100;
@@ -838,7 +838,7 @@ fn mixed_lens_change_invalidates() {
 
 #[test]
 fn value_ref_str() {
-    let a = Drv::new(MixedAtom { base: 42 });
+    let a = Atom::new(MixedAtom { base: 42 });
     // Pass &str — stored internally as String.
     assert_eq!(with_str(&a, "val"), "val=42");
     // Same string: cache hit.
@@ -851,7 +851,7 @@ fn value_ref_str() {
 
 #[test]
 fn value_ref_bytes() {
-    let a = Drv::new(MixedAtom { base: 10 });
+    let a = Atom::new(MixedAtom { base: 10 });
     assert_eq!(with_bytes(&a, &[1, 2, 3]), 13);
     assert_eq!(with_bytes(&a, &[1, 2, 3]), 13); // hit
     assert_eq!(with_bytes(&a, &[1, 2, 3, 4]), 14); // different bytes
@@ -860,7 +860,7 @@ fn value_ref_bytes() {
 #[test]
 fn value_ref_with_owned_string() {
     // Users can also pass owned types that coerce via AutoRef.
-    let a = Drv::new(MixedAtom { base: 1 });
+    let a = Atom::new(MixedAtom { base: 1 });
     let s: String = "hello".into();
     assert_eq!(with_str(&a, &s), "hello=1");
 }
@@ -873,14 +873,14 @@ fn value_ref_with_owned_string() {
 fn atoms_are_send() {
     fn assert_send<T: Send>() {}
 
-    assert_send::<Drv<Editor>>();
-    assert_send::<Drv<Dashboard>>();
-    assert_send::<Drv<Summary>>();
-    assert_send::<Drv<GameState>>();
-    assert_send::<Drv<BufferStore>>();
-    assert_send::<Drv<Counter>>();
-    assert_send::<Drv<AppState>>();
-    assert_send::<Drv<ItemsSummary>>();
+    assert_send::<Atom<Editor>>();
+    assert_send::<Atom<Dashboard>>();
+    assert_send::<Atom<Summary>>();
+    assert_send::<Atom<GameState>>();
+    assert_send::<Atom<BufferStore>>();
+    assert_send::<Atom<Counter>>();
+    assert_send::<Atom<AppState>>();
+    assert_send::<Atom<ItemsSummary>>();
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -892,7 +892,7 @@ fn arc_ptr_eq_fast_path() {
     ARC_MEMO_COMPUTES.store(0, Ordering::SeqCst);
 
     let data = Arc::new(vec![1u32, 2, 3, 4, 5]);
-    let mut a = Drv::new(ArcAtom { data: data.clone() });
+    let mut a = Atom::new(ArcAtom { data: data.clone() });
     assert_eq!(arc_sum(&a), 15);
     assert_eq!(ARC_MEMO_COMPUTES.load(Ordering::SeqCst), 1);
 
@@ -925,7 +925,7 @@ fn arc_ptr_eq_fast_path() {
 
 #[test]
 fn proj_lens_basic() {
-    let a = Drv::new(Outer {
+    let a = Atom::new(Outer {
         inner: Inner {
             value: 42,
             label: "hello".into(),
@@ -938,7 +938,7 @@ fn proj_lens_basic() {
 
 #[test]
 fn proj_lens_cache_hit() {
-    let mut a = Drv::new(Outer {
+    let mut a = Atom::new(Outer {
         inner: Inner {
             value: 10,
             label: "x".into(),
@@ -962,7 +962,7 @@ fn proj_lens_cache_hit() {
 
 #[test]
 fn proj_lens_cache_miss() {
-    let mut a = Drv::new(Outer {
+    let mut a = Atom::new(Outer {
         inner: Inner {
             value: 10,
             label: "x".into(),
@@ -986,7 +986,7 @@ fn proj_lens_cache_miss() {
 
 #[test]
 fn proj_lens_mixed_with_regular() {
-    let outer = Drv::new(Outer {
+    let outer = Atom::new(Outer {
         inner: Inner {
             value: 5,
             label: "x".into(),
@@ -994,14 +994,14 @@ fn proj_lens_mixed_with_regular() {
         name: "hello".into(),
         ..Default::default()
     });
-    let mixed = Drv::new(MixedAtom { base: 7 });
+    let mixed = Atom::new(MixedAtom { base: 7 });
     assert_eq!(proj_plus_regular(&outer, &mixed), "hello-7");
 }
 
 #[test]
 fn proj_lens_send() {
     fn assert_send<T: Send>() {}
-    assert_send::<Drv<Outer>>();
+    assert_send::<Atom<Outer>>();
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1012,7 +1012,7 @@ fn proj_lens_send() {
 fn copy_by_value_in_lens() {
     // Standalone lens with x: u32 (owned, no deref) and y: &u32 (reference, deref).
     // Both styles work in the same lens.
-    let a = Drv::new(CopyTest {
+    let a = Atom::new(CopyTest {
         x: 10,
         y: 20,
         ..Default::default()

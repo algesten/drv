@@ -33,11 +33,11 @@ An atom is a struct of observable facts. Each field must implement
 mutated directly (plain field assignment) and serves as the root of the
 dependency graph.
 
-At use, an atom is wrapped in `Drv<T>`, which owns both the atom and its
-memoization cache. `Drv<T>` is an explicit constructor — `Drv::new(MyAtom { ... })`
-— but it derefs transparently to `T`, so field access reads like normal struct
-access. Cloning a `Drv<T>` clones the atom and starts the clone with a fresh
-empty cache.
+At use, the data struct is wrapped in `Atom<T>`, which owns both the data and
+its memoization cache. Construction is explicit — `Atom::new(MyAtom { ... })`
+— but the wrapper derefs transparently to `T`, so field access reads like
+normal struct access. Cloning an `Atom<T>` clones the data and starts the
+clone with a fresh empty cache.
 
 In database terms, an atom is a **base table**. In signal frameworks, it is a
 **state signal** or **observable**. In Datalog, it is the **extensional
@@ -199,7 +199,7 @@ With `imbl`, it is also efficient.
 Each `#[drv::memo]` function is transformed by the macro into a free function
 with the same name that performs the memoization inline.
 
-The `Drv<A>` wrapper owns both the atom and a `drv::Cache<A>`. `Cache<A: Atom>`
+The `Atom<A>` wrapper owns both the atom and a `drv::Cache<A>`. `Cache<A: Atom>`
 holds `RefCell<A::State>` — a stack-allocated, interior-mutable state struct
 unique to each atom type. The state type is supplied by the atom's `impl Atom`,
 which `drv::assemble!()` emits. It holds `(input, output)` pairs — one for each
@@ -208,10 +208,10 @@ memo that targets this atom.
 The evaluation flow:
 
 ```
-call memo(&drv)                      // drv: &Drv<Atom>
+call memo(&a)                      // a: &Atom<MyAtom>
   → convert &drv into the lens (auto via Into):
       built-in primitive Copy types are copied by value, others borrowed by reference
-  → take a short shared borrow of drv.__drv_cache()
+  → take a short shared borrow of a.__drv_cache()
   → compare each lens field against the cached snapshot
     → all equal: clone the cached output, DROP the borrow, return it (FAST PATH)
     → any differ: drop the borrow
@@ -322,12 +322,12 @@ output didn't actually change. In `drv`, early cutoff falls out naturally
 from the `PartialEq` check — it doesn't require special support.
 
 For an atom used as a memo output, the programmer constructs it in the memo
-body wrapped in `Drv::new(...)`. The cache is fresh on every recomputation of
+body wrapped in `Atom::new(...)`. The cache is fresh on every recomputation of
 the upstream memo — which is correct because the atom value itself is new.
 
 ## Memory layout
 
-`Drv<A>` owns both the atom data and its cache:
+`Atom<A>` owns both the atom data and its cache:
 
 ```rust
 pub trait Atom {
@@ -338,7 +338,7 @@ pub struct Cache<A: Atom> {
     inner: RefCell<A::State>,
 }
 
-pub struct Drv<T: Atom> {
+pub struct Atom<T: Atomized> {
     inner: T,
     cache: Cache<T>,
 }
@@ -389,14 +389,14 @@ pub struct __DrvComputeInput {
 }
 ```
 
-The associated type `Atom::State` bridges the ordering mismatch: `Drv<T>`'s
+The associated type `Atomized::State` bridges the ordering mismatch: `Atom<T>`'s
 field type (`Cache<T>`) is known at atom-definition time, while the concrete
 state layout depends on which memos exist and is resolved later via the trait
-impl. The `Send` bound on `State` propagates to `Drv<T>`, so wrapped atoms can
+impl. The `Send` bound on `State` propagates to `Atom<T>`, so wrapped atoms can
 be moved across threads.
 
 No heap allocation, no type erasure, no `Box`. The state struct is inlined
-directly next to the atom inside `Drv<T>`. Access cost on the hot path:
+directly next to the atom inside `Atom<T>`. Access cost on the hot path:
 
 - `RefCell::borrow()` — a single atomic-like flag check
 - Direct field access into `A::State` — known offset, no downcast

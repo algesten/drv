@@ -74,7 +74,8 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
                     #(#state_fields,)*
                 }
 
-                impl ::drv::Atom for #atom_ident {
+                impl ::drv::__sealed::Sealed for #atom_ident {}
+                impl ::drv::Atomized for #atom_ident {
                     type State = #state_name;
                 }
             });
@@ -189,7 +190,7 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                 } => {
                     if *is_identity {
                         let atom_ident = Ident::new(atom_name, Span::call_site());
-                        quote! { #pname: &::drv::Drv<#atom_ident> }
+                        quote! { #pname: &::drv::Atom<#atom_ident> }
                     } else {
                         let lens_ident = Ident::new(lens_name, Span::call_site());
                         let lt = syn::Lifetime::new(&format!("'drv{}", i), Span::call_site());
@@ -263,7 +264,7 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
             let field = Ident::new(&p.param_name, Span::call_site());
             match &p.kind {
                 MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-                    // #pname: &Drv<Atom>; double-deref to reach the Atom value
+                    // #pname: &Atom<Atom>; double-deref to reach the Atom value
                     // so the existing `PartialEq<__Drv{Atom}Identity> for Atom` impl fires.
                     quote! { **#pname == __prev.#field }
                 }
@@ -337,7 +338,7 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
             let pname = Ident::new(&p.param_name, Span::call_site());
             match &p.kind {
                 MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-                    // #pname: &Drv<Atom>; user __compute takes &Atom, so deref.
+                    // #pname: &Atom<Atom>; user __compute takes &Atom, so deref.
                     quote! { &**#pname }
                 }
                 MemoParamKind::Lens { .. } => {

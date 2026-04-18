@@ -254,7 +254,7 @@ pub(crate) fn generate_lens_types_with(
             eq_checks.push(quote! {
                 (::drv::FastEq(&self.#name).fast_eq(&other.#name))
             });
-            // Explicit deref: `source: &'drv Drv<Atom>` → `(*source): Atom`
+            // Explicit deref: `source: &'drv Atom<Atom>` → `(*source): Atom`
             // so the field access borrows for the full `'drv` lifetime.
             from_fields.push(quote! { #name: (*source).#name });
             snap_stores.push(quote! { #name: self.#name.clone() });
@@ -294,9 +294,9 @@ pub(crate) fn generate_lens_types_with(
             }
         }
 
-        // From<&Drv<Atom>> for the lens — copy primitives, borrow the rest.
-        impl<'drv> ::core::convert::From<&'drv ::drv::Drv<#atom_ident>> for #lens_ident<'drv> {
-            fn from(source: &'drv ::drv::Drv<#atom_ident>) -> Self {
+        // From<&Atom<Atom>> for the lens — copy primitives, borrow the rest.
+        impl<'drv> ::core::convert::From<&'drv ::drv::Atom<#atom_ident>> for #lens_ident<'drv> {
+            fn from(source: &'drv ::drv::Atom<#atom_ident>) -> Self {
                 #lens_ident {
                     __drv: source.__drv_cache(),
                     #(#from_fields,)*

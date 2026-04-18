@@ -59,11 +59,11 @@ pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
         Ok(())
     })?;
 
-    // Rewrite the impl so the user never has to type `Drv<_>`:
+    // Rewrite the impl so the user never has to type the wrapper:
     //
-    // - Change the trait argument from `&'a Atom` to `&'a ::drv::Drv<Atom>`.
-    // - Rename the `from` parameter to an internal name holding the `&Drv`.
-    // - Re-bind the user's original name to a deref'd `&Atom` at the top of
+    // - Change the trait argument from `&'a MyAtom` to `&'a ::drv::Atom<MyAtom>`.
+    // - Rename the `from` parameter to an internal name that holds the wrapper.
+    // - Re-bind the user's original name to a deref'd `&MyAtom` at the top of
     //   the body, so field access (`v.inner`) reads the atom directly.
     // - Inject `__drv: #internal.__drv_cache()` into struct literals.
     let internal_param = Ident::new("__drv_proj_src", user_param.span());
@@ -122,11 +122,11 @@ fn extract_atom_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
         if let Some(syn::GenericArgument::Type(syn::Type::Reference(r))) = args.args.first() {
             if let syn::Type::Path(p) = r.elem.as_ref() {
                 if let Some(seg) = p.path.segments.last() {
-                    if seg.ident == "Drv" {
+                    if seg.ident == "Atom" {
                         return Err(syn::Error::new_spanned(
                             &last_seg.arguments,
-                            "#[drv::proj] expects `From<&Atom>` — the `Drv<_>` \
-                             wrapper is added automatically",
+                            "#[drv::proj] expects `From<&YourAtom>` — the \
+                             `Atom<_>` wrapper is added automatically",
                         ));
                     }
                     return Ok(seg.ident.clone());
@@ -176,7 +176,7 @@ fn extract_from_lifetime(item: &ItemImpl) -> Option<syn::Lifetime> {
     None
 }
 
-/// Rewrite `impl ... From<&'a Atom> ...` to `impl ... From<&'a ::drv::Drv<Atom>> ...`.
+/// Rewrite `impl ... From<&'a MyAtom> ...` to `impl ... From<&'a ::drv::Atom<MyAtom>> ...`.
 fn rewrite_trait_arg(item: &mut ItemImpl, atom_name: &Ident) -> Result<(), syn::Error> {
     let trait_path = &mut item
         .trait_
@@ -189,7 +189,7 @@ fn rewrite_trait_arg(item: &mut ItemImpl, atom_name: &Ident) -> Result<(), syn::
         .expect("validated earlier: From<...> has segments");
     if let syn::PathArguments::AngleBracketed(args) = &mut last_seg.arguments {
         if let Some(syn::GenericArgument::Type(syn::Type::Reference(r))) = args.args.first_mut() {
-            *r.elem = syn::parse_quote! { ::drv::Drv<#atom_name> };
+            *r.elem = syn::parse_quote! { ::drv::Atom<#atom_name> };
             return Ok(());
         }
     }
@@ -199,7 +199,7 @@ fn rewrite_trait_arg(item: &mut ItemImpl, atom_name: &Ident) -> Result<(), syn::
     ))
 }
 
-/// Rewrite the `from` method to take `&'a Drv<Atom>` under a fresh internal
+/// Rewrite the `from` method to take `&'a Atom<Atom>` under a fresh internal
 /// name, and re-bind the user's original parameter name to a deref'd `&Atom`
 /// so their body reads atom fields naturally.
 fn rewrite_from_method(
@@ -218,8 +218,8 @@ fn rewrite_from_method(
                         pat_ident.ident = internal_param.clone();
                     }
                     *pat_ty.ty = match lifetime {
-                        Some(lt) => syn::parse_quote! { &#lt ::drv::Drv<#atom_name> },
-                        None => syn::parse_quote! { &::drv::Drv<#atom_name> },
+                        Some(lt) => syn::parse_quote! { &#lt ::drv::Atom<#atom_name> },
+                        None => syn::parse_quote! { &::drv::Atom<#atom_name> },
                     };
                 }
                 // Insert `let #user_param: &'a Atom = &**#internal_param;` at the top.

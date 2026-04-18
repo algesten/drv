@@ -9,7 +9,7 @@ that are automatically cached. When nothing changed, nothing recomputes.
 ## Quick example
 
 ```rust
-use drv::Drv;
+use drv::Atom;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
@@ -29,7 +29,7 @@ fn total_score(lens: &TotalLens) -> u32 {
 
 drv::assemble!();
 
-let mut game = Drv::new(Scoreboard {
+let mut game = Atom::new(Scoreboard {
     hits: vec![100, 250, 50],
     ..Default::default()
 });
@@ -43,20 +43,22 @@ Moving the player? Free. `total_score` only recomputes when `hits` change.
 
 ## The three pieces
 
-**Atom** — a plain struct of ground-truth data, tagged with `#[drv::atom]`.
-You derive whatever you need (`Clone`, `PartialEq`, `Debug`, `Default`,
-`serde`, …) with normal `#[derive(...)]`; drv does not inject fields or
-impls. The struct is wrapped in `Drv<T>` at construction so each instance
-carries its own memoization cache alongside the data.
+**Atom** — a plain struct of ground-truth data, tagged with
+[`#[drv::atom]`](macro@atom). You derive whatever you need (`Clone`,
+`PartialEq`, `Debug`, `Default`, `serde`, …) with normal `#[derive(...)]`;
+drv does not inject fields or impls. The struct is wrapped in
+[`drv::Atom<T>`](Atom) at construction so each instance carries its own
+memoization cache alongside the data.
 
 **Lens** — a projection: a subset of an atom's fields, by name and type.
 It declares "this computation depends on exactly these fields and no others."
 
 **Memo** — a pure function from a lens (or an atom directly) to an output.
-Annotated with `#[drv::memo]`. The result is cached and only recomputed when
-the input fields change.
+Annotated with [`#[drv::memo]`](macro@memo). The result is cached and only
+recomputed when the input fields change.
 
-At the end of your crate, `drv::assemble!()` stitches everything together.
+At the end of your crate, [`drv::assemble!()`](assemble!) stitches
+everything together.
 
 ## Declaring lenses
 
@@ -67,13 +69,13 @@ In all generated lenses, built-in scalar primitives (`u32`, `bool`, `f64`,
 dereference needed. All other types are borrowed as `&T`. User-defined
 `Copy` types are *not* auto-detected (the proc macro can only recognise
 language built-ins); for full control over field representation, declare
-the projection explicitly with `#[drv::proj]`.
+the projection explicitly with [`#[drv::proj]`](macro@proj).
 
 ### Inline: annotate fields on the atom
 
-Tag fields with `#[drv::lens(Name)]` directly on the atom. The macro generates
-a lens called `Name` with those fields. This keeps the full dependency picture
-in one place:
+Tag fields with [`#[drv::lens(Name)]`](macro@lens) directly on the atom.
+The macro generates a lens called `Name` with those fields. This keeps
+the full dependency picture in one place:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -94,12 +96,13 @@ pub struct AppState {
 
 This generates three lenses: `TotalLens { items }`, `StatusLens { items, selected }`,
 and `Render { viewport_rows }`. A field can appear in multiple lenses —
-list them in one attribute `#[drv::lens(A, B)]` or as separate attributes.
+list them in one attribute [`#[drv::lens(A, B)]`](macro@lens) or as
+separate attributes.
 
 ### Standalone: declare a separate struct
 
-Declare the lens as its own struct with `#[drv::lens(Atom)]`. The macro verifies
-that every field name and type matches the atom:
+Declare the lens as its own struct with [`#[drv::lens(Atom)]`](macro@lens).
+The macro verifies that every field name and type matches the atom:
 
 ```rust
 #[drv::lens(AppState)]
@@ -112,23 +115,23 @@ struct MyLens<'a> {
 Only built-in primitive Copy types (`u8`..`u128`, `i8`..`i128`, `usize`, `isize`, `f32`,
 `f64`, `bool`, `char`) may appear by value — any other type must be written
 as `&'a T`. The lens struct must be valid Rust on its own (the
-`#[drv::lens(...)]` attribute is a no-op when stripped), so any reference
-field requires a lifetime parameter declared on the struct. If you need a
-clone (or a projection into a nested struct, or a different type), write
-a custom projection with `#[drv::proj]` instead.
+[`#[drv::lens(...)]`](macro@lens) attribute is a no-op when stripped), so
+any reference field requires a lifetime parameter declared on the struct.
+If you need a clone (or a projection into a nested struct, or a different
+type), write a custom projection with [`#[drv::proj]`](macro@proj) instead.
 
 Use standalone lenses when the lens is defined closer to the memo that consumes
 it, or when the atom is in another module and you don't want to modify it.
 
-### Custom projection with `#[drv::proj]`
+### Custom projection with [`#[drv::proj]`](macro@proj)
 
 When you need lens fields that don't match the atom — different names, different
 types, or reaching into nested structs — write the projection yourself. You declare
-the lens struct with `#[drv::lens(Atom)]` and annotate the `From` impl with
-`#[drv::proj]`:
+the lens struct with [`#[drv::lens(Atom)]`](macro@lens) and annotate the
+`From` impl with [`#[drv::proj]`](macro@proj):
 
 ```rust
-use drv::Drv;
+use drv::Atom;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Inner {
@@ -152,7 +155,7 @@ struct ProjectedLens<'a> {
 }
 
 // The projection function. drv::proj wires the cache handle and rewrites
-// the signature to take a `&Drv<Container>` under the hood.
+// the signature to take a `&Atom<Container>` under the hood.
 #[drv::proj]
 impl<'a> From<&'a Container> for ProjectedLens<'a> {
     fn from(v: &'a Container) -> Self {
@@ -168,7 +171,7 @@ fn display(lens: &ProjectedLens) -> String {
     format!("{}={}", lens.name, lens.x)
 }
 
-let c = Drv::new(Container {
+let c = Atom::new(Container {
     inner: Inner { x: 42, label: "ignored".into() },
     name: "hello".into(),
     ..Default::default()
@@ -178,21 +181,22 @@ assert_eq!(display(&c), "hello=42");
 
 The macro switches to this mode automatically when the lens struct's fields
 don't match the atom. Your struct definition stays exactly as written; the
-`#[drv::proj]` attribute only rewrites the `From` body to wire the cache
-reference. Lenses with a `#[drv::proj]` impl require a lifetime parameter
-on the struct (for the cache reference).
+[`#[drv::proj]`](macro@proj) attribute only rewrites the `From` body to
+wire the cache reference. Lenses with a [`#[drv::proj]`](macro@proj) impl
+require a lifetime parameter on the struct (for the cache reference).
 
 They work identically with memos — cache hits, misses, multi-lens parameters,
 and value parameters all behave the same as standard lenses.
 
 ## Calling memos
 
-`#[drv::memo]` generates a free function with the same name. The function
-body reads from the lens; the generated wrapper handles memoization. You
-call it with `&Drv<Atom>` — the macro auto-converts into the right lens:
+[`#[drv::memo]`](macro@memo) generates a free function with the same name.
+The function body reads from the lens; the generated wrapper handles
+memoization. You call it with [`&Atom<YourStruct>`](Atom) — the macro
+auto-converts into the right lens:
 
 ```rust
-use drv::Drv;
+use drv::Atom;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
@@ -207,12 +211,12 @@ fn item_count(lens: &CountLens) -> usize {
     lens.items.len()
 }
 
-let app = Drv::new(AppState {
+let app = Atom::new(AppState {
     items: vec![10, 20, 30],
     ..Default::default()
 });
 
-let n = item_count(&app);   // pass &Drv<AppState>; projects to CountLens
+let n = item_count(&app);   // pass &Atom<AppState>; projects to CountLens
 assert_eq!(n, 3);
 ```
 
@@ -221,11 +225,12 @@ Memoization happens behind the scenes — no cache struct, no setup.
 ## Using an atom directly
 
 A memo can take the atom itself as input — treated as an "identity lens" over
-all data fields. Write the parameter as `&Atom`; callers pass `&Drv<Atom>`
-and the generated wrapper derefs before invoking the body:
+all data fields. Write the parameter as `&YourStruct`; callers pass
+[`&Atom<YourStruct>`](Atom) and the generated wrapper derefs before
+invoking the body:
 
 ```rust
-use drv::Drv;
+use drv::Atom;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
@@ -249,7 +254,7 @@ A memo can take lenses from multiple atoms. The cache lives in the first
 parameter's atom:
 
 ```rust
-use drv::Drv;
+use drv::Atom;
 
 #[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
@@ -274,7 +279,7 @@ let score = weighted_score(&game, &settings);   // cache stored in `game`
 ```
 
 If any of the lens field comparisons fail, the memo recomputes. Two lenses from
-the same atom (`fn foo(a: &LensA, b: &LensB)` called as `foo(&drv, &drv)`)
+the same atom (`fn foo(a: &LensA, b: &LensB)` called as `foo(&app, &app)`)
 works too.
 
 ## Value parameters
@@ -292,7 +297,7 @@ fn labeled(lens: &CountLens, label: &str, multiplier: u32) -> String {
 
 Parameter classification:
 
-- `&Lens` or `&Drv<Atom>` — a lens parameter (required: at least one lens).
+- `&Lens` or [`&Atom<MyAtom>`](Atom) — a lens parameter (required: at least one lens).
 - Owned types (`u32`, `String`, `MyStruct`) — stored via `Clone`.
 - Borrowed types with `ToOwned` (`&str`, `&[u8]`, `&Path`, ...) — stored
   as `<T as ToOwned>::Owned` (so `&str` stores as `String`).
@@ -305,10 +310,11 @@ always stored on the first lens parameter's atom.
 ## Chaining
 
 A memo's output can feed into another memo. Mark the output type as an atom too,
-and return it wrapped in `Drv<...>` so downstream memos can project from it:
+and return it wrapped in [`Atom<...>`](Atom) so downstream memos can project
+from it:
 
 ```rust
-use drv::Drv;
+use drv::Atom;
 
 // Root atom
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -325,8 +331,8 @@ struct HitsLens<'a> {
 }
 
 #[drv::memo]
-fn stats(lens: &HitsLens) -> Drv<Stats> {
-    Drv::new(Stats {
+fn stats(lens: &HitsLens) -> Atom<Stats> {
+    Atom::new(Stats {
         total: lens.hits.iter().sum(),
         count: lens.hits.len() as u32,
         best: lens.hits.iter().copied().max().unwrap_or(0),
@@ -424,12 +430,12 @@ Two kinds of costs matter on the hot path:
 1. Per-field `PartialEq` cost.
 2. Output `Clone` cost.
 
-For `PartialEq`, the field type matters. Scalars are free. Collections
-(both `Vec`/`HashMap` and `imbl::Vector`/`imbl::HashMap`) iterate and
-compare pairwise — O(n) worst case on a cache hit. `imbl` does not
-short-circuit via pointer equality; its advantage is O(1) `Clone` on
-cache miss, not faster comparison. For output `Clone`, wrap expensive
-outputs in `Rc`/`Arc` for O(1) cloning.
+For `PartialEq`, the field type matters. Scalars are free. Plain
+collections (`Vec`, `HashMap`) iterate and compare pairwise — O(n) worst
+case on a cache hit. `Arc<T>` and (with the `imbl` feature) `imbl`'s
+persistent collections take a pointer-equality fast path: when the field
+hasn't been mutated since the last cache miss, comparison is O(1).
+For output `Clone`, wrap expensive outputs in `Rc`/`Arc` for O(1) cloning.
 
 **Principle:** choose types where `PartialEq` is proportional to the amount of
 change, not the total size of the data.
@@ -528,9 +534,10 @@ over the combined state.
 
 ## Assembly
 
-`drv::assemble!()` must appear once, after all `#[drv::atom]`, `#[drv::lens]`,
-and `#[drv::memo]` declarations in the crate. It collects all registrations
-and emits the cache types, the lens types, and the memoized free functions.
+`drv::assemble!()` must appear once, after every `#[drv::atom]`,
+`#[drv::lens]`, `#[drv::memo]`, and `#[drv::proj]` declaration in the
+crate. It collects every registration and emits the per-atom state types
+(the [`Atomized`] impls) and the memoized free functions.
 
 ```
 // lib.rs
@@ -543,15 +550,18 @@ drv::assemble!();
 
 ## Design goals
 
-- **Plain Rust structs.** Atoms and lenses are regular structs you can construct
-  with literal syntax, clone, compare, debug.
-- **Static dependency declaration.** The lens struct _is_ the dependency list.
-  The compiler verifies field names and types at compile time.
-- **Zero runtime tracking.** No proxy objects, no access instrumentation, no
-  subscription management. Just field-by-field `PartialEq`.
-- **Memoization is automatic.** No cache struct to construct, no explicit
-  setup — just call the memo.
-- **Free functions, not methods.** Memos are ordinary functions. Call sites
-  don't need to know any generated type names.
+- **Plain Rust structs.** Your atom is a plain data struct with whatever
+  `#[derive(...)]` you choose. drv injects nothing into it; the
+  [`Atom<T>`] wrapper holds the cache *next to* the data, not inside it.
+- **Static dependency declaration.** The lens struct _is_ the dependency
+  list. The compiler verifies field names and types at compile time
+  (or, with [`#[drv::proj]`](macro@proj), the projection function).
+- **Zero runtime tracking.** No proxy objects, no access instrumentation,
+  no subscription management. Just field-by-field `PartialEq` against a
+  stashed snapshot.
+- **Memoization is automatic.** Wrap your atom with [`Atom::new`] and
+  call the memo. No cache struct to manage, no explicit setup.
+- **Free functions, not methods.** Memos are ordinary functions. Call
+  sites don't need to know any generated type names.
 
 License: MIT OR Apache-2.0
