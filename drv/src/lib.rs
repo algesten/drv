@@ -627,6 +627,18 @@
 //! drv::assemble!();
 //! ```
 //!
+//! # Serde
+//!
+//! Enable the `serde` feature to make `Atom<T>` forward [`serde::Serialize`]
+//! and [`serde::Deserialize`] whenever `T` implements them. Only the inner
+//! data is serialized; the cache is reconstructed empty on deserialize, so a
+//! roundtripped atom is observably equivalent to the original but starts cold.
+//!
+//! ```toml
+//! [dependencies]
+//! drv = { version = "0.1", features = ["serde"] }
+//! ```
+//!
 //! # Design goals
 //!
 //! - **Plain Rust structs.** Your atom is a plain data struct with whatever
@@ -911,6 +923,20 @@ impl<T: Atomized + std::hash::Hash> std::hash::Hash for Atom<T> {
 impl<T: Atomized> From<T> for Atom<T> {
     fn from(value: T) -> Self {
         Self::new(value)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<T: Atomized + serde::Serialize> serde::Serialize for Atom<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T: Atomized + serde::Deserialize<'de>> serde::Deserialize<'de> for Atom<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::new)
     }
 }
 

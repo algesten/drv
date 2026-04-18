@@ -576,6 +576,18 @@ mod rendering;   // more lenses + memos
 drv::assemble!();
 ```
 
+## Serde
+
+Enable the `serde` feature to make `Atom<T>` forward [`serde::Serialize`]
+and [`serde::Deserialize`] whenever `T` implements them. Only the inner
+data is serialized; the cache is reconstructed empty on deserialize, so a
+roundtripped atom is observably equivalent to the original but starts cold.
+
+```toml
+[dependencies]
+drv = { version = "0.1", features = ["serde"] }
+```
+
 ## Design goals
 
 - **Plain Rust structs.** Your atom is a plain data struct with whatever

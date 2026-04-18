@@ -17,13 +17,19 @@ default = []
 # Enables pointer-equality fast-path comparisons for imbl's persistent
 # collections (Vector, HashMap, OrdMap, HashSet, OrdSet).
 imbl = ["dep:imbl"]
+# Forwards Serialize / Deserialize through Atom<T> when T implements them.
+# Only the inner atom data is serialized; the cache is always reconstructed
+# empty on deserialize.
+serde = ["dep:serde"]
 
 [dependencies]
 drv-macros = { version = "=0.1.0", path = "../drv-macros" }
 imbl = { version = "7.0.0", optional = true }
+serde = { version = "1", optional = true }
 
 [dev-dependencies]
 imbl = "7.0.0"
+serde = { version = "1", features = ["derive"] }
 trybuild = "1.0"
 
 [lints]
