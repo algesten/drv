@@ -35,7 +35,6 @@ pub struct AtomField {
 pub struct LensRegistration {
     pub name: String,
     pub atom_name: String,
-    pub fields: Vec<LensField>,
     /// True if this is an "identity lens" — the lens IS the atom (all fields).
     pub is_identity: bool,
     /// True if this lens *requires* a user-written `#[drv::proj]` projection
@@ -51,24 +50,8 @@ pub struct LensRegistration {
 }
 
 #[derive(Clone)]
-pub struct LensField {
-    pub name: String,
-    // Fields below are populated for lenses with a #[drv::proj] impl. Not read
-    // from the registry directly — code gen happens at #[drv::lens] time, not
-    // at assemble!() time. Retained for potential future use.
-    #[allow(dead_code)]
-    pub ty_tokens: Option<String>,
-    #[allow(dead_code)]
-    pub is_ref: bool,
-    #[allow(dead_code)]
-    pub referent_tokens: Option<String>,
-}
-
-#[derive(Clone)]
 pub struct ProjRegistration {
     pub lens_name: String,
-    #[allow(dead_code)]
-    pub atom_name: String,
 }
 
 #[derive(Clone)]

@@ -4,6 +4,17 @@ use syn::Ident;
 
 use crate::registry::{self, MemoParam};
 
+/// Struct name for an atom's identity-lens view, generated only when some memo
+/// actually takes `&Atom<T>` as a parameter.
+fn identity_lens_ident(atom_name: &str) -> Ident {
+    format_ident!("__DrvIdentity{}", atom_name)
+}
+
+/// Snapshot struct name paired with [`identity_lens_ident`].
+fn identity_snapshot_ident(atom_name: &str) -> Ident {
+    format_ident!("__Drv__DrvIdentity{}", atom_name)
+}
+
 pub fn expand() -> Result<TokenStream, syn::Error> {
     registry::with(|reg| {
         let mut output = TokenStream::new();
@@ -22,6 +33,51 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
                     ),
                 ));
             }
+        }
+
+        // Identity-lens generation. The lens struct + snapshot + PartialEq +
+        // From are emitted only for atoms that some memo actually consumes via
+        // `&Atom<T>`. Atoms without an identity-lens consumer impose no bounds
+        // on their fields from the identity path.
+        let identity_atoms: std::collections::BTreeSet<String> = reg
+            .memos
+            .iter()
+            .flat_map(|m| m.params.iter())
+            .filter_map(|p| match p {
+                MemoParam::Lens { lens_name, .. } => reg
+                    .find_lens(lens_name)
+                    .filter(|l| l.is_identity)
+                    .map(|l| l.atom_name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        for atom_name in &identity_atoms {
+            let atom = reg
+                .find_atom(atom_name)
+                .expect("identity lens references a registered atom");
+            let atom_ident = Ident::new(&atom.name, Span::call_site());
+            let lens_ident = identity_lens_ident(&atom.name);
+            let snapshot_ident = identity_snapshot_ident(&atom.name);
+            let field_names: Vec<Ident> = atom
+                .fields
+                .iter()
+                .map(|f| Ident::new(&f.name, Span::call_site()))
+                .collect();
+            let field_types: Vec<syn::Type> = atom
+                .fields
+                .iter()
+                .map(|f| syn::parse_str(&f.ty_tokens).expect("atom field type should parse"))
+                .collect();
+            let (base, from_impl) = crate::atom::generate_lens_types(
+                &lens_ident,
+                &snapshot_ident,
+                &atom_ident,
+                &field_names,
+                &field_types,
+            );
+            output.extend(base);
+            output.extend(from_impl);
         }
 
         // Emit auto-generated `From<&Atom> for Lens` impls for every standard
@@ -150,7 +206,6 @@ fn generate_input_struct(memo: &MemoInfo) -> TokenStream {
 
     quote! {
         #[doc(hidden)]
-        #[derive(Default)]
         pub struct #struct_ident {
             #(pub #fields,)*
         }
@@ -236,25 +291,42 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
     };
 
     // Inside the function: convert each lens param into the lens value.
-    // Value params don't need conversion.
+    // - Regular lens: shadow `pname` with the converted lens, so downstream
+    //   references (cache, fresh-check, snapshot, compute) all see the lens.
+    // - Identity lens: keep `pname` as the atom reference (needed for the
+    //   user's `__compute`), and bind a sibling `__drvl_<pname>` to the
+    //   identity-lens view used by the cache machinery.
+    let lens_expr = |p: &MemoParamLocal| -> TokenStream {
+        let pname = Ident::new(&p.param_name, Span::call_site());
+        match &p.kind {
+            MemoParamKind::Lens { is_identity, .. } if *is_identity => {
+                let v = format_ident!("__drvl_{}", p.param_name);
+                quote! { #v }
+            }
+            _ => quote! { #pname },
+        }
+    };
+
     let conversions: Vec<TokenStream> = memo
         .params
         .iter()
         .map(|p| {
             let pname = Ident::new(&p.param_name, Span::call_site());
             match &p.kind {
-                MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-                    quote! { let #pname = #pname; }
+                MemoParamKind::Lens {
+                    is_identity,
+                    atom_name,
+                    ..
+                } if *is_identity => {
+                    let v = format_ident!("__drvl_{}", p.param_name);
+                    let lens_ident = identity_lens_ident(atom_name);
+                    quote! { let #v: #lens_ident<'_> = #pname.into(); }
                 }
                 MemoParamKind::Lens { .. } => {
                     quote! { let #pname: _ = #pname.into(); }
                 }
-                MemoParamKind::Value { .. } => {
-                    quote! {}
-                }
-                MemoParamKind::ValueRef { .. } => {
-                    quote! {}
-                }
+                MemoParamKind::Value { .. } => quote! {},
+                MemoParamKind::ValueRef { .. } => quote! {},
             }
         })
         .collect();
@@ -265,13 +337,8 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
         .iter()
         .find(|p| matches!(p.kind, MemoParamKind::Lens { .. }))
         .expect("memo must have at least one lens param (validated in memo.rs)");
-    let first_lens_name = Ident::new(&first_lens.param_name, Span::call_site());
-    let cache_expr = match &first_lens.kind {
-        MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-            quote! { #first_lens_name.__drv_cache() }
-        }
-        _ => quote! { #first_lens_name.__drv },
-    };
+    let first_lens_expr = lens_expr(first_lens);
+    let cache_expr = quote! { #first_lens_expr.__drv };
 
     // Freshness check: compare each param against the stored snapshot field.
     let fresh_checks: Vec<TokenStream> = memo
@@ -281,14 +348,10 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
             let pname = Ident::new(&p.param_name, Span::call_site());
             let field = Ident::new(&p.param_name, Span::call_site());
             match &p.kind {
-                MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-                    // #pname: &Atom<Atom>; double-deref to reach the Atom value
-                    // so the existing `PartialEq<__Drv{Atom}Identity> for Atom` impl fires.
-                    quote! { **#pname == __prev.#field }
-                }
                 MemoParamKind::Lens { .. } => {
-                    // lens compared with lens snapshot: lens == prev.field
-                    quote! { #pname == __prev.#field }
+                    // Regular and identity lenses both compare as `lens == prev.field`.
+                    let lens = lens_expr(p);
+                    quote! { #lens == __prev.#field }
                 }
                 MemoParamKind::Value { .. } => {
                     // FastEq enables ptr_eq short-circuit for Arc and imbl.
@@ -314,25 +377,9 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
             let pname = Ident::new(&p.param_name, Span::call_site());
             let field = Ident::new(&p.param_name, Span::call_site());
             match &p.kind {
-                MemoParamKind::Lens {
-                    is_identity,
-                    atom_name,
-                    fields: atom_fields,
-                    ..
-                } if *is_identity => {
-                    // Identity snapshot — clone each atom field.
-                    let snap = format_ident!("__Drv{}Identity", atom_name);
-                    let field_clones: Vec<TokenStream> = atom_fields
-                        .iter()
-                        .map(|f| {
-                            let fname = Ident::new(&f.name, Span::call_site());
-                            quote! { #fname: #pname.#fname.clone() }
-                        })
-                        .collect();
-                    quote! { #field: #snap { #(#field_clones),* } }
-                }
                 MemoParamKind::Lens { .. } => {
-                    quote! { #field: #pname.__drv_snapshot() }
+                    let lens = lens_expr(p);
+                    quote! { #field: #lens.__drv_snapshot() }
                 }
                 MemoParamKind::Value { .. } => {
                     quote! { #field: #pname }
@@ -435,11 +482,14 @@ fn build_memo_info(
                 }
 
                 let snapshot_ident = if lens.is_identity {
-                    format_ident!("__Drv{}Identity", lens.atom_name)
+                    identity_snapshot_ident(&lens.atom_name)
                 } else {
                     format_ident!("__Drv{}", lens.name)
                 };
                 let lens_type = if lens.is_identity {
+                    // The user's `__compute` receives `&T` (not `&Lens`); the
+                    // identity-lens machinery is used only internally for
+                    // cache lookup / freshness / snapshot.
                     Ident::new(&lens.atom_name, Span::call_site()).into_token_stream()
                 } else {
                     let i = Ident::new(&lens.name, Span::call_site());
@@ -454,7 +504,6 @@ fn build_memo_info(
                         is_identity: lens.is_identity,
                         snapshot_ident,
                         lens_type,
-                        fields: lens.fields.clone(),
                     },
                 });
             }
@@ -517,7 +566,6 @@ enum MemoParamKind {
         is_identity: bool,
         snapshot_ident: Ident,
         lens_type: TokenStream,
-        fields: Vec<registry::LensField>,
     },
     Value {
         ty_tokens: String,

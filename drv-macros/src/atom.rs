@@ -2,7 +2,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Fields, Ident, ItemStruct};
 
-use crate::registry::{self, AtomField, AtomRegistration, LensField, LensRegistration};
+use crate::registry::{self, AtomField, AtomRegistration, LensRegistration};
 
 pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::Error> {
     let struct_name = &item.ident;
@@ -96,15 +96,6 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
             reg.lenses.push(LensRegistration {
                 name: lens_name_str.clone(),
                 atom_name: struct_name.to_string(),
-                fields: lens_fields
-                    .iter()
-                    .map(|(name, _ty)| LensField {
-                        name: name.to_string(),
-                        ty_tokens: None,
-                        is_ref: false,
-                        referent_tokens: None,
-                    })
-                    .collect(),
                 is_identity: false,
                 is_proj: false,
                 from_impl_tokens: Some(from_impl.to_string()),
@@ -132,9 +123,6 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
         })
         .collect();
 
-    let data_field_idents: Vec<&Ident> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
-    let data_field_types: Vec<&syn::Type> = fields.iter().map(|f| &f.ty).collect();
-
     let mut output = quote! {
         #(#other_attrs)*
         #vis struct #struct_name #generics {
@@ -159,64 +147,24 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
             &field_types,
         );
         output.extend(base);
-
-        // All atom data fields (for From impl)
-        let _ = &data_field_idents;
-        let _ = &data_field_types;
     }
 
-    // Generate identity lens: atom itself as lens.
-    // Register it so memos taking `&AtomName` work.
-    {
-        let snapshot_ident = format_ident!("__Drv{}Identity", struct_name);
-        let field_names: Vec<Ident> = data_field_idents.iter().cloned().cloned().collect();
-        let field_types: Vec<syn::Type> = data_field_types.iter().cloned().cloned().collect();
-
-        // Snapshot struct for identity lens.
-        let fn_iter = field_names.iter();
-        let ft_iter = field_types.iter();
-        output.extend(quote! {
-            #[doc(hidden)]
-            #[derive(Default)]
-            pub struct #snapshot_ident {
-                #(pub #fn_iter: #ft_iter,)*
-            }
-        });
-
-        // PartialEq between &Atom and identity snapshot.
-        let fe1 = field_names.iter();
-        let fe2 = field_names.iter();
-        output.extend(quote! {
-            impl ::core::cmp::PartialEq<#snapshot_ident> for #struct_name {
-                fn eq(&self, other: &#snapshot_ident) -> bool {
-                    use ::drv::FastEqFallback as _;
-                    #(::drv::FastEq(&self.#fe1).fast_eq(&other.#fe2))&&*
-                }
-            }
-        });
-
-        registry::with(|reg| {
-            // Check there's no user-defined lens with the same name as the atom.
-            if !reg.lens_name_exists(&struct_name.to_string()) {
-                reg.lenses.push(LensRegistration {
-                    name: struct_name.to_string(),
-                    atom_name: struct_name.to_string(),
-                    fields: data_field_idents
-                        .iter()
-                        .map(|n| LensField {
-                            name: n.to_string(),
-                            ty_tokens: None,
-                            is_ref: false,
-                            referent_tokens: None,
-                        })
-                        .collect(),
-                    is_identity: true,
-                    is_proj: false,
-                    from_impl_tokens: None,
-                });
-            }
-        });
-    }
+    // Register the identity lens so memos taking `&AtomName` can find it.
+    // The lens struct, snapshot, PartialEq, and From impls are emitted by
+    // `drv::assemble!()` only when some memo actually consumes the identity
+    // lens — atoms with no identity-lens consumers impose no bounds on their
+    // fields beyond what their explicit lenses already demand.
+    registry::with(|reg| {
+        if !reg.lens_name_exists(&struct_name.to_string()) {
+            reg.lenses.push(LensRegistration {
+                name: struct_name.to_string(),
+                atom_name: struct_name.to_string(),
+                is_identity: true,
+                is_proj: false,
+                from_impl_tokens: None,
+            });
+        }
+    });
 
     Ok(output)
 }
@@ -309,7 +257,6 @@ pub(crate) fn generate_lens_types_with(
 
         // Internal owned snapshot for cache storage.
         #[doc(hidden)]
-        #[derive(Default)]
         pub struct #snapshot_ident {
             #(#snap_fields,)*
         }

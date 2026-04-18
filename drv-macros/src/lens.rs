@@ -3,7 +3,7 @@ use quote::{format_ident, quote};
 use syn::{Fields, Ident, ItemStruct};
 
 use crate::atom::{generate_lens_types_with, is_copy_primitive};
-use crate::registry::{self, LensField, LensRegistration};
+use crate::registry::{self, LensRegistration};
 
 pub fn expand(attr_args: &Ident, item: ItemStruct) -> Result<TokenStream, syn::Error> {
     let atom_name = attr_args;
@@ -184,10 +184,9 @@ fn expand_standard(
 ) -> Result<TokenStream, syn::Error> {
     // Validate each field. Already verified by the all_match check above,
     // but re-validate here for precise error messages on name mismatches.
-    let mut lens_fields = Vec::new();
     registry::with(|reg| {
         let atom_name_str = atom_name.to_string();
-        for (i, field) in fields.iter().enumerate() {
+        for field in fields.iter() {
             let field_name = field.ident.as_ref().unwrap();
             let atom_field = atom.fields.iter().find(|af| field_name == af.name.as_str());
             if atom_field.is_none() {
@@ -203,13 +202,6 @@ fn expand_standard(
                     ),
                 ));
             }
-            let _ = i; // force_ref already validated the type match
-            lens_fields.push(LensField {
-                name: field_name.to_string(),
-                ty_tokens: None,
-                is_ref: false,
-                referent_tokens: None,
-            });
         }
 
         if reg.lens_name_exists(&lens_name.to_string()) {
@@ -265,7 +257,6 @@ fn expand_standard(
         reg.lenses.push(LensRegistration {
             name: lens_name.to_string(),
             atom_name: atom_name.to_string(),
-            fields: lens_fields,
             is_identity: false,
             is_proj: false,
             from_impl_tokens: Some(from_impl.to_string()),
@@ -294,30 +285,9 @@ fn expand_proj(
             ));
         }
 
-        let mut lens_fields = Vec::new();
-        for field in fields {
-            let field_name = field.ident.as_ref().unwrap();
-            let field_ty = &field.ty;
-            let ty_tokens = registry::type_to_tokens(field_ty);
-
-            let (is_ref, referent_tokens) = if let syn::Type::Reference(r) = field_ty {
-                (true, Some(registry::type_to_tokens(&r.elem)))
-            } else {
-                (false, None)
-            };
-
-            lens_fields.push(LensField {
-                name: field_name.to_string(),
-                ty_tokens: Some(ty_tokens),
-                is_ref,
-                referent_tokens,
-            });
-        }
-
         reg.lenses.push(LensRegistration {
             name: lens_name.to_string(),
             atom_name: atom_name.to_string(),
-            fields: lens_fields,
             is_identity: false,
             is_proj: true,
             from_impl_tokens: None,
@@ -431,7 +401,6 @@ fn generate_proj_lens_types(
     quote! {
         // Owned snapshot for cache storage.
         #[doc(hidden)]
-        #[derive(Default)]
         pub struct #snapshot_ident {
             #(#snap_fields,)*
         }

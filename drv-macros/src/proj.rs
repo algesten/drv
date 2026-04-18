@@ -64,7 +64,6 @@ pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
         // Register that the projection impl exists.
         reg.proj_impls.push(ProjRegistration {
             lens_name: lens_name_str,
-            atom_name: atom_name_str,
         });
 
         Ok(())

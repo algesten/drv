@@ -464,7 +464,28 @@
 //!
 //! # Choosing field types
 //!
-//! Atom fields must implement `PartialEq + Clone + Debug + Default + Send`.
+//! `#[drv::atom]` alone imposes **no trait bounds** on the struct or its
+//! fields — it just registers the type for lens/memo machinery. Bounds
+//! accrue only through the lenses that actually project a field:
+//!
+//! - **Any field reached by a lens** (explicit or identity) must implement
+//!   `PartialEq + Clone + Debug`. `PartialEq` drives the freshness check;
+//!   `Clone` is used to snapshot the field for the next comparison; `Debug`
+//!   comes from the lens struct's `#[derive]`.
+//! - **Fields whose snapshot is stored in cache state** (i.e. reached by a
+//!   memo via any lens) must additionally satisfy `Send + 'static`, because
+//!   the snapshot lives in [`Atomized::State`][atomized].
+//! - **Fields that never appear in a lens and whose atom has no memo taking
+//!   `&Atom<T>`** carry no bounds at all.
+//!
+//! The identity lens (reached when a memo takes `&Atom<T>` directly) is
+//! emitted only when some memo consumes it, so atoms without identity-lens
+//! consumers don't pay for bounds on unrelated fields.
+//!
+//! If you want to [`Clone`], [`PartialEq`]-compare, [`Debug`]-print, or
+//! [`Default`]-construct your atom itself (via `Atom<T>`), derive those traits
+//! on your struct as usual — drv's forwarding impls simply require the same
+//! bound on `T`.
 //!
 //! ## What runs when
 //!
@@ -980,10 +1001,13 @@ mod fasteq_imbl {
 /// Atomize a struct to be used in [`Atom<T>`].
 ///
 /// Registers the struct for memo/lens machinery; the struct body is emitted
-/// verbatim, and any `#[derive(...)]` you add stays on it. Field types must
-/// implement `PartialEq + Clone + Debug + Default + Send`. Fields can be any
-/// visibility (Rust's normal privacy rules apply for cross-module lens
-/// projection). Annotate fields with [`#[drv::lens(Name)]`](https://docs.rs/drv/latest/drv/attr.lens.html) to
+/// verbatim, and any `#[derive(...)]` you add stays on it. The attribute alone
+/// imposes no trait bounds on the struct or its fields — bounds are introduced
+/// by the lenses and memos that actually touch a field. See the crate-level
+/// [Choosing field types](crate#choosing-field-types) section for the details.
+/// Fields can be any visibility (Rust's normal privacy rules apply for
+/// cross-module lens projection). Annotate fields with
+/// [`#[drv::lens(Name)]`](https://docs.rs/drv/latest/drv/attr.lens.html) to
 /// declare inline lenses.
 ///
 /// # Example
