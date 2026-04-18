@@ -427,16 +427,18 @@ fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
     }
 }
 
-// Lenses for participant grid — only the fields this view needs
+// Lenses for participant grid — only the fields this view needs.
+// Standalone lenses borrow non-Copy fields as `&'a T` (only built-in
+// Copy primitives may be stored by value), so the struct needs a lifetime.
 #[drv::lens(RemoteParticipants)]
-struct GridParticipantsLens {
-    pub participants: imbl::Vector<Participant>,
+struct GridParticipantsLens<'a> {
+    pub participants: &'a imbl::Vector<Participant>,
 }
 
 #[drv::lens(ParticipantSettings)]
-struct GridSettingsLens {
-    pub muted: imbl::HashSet<ParticipantId>,
-    pub pinned: Option<ParticipantId>,
+struct GridSettingsLens<'a> {
+    pub muted: &'a imbl::HashSet<ParticipantId>,
+    pub pinned: &'a Option<ParticipantId>,
 }
 
 #[drv::memo]
