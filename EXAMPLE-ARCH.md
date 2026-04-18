@@ -103,6 +103,7 @@ They should live in **separate atoms**.
 
 ```rust
 // External fact — managed by the device enumeration driver
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct MicInventory {
     pub permission: MicPermission,     // NotAsked, Pending, Granted, Denied
@@ -110,11 +111,17 @@ pub struct MicInventory {
 }
 
 // User decision — managed by UI event handlers
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct MicPreference {
     pub selected: Option<MicId>,
 }
 ```
+
+At runtime each atom is held inside a `drv::Atom<T>` wrapper (via
+`Atom::new(MyAtom { ... })`); the wrapper owns the per-instance memoization
+cache. Drivers and the main loop pass `&mut Atom<T>` around, and field
+access (`atom.field`) goes through `Deref`/`DerefMut` to the inner data.
 
 Why separate? The device driver should not need to know about user
 preferences. The UI handler should not need to know about OS enumeration.
@@ -198,7 +205,7 @@ pub struct MicEnumerationDriver {
 impl MicEnumerationDriver {
     /// Called on the main thread each tick. Drains pending events
     /// into the atom. Cheap — just field assignments.
-    pub fn process(&self, inv: &mut MicInventory) {
+    pub fn process(&self, inv: &mut drv::Atom<MicInventory>) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 MicEvent::PermissionGranted => {
@@ -220,7 +227,7 @@ impl MicEnumerationDriver {
     /// Initiate a permission request. The result arrives via rx.
     /// Must write Pending synchronously — without it, the next tick's
     /// query still sees NotAsked and would request permission again.
-    pub fn request_permission(&self, inv: &mut MicInventory) {
+    pub fn request_permission(&self, inv: &mut drv::Atom<MicInventory>) {
         inv.permission = MicPermission::Pending;
         self.platform.request_permission_async();
     }
@@ -242,7 +249,7 @@ pub struct MicStreamDriver {
 }
 
 impl MicStreamDriver {
-    pub fn execute(&self, action: MicAction, cap: &mut MicCapture) {
+    pub fn execute(&self, action: MicAction, cap: &mut drv::Atom<MicCapture>) {
         match action {
             MicAction::Open(id) => {
                 // 1. Sync: update atom immediately
@@ -558,8 +565,9 @@ Background threads                        UI / Main thread
 
 ### Why atoms stay on the UI thread
 
-- The memoization cache inside each atom uses `RefCell` (not `Mutex`) —
-  fast, no contention, but makes atoms `!Sync` (they are still `Send`).
+- The cache inside each `drv::Atom<T>` wrapper uses `RefCell` (not `Mutex`)
+  — fast, no contention, but makes `Atom<T>` `!Sync` (it is still `Send`
+  whenever `T: Send`).
 - Query/memo computation is cheap (cache hits ~100ns). Hundreds of queries
   per frame is < 1ms.
 - The expensive work (I/O, network, audio processing) is already on
@@ -592,6 +600,7 @@ to unrelated fields (e.g., `last_enumerated` timestamp updating frequently)
 don't cause unnecessary recomputation.
 
 ```rust
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct MicInventory {
     #[drv::lens(MicListLens)]
@@ -603,6 +612,7 @@ pub struct MicInventory {
     pub last_enumerated: Option<Instant>,   // updated frequently, most memos don't care
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct MicPreference {
     #[drv::lens(MicSelectLens)]
@@ -611,6 +621,7 @@ pub struct MicPreference {
     pub last_changed: Option<Instant>,      // for analytics, not for queries
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct MicCapture {
     #[drv::lens(MicCapStateLens)]
@@ -726,17 +737,20 @@ and the diff against `Disconnected` producing `Open(mic1)`.
 ### Atoms
 
 ```rust
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct RemoteParticipants {
     pub participants: imbl::Vector<Participant>,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct ParticipantSettings {
     pub muted: imbl::HashSet<ParticipantId>,
     pub pinned: Option<ParticipantId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct RemoteStreams {
     pub video_tracks: imbl::HashMap<ParticipantId, VideoTrackState>,
@@ -812,10 +826,12 @@ pure functions.
 ### Unit testing a query
 
 ```rust
+use drv::Atom;
+
 #[test]
 fn desired_mic_requires_permission_and_availability() {
-    let mut inv = MicInventory::default();
-    let mut pref = MicPreference::default();
+    let mut inv = Atom::new(MicInventory::default());
+    let mut pref = Atom::new(MicPreference::default());
 
     // No permission → no desired mic
     pref.selected = Some(MicId(1));
@@ -842,11 +858,16 @@ fn desired_mic_requires_permission_and_availability() {
 ### Testing the full action cycle
 
 ```rust
+use drv::Atom;
+
 #[test]
 fn mic_action_produces_correct_diffs() {
-    let mut inv = MicInventory { permission: MicPermission::Granted, ..Default::default() };
-    let mut pref = MicPreference::default();
-    let mut cap = MicCapture::default();
+    let mut inv = Atom::new(MicInventory {
+        permission: MicPermission::Granted,
+        ..Default::default()
+    });
+    let mut pref = Atom::new(MicPreference::default());
+    let mut cap = Atom::new(MicCapture::default());
 
     inv.mics.push_back(mic(1));
     inv.mics.push_back(mic(2));

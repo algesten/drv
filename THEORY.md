@@ -162,30 +162,28 @@ fields against the atom. This is deliberately simple.
 For scalar types (`u32`, `bool`, `String`, small enums), comparison is
 trivial — one or a few machine instructions. No optimization needed.
 
-For collections, comparison cost depends on the collection type:
+For collections, comparison cost depends on the collection type and on how
+`drv` chooses to compare it:
 
-- `Vec<T>`, `HashMap<K,V>`: comparison is O(n). This is correct but
-  potentially expensive for large collections.
+- `Vec<T>`, `HashMap<K,V>`: standard element-wise `PartialEq`, O(n) on a
+  cache hit, O(position of first difference) on a miss.
 
-- `imbl::Vector<T>`, `imbl::HashMap<K,V>`: `PartialEq` iterates elements
-  pairwise (just like `Vec`/`HashMap`) and does *not* short-circuit via
-  pointer equality. Cost is O(n) on a cache hit, O(position of first
-  difference) on a miss. The structural-sharing advantage of `imbl` applies
-  to `Clone` (O(1), refcount bump on the root) and mutation (O(log n)), not
-  to equality.
+- `Arc<T>`: `drv` recognises `Arc<T>` and uses `Arc::ptr_eq` as a fast
+  path before falling back to `PartialEq`. When the snapshot still points
+  at the same allocation as the live field (the common case if nothing
+  has mutated wholesale), comparison is O(1).
 
-  So `imbl`'s advantage for memoization is primarily that snapshot creation
-  on cache miss is cheap. The cache-hit comparison cost is the same order
-  as with `Vec`/`HashMap`.
+- `imbl::Vector<T>`, `imbl::HashMap<K,V>` and friends (with the `imbl`
+  feature): `drv` uses `imbl`'s built-in pointer-equality check on the
+  shared root. After a snapshot is cloned, the snapshot and the live field
+  share their structural-sharing root, so as long as no mutation has
+  reshaped the root, comparison is O(1). On a true mismatch the check
+  falls back to element-wise `==`, which itself short-circuits on the
+  first difference.
 
-  `imbl::Vector` also exposes a separate `ptr_eq` method that checks whether
-  two values share the same root node — explicit pointer equality — but this
-  is not used by `==`. Users who want constant-time cache-hit comparison on
-  large collections would need to wrap the field in a newtype that uses
-  `ptr_eq` inside its `PartialEq`.
-
-The recommendation: use `imbl` collections for any collection field in an
-atom. Scalar fields need no special treatment.
+Recommendation: use `Arc<T>` for single large blobs you replace wholesale,
+and `imbl` collections for fields you mutate incrementally. Scalar fields
+need no special treatment.
 
 Alternative strategies (hash-based comparison, version counters, pointer
 equality) are not used because they each introduce either lossy comparison
@@ -223,17 +221,26 @@ call memo(&a)                      // a: &Atom<MyAtom>
         → return the computed output
 ```
 
-The fast path does no heap allocation at all. The comparison is field-by-field
-`PartialEq`. Collection fields (both `Vec`/`HashMap` and `imbl::Vector`/
-`imbl::HashMap`) compare element-by-element — O(n) worst case on a hit,
-O(position of first difference) on a miss. `imbl`'s structural sharing does
-not accelerate `==`; it accelerates `Clone` (O(1)) and mutation (O(log n)).
+The fast path does no heap allocation. The comparison is field-by-field
+`PartialEq` via `drv`'s `FastEq` helper, which short-circuits on `Arc::ptr_eq`
+for `Arc<T>` and on the equivalent pointer check for `imbl` persistent
+collections (when the `imbl` feature is enabled). Plain `Vec`/`HashMap`
+fall through to standard element-wise comparison.
 
 The user's compute function runs **without holding any borrow on the cache**.
-This is important for reentrancy: a memo body can safely call another memo on
-the same atom without triggering a `RefCell` double-borrow panic. The memo can
-even call itself indirectly (through another memo) — each call scopes its own
-short borrow around the cache check and the cache write.
+The shared borrow taken for the freshness check is dropped before the compute
+body runs (or before the cached output is cloned and returned). On a cache
+miss, a separate `borrow_mut` is taken *after* compute returns, scoped just
+to the store step. The borrow is never held across user code.
+
+This gives a hard re-entrancy guarantee: a memo can re-enter the same
+`Atom<T>`'s cache from anywhere — recursively, through a captured wrapper
+reference in a closure, through user-controlled call paths that loop back
+into another memo — without triggering a `RefCell` double-borrow panic.
+The `Cache` uses `RefCell` (so `Atom<T>` is `Send` whenever `T: Send` but
+`!Sync`) on the assumption that all access is single-threaded, and the
+borrow-scoping rule above means the in-thread re-entry case is safe by
+construction.
 
 The return value is returned by value (`Clone::clone` of the cached output).
 For cheap types (`usize`, `String`, `imbl` collections), this is effectively
@@ -330,11 +337,11 @@ the upstream memo — which is correct because the atom value itself is new.
 `Atom<A>` owns both the atom data and its cache:
 
 ```rust
-pub trait Atom {
+pub trait Atomized {
     type State: Default + Send + 'static;
 }
 
-pub struct Cache<A: Atom> {
+pub struct Cache<A: Atomized> {
     inner: RefCell<A::State>,
 }
 
@@ -344,8 +351,8 @@ pub struct Atom<T: Atomized> {
 }
 ```
 
-`drv::assemble!()` emits a per-atom state struct and implements `Atom` for
-each atom:
+`drv::assemble!()` emits a per-atom state struct and implements `Atomized`
+for each atom:
 
 ```rust
 // Generated by drv::assemble!()
@@ -371,7 +378,7 @@ pub struct __DrvEditorState {
     // ... one pair per memo targeting Editor
 }
 
-impl drv::Atom for Editor {
+impl drv::Atomized for Editor {
     type State = __DrvEditorState;
 }
 ```
