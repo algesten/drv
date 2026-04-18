@@ -1,6 +1,6 @@
 error: field 'user_name' has a non-Copy type — standalone lenses only store Copy primitives by value
        hint: prefix the type with `&` to borrow from the atom, or declare a custom projection via #[drv::proj] (field types differ from atom) to own a clone
-  --> tests/compile_fail/standalone_string_owned.rs:12:20
+  --> tests/compile_fail/standalone_string_owned.rs:13:20
    |
-12 |     pub user_name: String,
+13 |     pub user_name: String,
    |                    ^^^^^^

@@ -1,4 +1,10 @@
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
+//! Procedural macros for the [`drv`](https://docs.rs/drv) crate.
+//!
+//! See the `drv` crate for user-facing documentation. This crate exposes the
+//! proc-macro entry points (`#[drv::atom]`, `#[drv::lens]`, `#[drv::memo]`,
+//! `#[drv::proj]`, `drv::assemble!()`) and should not be used directly.
 
 mod assemble;
 mod atom;
@@ -11,8 +17,12 @@ use proc_macro::TokenStream;
 
 /// Mark a struct as an atom — a ground-truth data source.
 ///
-/// Field types must implement `PartialEq + Clone + Debug + Default + Send`.
-/// Fields can be any visibility — Rust's normal privacy rules apply, so a
+/// `drv::atom` registers the struct for memo/lens machinery but makes no
+/// other changes to it. The struct body is emitted verbatim, and any
+/// `#[derive(...)]` you add stays on it. Atoms flow through memos
+/// wrapped as `drv::Drv<T>`.
+///
+/// Fields can be any visibility; Rust's normal privacy rules apply, so a
 /// private field can only be projected into a lens declared in the same
 /// module. Fields can be annotated with `#[drv::lens(Name)]` to declare
 /// inline lenses.

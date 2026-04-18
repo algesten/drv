@@ -1,5 +1,5 @@
 error: standalone lens declares a lifetime parameter but has no reference fields
-  --> tests/compile_fail/standalone_unused_lifetime.rs:11:15
+  --> tests/compile_fail/standalone_unused_lifetime.rs:12:15
    |
-11 | struct BadLens<'a> {
+12 | struct BadLens<'a> {
    |               ^^^^

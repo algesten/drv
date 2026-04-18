@@ -1,6 +1,7 @@
 // A standalone lens reference field must use the lifetime declared on the struct,
 // not `'static` or any other unrelated lifetime.
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct AppState {
     pub items: Vec<u32>,

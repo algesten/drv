@@ -8,11 +8,15 @@ pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
     // Extract lens name from the Self type (e.g., MyLens<'a>).
     let lens_name = extract_lens_name(&item)?;
 
-    // Extract atom name from the From trait (e.g., From<&'a Bar> → Bar).
+    // Extract atom name from the From trait (e.g., `From<&'a Bar>` → `Bar`).
     let atom_name = extract_atom_name(&item)?;
 
-    // Extract the parameter name from the from() method (e.g., `v` in `fn from(v: &Bar)`).
-    let param_name = extract_from_param_name(&item)?;
+    // Extract the user's parameter name from the from() method.
+    let user_param = extract_from_param_name(&item)?;
+
+    // Extract the lifetime on the reference parameter (used when we rewrite
+    // the signature — we preserve whatever lifetime the user wrote).
+    let lifetime = extract_from_lifetime(&item);
 
     // Validate and register.
     registry::with(|reg| {
@@ -55,8 +59,23 @@ pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
         Ok(())
     })?;
 
-    // Rewrite the From body: inject `__drv: &v.__drv` into struct construction.
-    inject_drv_field(&mut item, &param_name)?;
+    // Rewrite the impl so the user never has to type `Drv<_>`:
+    //
+    // - Change the trait argument from `&'a Atom` to `&'a ::drv::Drv<Atom>`.
+    // - Rename the `from` parameter to an internal name holding the `&Drv`.
+    // - Re-bind the user's original name to a deref'd `&Atom` at the top of
+    //   the body, so field access (`v.inner`) reads the atom directly.
+    // - Inject `__drv: #internal.__drv_cache()` into struct literals.
+    let internal_param = Ident::new("__drv_proj_src", user_param.span());
+    rewrite_trait_arg(&mut item, &atom_name)?;
+    rewrite_from_method(
+        &mut item,
+        &user_param,
+        &internal_param,
+        &atom_name,
+        lifetime.as_ref(),
+    )?;
+    inject_drv_field(&mut item, &internal_param)?;
 
     Ok(quote! { #item })
 }
@@ -86,7 +105,6 @@ fn extract_atom_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
         }
     };
 
-    // The trait path should be `From<&'a AtomName>`.
     let last_seg = trait_path
         .segments
         .last()
@@ -99,11 +117,18 @@ fn extract_atom_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
         ));
     }
 
-    // Extract the generic argument: From<&'a AtomName>.
+    // Extract `From<&'a AtomName>` → `AtomName`.
     if let syn::PathArguments::AngleBracketed(args) = &last_seg.arguments {
         if let Some(syn::GenericArgument::Type(syn::Type::Reference(r))) = args.args.first() {
             if let syn::Type::Path(p) = r.elem.as_ref() {
                 if let Some(seg) = p.path.segments.last() {
+                    if seg.ident == "Drv" {
+                        return Err(syn::Error::new_spanned(
+                            &last_seg.arguments,
+                            "#[drv::proj] expects `From<&Atom>` — the `Drv<_>` \
+                             wrapper is added automatically",
+                        ));
+                    }
                     return Ok(seg.ident.clone());
                 }
             }
@@ -116,7 +141,7 @@ fn extract_atom_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
     ))
 }
 
-/// Extract the parameter name from `fn from(v: &Bar) -> Self`.
+/// Extract the parameter name from `fn from(v: &Atom) -> Self`.
 fn extract_from_param_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
     for impl_item in &item.items {
         if let syn::ImplItem::Fn(method) = impl_item {
@@ -135,7 +160,89 @@ fn extract_from_param_name(item: &ItemImpl) -> Result<Ident, syn::Error> {
     ))
 }
 
-/// Walk the from() body and inject `__drv: &param.__drv` into struct literals.
+/// Extract the lifetime written on the `from` parameter reference, if any.
+fn extract_from_lifetime(item: &ItemImpl) -> Option<syn::Lifetime> {
+    for impl_item in &item.items {
+        if let syn::ImplItem::Fn(method) = impl_item {
+            if method.sig.ident == "from" {
+                if let Some(syn::FnArg::Typed(pat_ty)) = method.sig.inputs.first() {
+                    if let syn::Type::Reference(r) = pat_ty.ty.as_ref() {
+                        return r.lifetime.clone();
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Rewrite `impl ... From<&'a Atom> ...` to `impl ... From<&'a ::drv::Drv<Atom>> ...`.
+fn rewrite_trait_arg(item: &mut ItemImpl, atom_name: &Ident) -> Result<(), syn::Error> {
+    let trait_path = &mut item
+        .trait_
+        .as_mut()
+        .expect("validated earlier: proj is on a trait impl")
+        .1;
+    let last_seg = trait_path
+        .segments
+        .last_mut()
+        .expect("validated earlier: From<...> has segments");
+    if let syn::PathArguments::AngleBracketed(args) = &mut last_seg.arguments {
+        if let Some(syn::GenericArgument::Type(syn::Type::Reference(r))) = args.args.first_mut() {
+            *r.elem = syn::parse_quote! { ::drv::Drv<#atom_name> };
+            return Ok(());
+        }
+    }
+    Err(syn::Error::new_spanned(
+        trait_path,
+        "#[drv::proj] expects `From<&Atom>`",
+    ))
+}
+
+/// Rewrite the `from` method to take `&'a Drv<Atom>` under a fresh internal
+/// name, and re-bind the user's original parameter name to a deref'd `&Atom`
+/// so their body reads atom fields naturally.
+fn rewrite_from_method(
+    item: &mut ItemImpl,
+    user_param: &Ident,
+    internal_param: &Ident,
+    atom_name: &Ident,
+    lifetime: Option<&syn::Lifetime>,
+) -> Result<(), syn::Error> {
+    for impl_item in &mut item.items {
+        if let syn::ImplItem::Fn(method) = impl_item {
+            if method.sig.ident == "from" {
+                // Rewrite first parameter.
+                if let Some(syn::FnArg::Typed(pat_ty)) = method.sig.inputs.first_mut() {
+                    if let syn::Pat::Ident(pat_ident) = pat_ty.pat.as_mut() {
+                        pat_ident.ident = internal_param.clone();
+                    }
+                    *pat_ty.ty = match lifetime {
+                        Some(lt) => syn::parse_quote! { &#lt ::drv::Drv<#atom_name> },
+                        None => syn::parse_quote! { &::drv::Drv<#atom_name> },
+                    };
+                }
+                // Insert `let #user_param: &'a Atom = &**#internal_param;` at the top.
+                let binding: syn::Stmt = match lifetime {
+                    Some(lt) => syn::parse_quote! {
+                        let #user_param: &#lt #atom_name = &**#internal_param;
+                    },
+                    None => syn::parse_quote! {
+                        let #user_param: &#atom_name = &**#internal_param;
+                    },
+                };
+                method.block.stmts.insert(0, binding);
+                return Ok(());
+            }
+        }
+    }
+    Err(syn::Error::new_spanned(
+        &*item,
+        "#[drv::proj] could not find `fn from` in impl",
+    ))
+}
+
+/// Walk the from() body and inject `__drv: #param.__drv_cache()` into struct literals.
 fn inject_drv_field(item: &mut ItemImpl, param_name: &Ident) -> Result<(), syn::Error> {
     for impl_item in &mut item.items {
         if let syn::ImplItem::Fn(method) = impl_item {
@@ -195,10 +302,11 @@ fn inject_drv_in_expr(expr: &mut Expr, param_name: &Ident) {
 }
 
 fn inject_drv_in_struct_expr(s: &mut ExprStruct, param_name: &Ident) {
-    // Only inject into struct literals that look like Self { ... } or LensName { ... }.
-    // We inject `__drv: &param.__drv` as the first field.
+    // Only inject into struct literals that look like `Self { ... }` or
+    // `LensName { ... }`. We inject `__drv: #param.__drv_cache()` as the
+    // first field.
     let drv_field: syn::FieldValue = syn::parse_quote! {
-        __drv: &#param_name.__drv
+        __drv: #param_name.__drv_cache()
     };
     s.fields.insert(0, drv_field);
 }

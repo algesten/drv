@@ -1,6 +1,6 @@
 # drv
 
-Memoized derivations over plain Rust structs.
+Derived, memoized values over plain Rust structs.
 
 `drv` lets you declare a struct of ground-truth data (an **atom**), project
 subsets of its fields (a **lens**), and compute derived values (a **memo**)
@@ -9,8 +9,10 @@ that are automatically cached. When nothing changed, nothing recomputes.
 ## Quick example
 
 ```rust
+use drv::Drv;
+
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
-// Clone, PartialEq, Debug, Default are auto-generated on atoms.
 pub struct Scoreboard {
     #[drv::lens(TotalLens)]
     pub hits: Vec<u32>,
@@ -27,12 +29,10 @@ fn total_score(lens: &TotalLens) -> u32 {
 
 drv::assemble!();
 
-let mut game = Scoreboard {
+let mut game = Drv::new(Scoreboard {
     hits: vec![100, 250, 50],
-
-    // Atoms have a hidden __drv field for caching lenses
     ..Default::default()
-};
+});
 
 let score = total_score(&game);     // computes: 400
 game.player_x = 42;                  // irrelevant to the lens
@@ -43,10 +43,11 @@ Moving the player? Free. `total_score` only recomputes when `hits` change.
 
 ## The three pieces
 
-**Atom** — a struct of ground-truth data. Declared with `#[drv::atom]`.
-Field types must implement `PartialEq + Clone + Debug + Default + Send`.
-Fields can be any visibility — standard Rust rules apply, so a private
-field can only be projected into a lens in the same module.
+**Atom** — a plain struct of ground-truth data, tagged with `#[drv::atom]`.
+You derive whatever you need (`Clone`, `PartialEq`, `Debug`, `Default`,
+`serde`, …) with normal `#[derive(...)]`; drv does not inject fields or
+impls. The struct is wrapped in `Drv<T>` at construction so each instance
+carries its own memoization cache alongside the data.
 
 **Lens** — a projection: a subset of an atom's fields, by name and type.
 It declares "this computation depends on exactly these fields and no others."
@@ -75,6 +76,7 @@ a lens called `Name` with those fields. This keeps the full dependency picture
 in one place:
 
 ```rust
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct AppState {
     #[drv::lens(TotalLens, StatusLens)]
@@ -126,12 +128,15 @@ the lens struct with `#[drv::lens(Atom)]` and annotate the `From` impl with
 `#[drv::proj]`:
 
 ```rust
+use drv::Drv;
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Inner {
     pub x: u32,
     pub label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct Container {
     pub inner: Inner,
@@ -146,7 +151,8 @@ struct ProjectedLens<'a> {
     pub name: &'a str,     // borrow &str from a String field
 }
 
-// The projection function. drv::proj injects the cache reference.
+// The projection function. drv::proj wires the cache handle and rewrites
+// the signature to take a `&Drv<Container>` under the hood.
 #[drv::proj]
 impl<'a> From<&'a Container> for ProjectedLens<'a> {
     fn from(v: &'a Container) -> Self {
@@ -162,19 +168,19 @@ fn display(lens: &ProjectedLens) -> String {
     format!("{}={}", lens.name, lens.x)
 }
 
-let c = Container {
+let c = Drv::new(Container {
     inner: Inner { x: 42, label: "ignored".into() },
     name: "hello".into(),
     ..Default::default()
-};
+});
 assert_eq!(display(&c), "hello=42");
 ```
 
-The macro switches to this mode automatically when the lens struct's fields don't
-match the atom. It keeps your struct definition (adding only a hidden `__drv`
-field), generates the snapshot and comparison logic, and rewrites your `From` impl
-to inject the cache reference. Lenses with a `#[drv::proj]` impl require a lifetime
-parameter on the struct (for the cache reference).
+The macro switches to this mode automatically when the lens struct's fields
+don't match the atom. Your struct definition stays exactly as written; the
+`#[drv::proj]` attribute only rewrites the `From` body to wire the cache
+reference. Lenses with a `#[drv::proj]` impl require a lifetime parameter
+on the struct (for the cache reference).
 
 They work identically with memos — cache hits, misses, multi-lens parameters,
 and value parameters all behave the same as standard lenses.
@@ -183,9 +189,12 @@ and value parameters all behave the same as standard lenses.
 
 `#[drv::memo]` generates a free function with the same name. The function
 body reads from the lens; the generated wrapper handles memoization. You
-call it with `&atom` — the macro auto-converts into the right lens:
+call it with `&Drv<Atom>` — the macro auto-converts into the right lens:
 
 ```rust
+use drv::Drv;
+
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct AppState {
     #[drv::lens(CountLens)]
@@ -198,12 +207,12 @@ fn item_count(lens: &CountLens) -> usize {
     lens.items.len()
 }
 
-let mut app = AppState {
+let app = Drv::new(AppState {
     items: vec![10, 20, 30],
     ..Default::default()
-};
+});
 
-let n = item_count(&app);   // pass &AppState directly — converts to CountLens
+let n = item_count(&app);   // pass &Drv<AppState>; projects to CountLens
 assert_eq!(n, 3);
 ```
 
@@ -212,9 +221,13 @@ Memoization happens behind the scenes — no cache struct, no setup.
 ## Using an atom directly
 
 A memo can take the atom itself as input — treated as an "identity lens" over
-all data fields:
+all data fields. Write the parameter as `&Atom`; callers pass `&Drv<Atom>`
+and the generated wrapper derefs before invoking the body:
 
 ```rust
+use drv::Drv;
+
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct Stats {
     pub total: u32,
@@ -236,12 +249,16 @@ A memo can take lenses from multiple atoms. The cache lives in the first
 parameter's atom:
 
 ```rust
+use drv::Drv;
+
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct Game {
     #[drv::lens(HitsLens)]
     pub hits: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct Settings {
     #[drv::lens(MultiplierLens)]
@@ -257,7 +274,7 @@ let score = weighted_score(&game, &settings);   // cache stored in `game`
 ```
 
 If any of the lens field comparisons fail, the memo recomputes. Two lenses from
-the same atom (`fn foo(a: &LensA, b: &LensB)` called as `foo(&app, &app)`)
+the same atom (`fn foo(a: &LensA, b: &LensB)` called as `foo(&drv, &drv)`)
 works too.
 
 ## Value parameters
@@ -275,7 +292,7 @@ fn labeled(lens: &CountLens, label: &str, multiplier: u32) -> String {
 
 Parameter classification:
 
-- `&Lens` or `&Atom` — a lens parameter (required: at least one lens).
+- `&Lens` or `&Drv<Atom>` — a lens parameter (required: at least one lens).
 - Owned types (`u32`, `String`, `MyStruct`) — stored via `Clone`.
 - Borrowed types with `ToOwned` (`&str`, `&[u8]`, `&Path`, ...) — stored
   as `<T as ToOwned>::Owned` (so `&str` stores as `String`).
@@ -287,12 +304,14 @@ always stored on the first lens parameter's atom.
 
 ## Chaining
 
-A memo's output can feed into another memo. Mark the output type as an atom too.
-When constructing it inside the memo body, close with `..Default::default()` so
-`drv` can set up its internal state:
+A memo's output can feed into another memo. Mark the output type as an atom too,
+and return it wrapped in `Drv<...>` so downstream memos can project from it:
 
 ```rust
+use drv::Drv;
+
 // Root atom
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct Game {
     pub hits: Vec<u32>,
@@ -306,16 +325,16 @@ struct HitsLens<'a> {
 }
 
 #[drv::memo]
-fn stats(lens: &HitsLens) -> Stats {
-    Stats {
+fn stats(lens: &HitsLens) -> Drv<Stats> {
+    Drv::new(Stats {
         total: lens.hits.iter().sum(),
         count: lens.hits.len() as u32,
         best: lens.hits.iter().copied().max().unwrap_or(0),
-        ..Default::default()   // lets drv initialize its internal state
-    }
+    })
 }
 
 // Stats is an atom, so more lenses can project from it.
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct Stats {
     #[drv::lens(AverageLens)]
@@ -476,6 +495,7 @@ when the collection was rebuilt from scratch but happens to compare equal.
 ```rust
 use imbl::{Vector, HashMap};
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct AppState {
     pub active_tab: Option<String>,       // scalar — trivial

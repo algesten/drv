@@ -1,6 +1,7 @@
 // A standalone lens with a reference field must declare a lifetime on the
 // struct — removing the `#[drv::lens]` attribute must leave valid Rust.
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct AppState {
     pub items: Vec<u32>,

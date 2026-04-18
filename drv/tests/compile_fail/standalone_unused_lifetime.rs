@@ -1,6 +1,7 @@
 // A standalone lens with only Copy-primitive fields must not declare a lifetime
 // (it would be unused).
 
+#[derive(Debug, Clone, PartialEq, Default)]
 #[drv::atom]
 pub struct AppState {
     pub count: u32,

@@ -1,5 +1,5 @@
 use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote};
+use quote::{format_ident, quote, ToTokens};
 use syn::Ident;
 
 use crate::registry::{self, MemoParam};
@@ -189,7 +189,7 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
                 } => {
                     if *is_identity {
                         let atom_ident = Ident::new(atom_name, Span::call_site());
-                        quote! { #pname: &#atom_ident }
+                        quote! { #pname: &::drv::Drv<#atom_ident> }
                     } else {
                         let lens_ident = Ident::new(lens_name, Span::call_site());
                         let lt = syn::Lifetime::new(&format!("'drv{}", i), Span::call_site());
@@ -249,7 +249,7 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
     let first_lens_name = Ident::new(&first_lens.param_name, Span::call_site());
     let cache_expr = match &first_lens.kind {
         MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-            quote! { &#first_lens_name.__drv }
+            quote! { #first_lens_name.__drv_cache() }
         }
         _ => quote! { #first_lens_name.__drv },
     };
@@ -263,8 +263,9 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
             let field = Ident::new(&p.param_name, Span::call_site());
             match &p.kind {
                 MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-                    // identity atom compared with identity snapshot: *atom == prev.field
-                    quote! { *#pname == __prev.#field }
+                    // #pname: &Drv<Atom>; double-deref to reach the Atom value
+                    // so the existing `PartialEq<__Drv{Atom}Identity> for Atom` impl fires.
+                    quote! { **#pname == __prev.#field }
                 }
                 MemoParamKind::Lens { .. } => {
                     // lens compared with lens snapshot: lens == prev.field
@@ -336,7 +337,8 @@ fn generate_memo_fn(memo: &MemoInfo) -> TokenStream {
             let pname = Ident::new(&p.param_name, Span::call_site());
             match &p.kind {
                 MemoParamKind::Lens { is_identity, .. } if *is_identity => {
-                    quote! { #pname }
+                    // #pname: &Drv<Atom>; user __compute takes &Atom, so deref.
+                    quote! { &**#pname }
                 }
                 MemoParamKind::Lens { .. } => {
                     quote! { &#pname }
@@ -506,6 +508,3 @@ enum MemoParamKind {
         referent_tokens: String,
     },
 }
-
-// Required so we can use ToTokens on the Ident inline.
-use quote::ToTokens;

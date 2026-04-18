@@ -7,8 +7,12 @@ use crate::registry::{self, AtomField, AtomRegistration, LensField, LensRegistra
 pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::Error> {
     let struct_name = &item.ident;
 
-    // Parse attribute args: #[drv::atom(derive(Hash, Eq, ...))]
-    let derive_traits = parse_atom_attr(attr)?;
+    if !attr.is_empty() {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "drv::atom takes no arguments -- put derives in #[derive(...)] on the struct directly",
+        ));
+    }
 
     let fields = match &item.fields {
         Fields::Named(f) => &f.named,
@@ -19,17 +23,6 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
             ));
         }
     };
-
-    // Reject #[derive(...)] on the struct.
-    for attr in &item.attrs {
-        if attr.path().is_ident("derive") {
-            return Err(syn::Error::new_spanned(
-                attr,
-                "use #[drv::atom(derive(Hash, Eq, ...))] for extra derives on atoms\n\
-                 hint: Clone, PartialEq, Debug, Default are always generated",
-            ));
-        }
-    }
 
     // Collect atom fields and inline lens annotations.
     let mut inline_lenses: std::collections::HashMap<String, Vec<(Ident, syn::Type)>> =
@@ -128,93 +121,13 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
 
     let data_field_idents: Vec<&Ident> = fields.iter().map(|f| f.ident.as_ref().unwrap()).collect();
     let data_field_types: Vec<&syn::Type> = fields.iter().map(|f| &f.ty).collect();
-    let data_field_strs: Vec<String> = data_field_idents.iter().map(|i| i.to_string()).collect();
 
     let mut output = quote! {
         #(#other_attrs)*
         #vis struct #struct_name #generics {
             #(#clean_fields,)*
-            #[doc(hidden)]
-            pub __drv: ::drv::Cache<Self>,
         }
     };
-
-    // Always generate Clone, PartialEq, Debug, Default.
-    {
-        let f1 = data_field_idents.iter();
-        let f2 = data_field_idents.iter();
-        output.extend(quote! {
-            impl Clone for #struct_name {
-                fn clone(&self) -> Self {
-                    Self {
-                        #(#f1: self.#f2.clone(),)*
-                        __drv: ::drv::Cache::new(),
-                    }
-                }
-            }
-        });
-    }
-    {
-        let f1 = data_field_idents.iter();
-        let f2 = data_field_idents.iter();
-        output.extend(quote! {
-            impl PartialEq for #struct_name {
-                fn eq(&self, other: &Self) -> bool {
-                    use ::drv::FastEqFallback as _;
-                    #(::drv::FastEq(&self.#f1).fast_eq(&other.#f2))&&*
-                }
-            }
-        });
-    }
-    {
-        let strs = data_field_strs.iter();
-        let ids = data_field_idents.iter();
-        let name_str = struct_name.to_string();
-        output.extend(quote! {
-            impl ::core::fmt::Debug for #struct_name {
-                fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-                    f.debug_struct(#name_str)
-                        #(.field(#strs, &self.#ids))*
-                        .finish()
-                }
-            }
-        });
-    }
-    {
-        let f = data_field_idents.iter();
-        output.extend(quote! {
-            impl Default for #struct_name {
-                fn default() -> Self {
-                    Self {
-                        #(#f: Default::default(),)*
-                        __drv: Default::default(),
-                    }
-                }
-            }
-        });
-    }
-
-    // Opt-in derives.
-    for trait_path in &derive_traits {
-        if trait_path.is_ident("Clone")
-            || trait_path.is_ident("PartialEq")
-            || trait_path.is_ident("Debug")
-            || trait_path.is_ident("Default")
-        {
-            // Already generated.
-        } else if trait_path.is_ident("Eq") {
-            output.extend(quote! { impl Eq for #struct_name {} });
-        } else if trait_path.is_ident("Hash") {
-            let f = data_field_idents.iter();
-            output.extend(quote! {
-                impl ::core::hash::Hash for #struct_name {
-                    fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
-                        #(self.#f.hash(state);)*
-                    }
-                }
-            });
-        }
-    }
 
     // Generate inline lens structs (borrow view + owned snapshot + PartialEq + From).
     for (lens_name_str, lens_fields) in &inline_lenses {
@@ -341,7 +254,9 @@ pub(crate) fn generate_lens_types_with(
             eq_checks.push(quote! {
                 (::drv::FastEq(&self.#name).fast_eq(&other.#name))
             });
-            from_fields.push(quote! { #name: source.#name });
+            // Explicit deref: `source: &'drv Drv<Atom>` → `(*source): Atom`
+            // so the field access borrows for the full `'drv` lifetime.
+            from_fields.push(quote! { #name: (*source).#name });
             snap_stores.push(quote! { #name: self.#name.clone() });
         } else {
             // Reference field — borrow from atom, zero-copy.
@@ -350,7 +265,7 @@ pub(crate) fn generate_lens_types_with(
             eq_checks.push(quote! {
                 (::drv::FastEq(self.#name).fast_eq(&other.#name))
             });
-            from_fields.push(quote! { #name: &source.#name });
+            from_fields.push(quote! { #name: &(*source).#name });
             snap_stores.push(quote! { #name: (*self.#name).clone() });
         }
     }
@@ -379,11 +294,11 @@ pub(crate) fn generate_lens_types_with(
             }
         }
 
-        // From<&Atom> for the lens — copy primitives, borrow the rest.
-        impl<'drv> ::core::convert::From<&'drv #atom_ident> for #lens_ident<'drv> {
-            fn from(source: &'drv #atom_ident) -> Self {
+        // From<&Drv<Atom>> for the lens — copy primitives, borrow the rest.
+        impl<'drv> ::core::convert::From<&'drv ::drv::Drv<#atom_ident>> for #lens_ident<'drv> {
+            fn from(source: &'drv ::drv::Drv<#atom_ident>) -> Self {
                 #lens_ident {
-                    __drv: &source.__drv,
+                    __drv: source.__drv_cache(),
                     #(#from_fields,)*
                 }
             }
@@ -426,42 +341,6 @@ pub(crate) fn is_copy_primitive(ty: &syn::Type) -> bool {
         }
     }
     false
-}
-
-fn parse_atom_attr(attr: TokenStream) -> Result<Vec<syn::Path>, syn::Error> {
-    if attr.is_empty() {
-        return Ok(Vec::new());
-    }
-    let parsed: AtomAttrArgs = syn::parse2(attr)?;
-    Ok(parsed.derives)
-}
-
-struct AtomAttrArgs {
-    derives: Vec<syn::Path>,
-}
-
-impl syn::parse::Parse for AtomAttrArgs {
-    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let mut derives = Vec::new();
-        while !input.is_empty() {
-            let ident: Ident = input.parse()?;
-            if ident == "derive" {
-                let content;
-                syn::parenthesized!(content in input);
-                let paths = content.parse_terminated(syn::Path::parse, syn::Token![,])?;
-                derives.extend(paths);
-            } else {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "expected `derive(...)` in #[drv::atom(...)]",
-                ));
-            }
-            if input.peek(syn::Token![,]) {
-                input.parse::<syn::Token![,]>()?;
-            }
-        }
-        Ok(AtomAttrArgs { derives })
-    }
 }
 
 fn parse_lens_attr(attr: &syn::Attribute) -> Result<Vec<Ident>, syn::Error> {
