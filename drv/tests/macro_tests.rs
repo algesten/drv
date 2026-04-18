@@ -427,6 +427,44 @@ fn proj_plus_regular(fl: &ProjLens, bl: &BaseLens) -> String {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 13. PROJ OVERRIDE — a standard lens (fields match the atom) can still
+//     carry a user-written #[drv::proj] impl to customise the projection.
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq, Default)]
+#[drv::atom]
+pub struct OverrideAtom {
+    pub n: u32,
+    pub tag: String,
+}
+
+// Fields structurally match the atom — normally the macro would auto-generate
+// a `From<&Atom<OverrideAtom>>` impl copying `n` and borrowing `tag`. By
+// supplying a `#[drv::proj]` impl below, the auto-generation is suppressed
+// and this custom logic runs instead.
+#[drv::lens(OverrideAtom)]
+struct OverrideLens<'a> {
+    pub n: u32,
+    pub tag: &'a String,
+}
+
+#[drv::proj]
+impl<'a> From<&'a OverrideAtom> for OverrideLens<'a> {
+    fn from(v: &'a OverrideAtom) -> Self {
+        // Deliberately diverges from the default: double `n`, keep `tag` as-is.
+        Self {
+            n: v.n * 2,
+            tag: &v.tag,
+        }
+    }
+}
+
+#[drv::memo]
+fn override_display(lens: &OverrideLens) -> String {
+    format!("{}:{}", lens.tag, lens.n)
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // ASSEMBLE — must come after all declarations
 // ══════════════════════════════════════════════════════════════════════
 
@@ -1007,6 +1045,17 @@ fn proj_lens_send() {
 // ══════════════════════════════════════════════════════════════════════
 // Copy-by-value + explicit &T in standalone lens
 // ══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn proj_overrides_standard_lens() {
+    // Standard lens fields match the atom, but the #[drv::proj] impl
+    // doubles `n` — verify the custom logic runs rather than the default.
+    let a = Atom::new(OverrideAtom {
+        n: 7,
+        tag: "hi".into(),
+    });
+    assert_eq!(override_display(&a), "hi:14");
+}
 
 #[test]
 fn copy_by_value_in_lens() {

@@ -23,22 +23,22 @@ pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
         let lens_name_str = lens_name.to_string();
         let atom_name_str = atom_name.to_string();
 
-        // Verify the lens expects a user-written projection.
-        let lens = reg.find_lens(&lens_name_str);
-        match lens {
-            Some(l) if l.is_proj && l.atom_name == atom_name_str => {}
-            Some(l) if !l.is_proj => {
+        // Verify the lens exists and targets this atom. A standard lens
+        // (fields structurally match the atom) is allowed to be overridden
+        // with a user-written projection — the auto-generated `From` impl is
+        // suppressed at assemble time when a `#[drv::proj]` exists.
+        match reg.find_lens(&lens_name_str) {
+            Some(l) if l.atom_name == atom_name_str => {}
+            Some(l) => {
                 return Err(syn::Error::new_spanned(
                     &item.self_ty,
                     format!(
-                        "lens '{}' is a standard lens and does not need a \
-                         projection impl -- #[drv::proj] is only for lenses \
-                         whose fields don't match the atom",
-                        lens_name_str
+                        "lens '{}' is declared for atom '{}', not '{}'",
+                        lens_name_str, l.atom_name, atom_name_str
                     ),
                 ));
             }
-            _ => {
+            None => {
                 return Err(syn::Error::new_spanned(
                     &item.self_ty,
                     format!(
@@ -48,6 +48,17 @@ pub fn expand(mut item: ItemImpl) -> Result<TokenStream, syn::Error> {
                     ),
                 ));
             }
+        }
+
+        if reg.proj_exists(&lens_name_str) {
+            return Err(syn::Error::new_spanned(
+                &item.self_ty,
+                format!(
+                    "lens '{}' already has a #[drv::proj] impl -- only one \
+                     projection impl per lens is allowed",
+                    lens_name_str
+                ),
+            ));
         }
 
         // Register that the projection impl exists.

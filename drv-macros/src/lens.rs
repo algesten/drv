@@ -222,14 +222,6 @@ fn expand_standard(
             ));
         }
 
-        reg.lenses.push(LensRegistration {
-            name: lens_name.to_string(),
-            atom_name: atom_name.to_string(),
-            fields: lens_fields,
-            is_identity: false,
-            is_proj: false,
-        });
-
         Ok(())
     })?;
 
@@ -260,7 +252,7 @@ fn expand_standard(
         .collect();
 
     let snapshot_ident = format_ident!("__Drv{}", lens_name);
-    let output = generate_lens_types_with(
+    let (base, from_impl) = generate_lens_types_with(
         lens_name,
         &snapshot_ident,
         atom_name,
@@ -268,7 +260,19 @@ fn expand_standard(
         &field_types,
         force_ref,
     );
-    Ok(output)
+
+    registry::with(|reg| {
+        reg.lenses.push(LensRegistration {
+            name: lens_name.to_string(),
+            atom_name: atom_name.to_string(),
+            fields: lens_fields,
+            is_identity: false,
+            is_proj: false,
+            from_impl_tokens: Some(from_impl.to_string()),
+        });
+    });
+
+    Ok(base)
 }
 
 fn expand_proj(
@@ -316,6 +320,7 @@ fn expand_proj(
             fields: lens_fields,
             is_identity: false,
             is_proj: true,
+            from_impl_tokens: None,
         });
 
         Ok(())

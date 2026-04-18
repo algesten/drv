@@ -24,6 +24,24 @@ pub fn expand() -> Result<TokenStream, syn::Error> {
             }
         }
 
+        // Emit auto-generated `From<&Atom> for Lens` impls for every standard
+        // lens that doesn't have a user-written `#[drv::proj]` impl shadowing
+        // it. Deferred to assemble time so users can override the generated
+        // projection with their own — when a `#[drv::proj]` exists for a
+        // standard lens, the user's impl wins and the auto-generated one is
+        // skipped to avoid a coherence conflict.
+        for lens in &reg.lenses {
+            if let Some(tokens) = &lens.from_impl_tokens {
+                if reg.proj_exists(&lens.name) {
+                    continue;
+                }
+                let parsed: TokenStream = tokens
+                    .parse()
+                    .expect("registered from_impl_tokens should re-parse");
+                output.extend(parsed);
+            }
+        }
+
         // Build per-memo info, group by primary atom (first lens param).
         let memos: Vec<MemoInfo> = reg
             .memos

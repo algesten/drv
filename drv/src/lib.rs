@@ -198,7 +198,9 @@
 //! yourself and annotating it with [`#[drv::proj]`][proj-attr].
 //! This is required when the lens's fields don't match the atom — different
 //! names, nested fields, or different types — since the macro has nothing to
-//! infer from.
+//! infer from. You can also supply a [`#[drv::proj]`][proj-attr] impl for a
+//! lens whose fields *do* match the atom: the macro's default projection is
+//! suppressed and your impl is used instead.
 //!
 //! Your struct definition stays exactly as written; the attribute only rewrites
 //! the `From` body to wire the cache reference. Lenses with a
@@ -1102,6 +1104,11 @@ pub use drv_macros::memo;
 /// atom. You write the `From<&Atom>` conversion explicitly; this attribute
 /// rewrites the signature to take `&Atom<Atom>` under the hood and wires
 /// the cache handle into the resulting lens.
+///
+/// You can also attach [`#[drv::proj]`](https://docs.rs/drv/latest/drv/attr.proj.html) to a lens whose
+/// fields structurally match the atom. The macro would normally
+/// auto-generate the `From` impl for such a lens; supplying a `#[drv::proj]`
+/// impl suppresses the default and uses yours instead.
 ///
 /// # Example
 ///

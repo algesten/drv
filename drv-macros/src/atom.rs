@@ -81,6 +81,18 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
         });
 
         for (lens_name_str, lens_fields) in &inline_lenses {
+            let lens_ident = Ident::new(lens_name_str, struct_name.span());
+            let snapshot_ident = format_ident!("__Drv{}", lens_ident);
+            let field_names: Vec<_> = lens_fields.iter().map(|(n, _)| n.clone()).collect();
+            let field_types: Vec<_> = lens_fields.iter().map(|(_, t)| t.clone()).collect();
+            let (_, from_impl) = generate_lens_types(
+                &lens_ident,
+                &snapshot_ident,
+                struct_name,
+                &field_names,
+                &field_types,
+            );
+
             reg.lenses.push(LensRegistration {
                 name: lens_name_str.clone(),
                 atom_name: struct_name.to_string(),
@@ -95,6 +107,7 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
                     .collect(),
                 is_identity: false,
                 is_proj: false,
+                from_impl_tokens: Some(from_impl.to_string()),
             });
         }
 
@@ -129,20 +142,23 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
         }
     };
 
-    // Generate inline lens structs (borrow view + owned snapshot + PartialEq + From).
+    // Generate inline lens structs (borrow view + owned snapshot + PartialEq +
+    // __drv_snapshot). The `From` impl is registered for `assemble!()` to emit
+    // so user-written `#[drv::proj]` impls can shadow it.
     for (lens_name_str, lens_fields) in &inline_lenses {
         let lens_ident = Ident::new(lens_name_str, struct_name.span());
         let snapshot_ident = format_ident!("__Drv{}", lens_ident);
         let field_names: Vec<_> = lens_fields.iter().map(|(n, _)| n.clone()).collect();
         let field_types: Vec<_> = lens_fields.iter().map(|(_, t)| t.clone()).collect();
 
-        output.extend(generate_lens_types(
+        let (base, _) = generate_lens_types(
             &lens_ident,
             &snapshot_ident,
             struct_name,
             &field_names,
             &field_types,
-        ));
+        );
+        output.extend(base);
 
         // All atom data fields (for From impl)
         let _ = &data_field_idents;
@@ -196,6 +212,7 @@ pub fn expand(attr: TokenStream, item: ItemStruct) -> Result<TokenStream, syn::E
                         .collect(),
                     is_identity: true,
                     is_proj: false,
+                    from_impl_tokens: None,
                 });
             }
         });
@@ -220,7 +237,7 @@ pub(crate) fn generate_lens_types(
     atom_ident: &Ident,
     field_names: &[Ident],
     field_types: &[syn::Type],
-) -> TokenStream {
+) -> (TokenStream, TokenStream) {
     generate_lens_types_with(
         lens_ident,
         snapshot_ident,
@@ -231,6 +248,17 @@ pub(crate) fn generate_lens_types(
     )
 }
 
+/// Returns `(base_tokens, from_impl_tokens)`.
+///
+/// `base_tokens` holds the lens struct, the owned snapshot, the `PartialEq`
+/// impl between them, and the `__drv_snapshot` method — these are emitted
+/// inline from the `#[drv::atom]` / `#[drv::lens]` expansion.
+///
+/// `from_impl_tokens` holds the auto-generated `From<&Atom> for Lens` impl.
+/// It is registered in the lens registration and emitted later by
+/// `drv::assemble!()`, so a user-supplied `#[drv::proj]` impl (which also
+/// implements `From<&Atom> for Lens`) can shadow it without a coherence
+/// conflict.
 pub(crate) fn generate_lens_types_with(
     lens_ident: &Ident,
     snapshot_ident: &Ident,
@@ -238,7 +266,7 @@ pub(crate) fn generate_lens_types_with(
     field_names: &[Ident],
     field_types: &[syn::Type],
     force_ref: &[bool],
-) -> TokenStream {
+) -> (TokenStream, TokenStream) {
     let mut struct_fields = Vec::new();
     let mut snap_fields = Vec::new();
     let mut eq_checks = Vec::new();
@@ -270,7 +298,7 @@ pub(crate) fn generate_lens_types_with(
         }
     }
 
-    quote! {
+    let base = quote! {
         // User-facing lens — Copy-type fields by value, others by reference.
         #[derive(Copy, Clone, Debug)]
         pub struct #lens_ident<'drv> {
@@ -294,16 +322,6 @@ pub(crate) fn generate_lens_types_with(
             }
         }
 
-        // From<&Atom<Atom>> for the lens — copy primitives, borrow the rest.
-        impl<'drv> ::core::convert::From<&'drv ::drv::Atom<#atom_ident>> for #lens_ident<'drv> {
-            fn from(source: &'drv ::drv::Atom<#atom_ident>) -> Self {
-                #lens_ident {
-                    __drv: source.__drv_cache(),
-                    #(#from_fields,)*
-                }
-            }
-        }
-
         // Snapshot the lens to an owned value for cache storage (cache miss only).
         impl<'drv> #lens_ident<'drv> {
             #[doc(hidden)]
@@ -313,7 +331,22 @@ pub(crate) fn generate_lens_types_with(
                 }
             }
         }
-    }
+    };
+
+    // From<&Atom<Atom>> for the lens — copy primitives, borrow the rest.
+    // Emitted from assemble!() unless a user #[drv::proj] shadows it.
+    let from_impl = quote! {
+        impl<'drv> ::core::convert::From<&'drv ::drv::Atom<#atom_ident>> for #lens_ident<'drv> {
+            fn from(source: &'drv ::drv::Atom<#atom_ident>) -> Self {
+                #lens_ident {
+                    __drv: source.__drv_cache(),
+                    #(#from_fields,)*
+                }
+            }
+        }
+    };
+
+    (base, from_impl)
 }
 
 /// Returns true if the type is a known Copy primitive.

@@ -38,9 +38,16 @@ pub struct LensRegistration {
     pub fields: Vec<LensField>,
     /// True if this is an "identity lens" — the lens IS the atom (all fields).
     pub is_identity: bool,
-    /// True if this lens uses a user-written `#[drv::proj]` projection impl
-    /// instead of a macro-generated one.
+    /// True if this lens *requires* a user-written `#[drv::proj]` projection
+    /// impl because the macro cannot infer one (field names/types don't match
+    /// the atom). Standard lenses have `is_proj: false` — the macro can
+    /// auto-generate a `From` impl, but the user may still override it by
+    /// writing their own `#[drv::proj]` impl.
     pub is_proj: bool,
+    /// Auto-generated `From<&Atom> for Lens` token string, emitted from
+    /// `assemble!()` unless a user `#[drv::proj]` impl shadows it. `None` for
+    /// proj-required lenses (`is_proj: true`) and identity lenses.
+    pub from_impl_tokens: Option<String>,
 }
 
 #[derive(Clone)]

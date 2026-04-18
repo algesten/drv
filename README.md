@@ -183,7 +183,9 @@ You can always take control of the projection by writing the `From` impl
 yourself and annotating it with [`#[drv::proj]`][proj-attr].
 This is required when the lens's fields don't match the atom — different
 names, nested fields, or different types — since the macro has nothing to
-infer from.
+infer from. You can also supply a [`#[drv::proj]`][proj-attr] impl for a
+lens whose fields *do* match the atom: the macro's default projection is
+suppressed and your impl is used instead.
 
 Your struct definition stays exactly as written; the attribute only rewrites
 the `From` body to wire the cache reference. Lenses with a
