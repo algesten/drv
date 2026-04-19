@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/algesten/drv"
 homepage = "https://github.com/algesten/drv"
 description = "Proc macros for drv"
-keywords = ["memoization", "incremental", "derive", "lens", "macro"]
+keywords = ["memoization", "incremental", "derive", "cache", "macro"]
 categories = ["caching", "data-structures", "rust-patterns"]
 
 [lib]

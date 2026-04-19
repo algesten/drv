@@ -1,13 +1,10 @@
 use proc_macro2::TokenStream;
-use quote::quote;
-use syn::{FnArg, Ident, ItemFn, Pat, ReturnType, Type};
-
-use crate::registry::{self, CacheStrategy, MemoParam, MemoRegistration};
+use quote::{format_ident, quote};
+use syn::{FnArg, GenericArgument, Ident, ItemFn, Pat, PathArguments, ReturnType, Type};
 
 pub fn expand(attr: TokenStream, item: ItemFn) -> Result<TokenStream, syn::Error> {
     let fn_name = &item.sig.ident;
-
-    let cache_strategy = parse_cache_strategy(&attr, fn_name)?;
+    let cache_size = parse_cache_strategy(&attr, fn_name)?;
 
     if item.sig.inputs.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -17,13 +14,6 @@ pub fn expand(attr: TokenStream, item: ItemFn) -> Result<TokenStream, syn::Error
                 fn_name,
             ),
         ));
-    }
-
-    // First-pass classification. `&Ident` is tentatively Lens; `&NonIdent`
-    // (e.g. &[u8], &dyn Trait) is ValueRef; non-references are Value.
-    let mut parsed: Vec<ParsedParam> = Vec::new();
-    for param in &item.sig.inputs {
-        parsed.push(classify_param(param, fn_name)?);
     }
 
     let output_ty = match &item.sig.output {
@@ -39,136 +29,265 @@ pub fn expand(attr: TokenStream, item: ItemFn) -> Result<TokenStream, syn::Error
         }
     };
 
-    let fn_name_str = fn_name.to_string();
+    let mut params: Vec<ParsedParam> = Vec::new();
+    for p in &item.sig.inputs {
+        params.push(classify_param(p, fn_name)?);
+    }
 
-    registry::with(|reg| {
-        // Promote tentative Lens params to ValueRef if they don't name a
-        // registered lens or atom. This lets users write things like `foo: &str`
-        // — `str` isn't a lens, so it's treated as a ToOwned'able reference.
-        for p in parsed.iter_mut() {
-            if let ParsedParam::Lens {
-                lens_name,
-                param_name,
-                is_impl_into,
-                ..
-            } = p
-            {
-                let lens_name_str = lens_name.to_string();
-                if !reg.lens_name_exists(&lens_name_str) && !reg.atom_name_exists(&lens_name_str) {
-                    if *is_impl_into {
-                        // `impl Into<X>` where X isn't a registered lens or
-                        // atom — can't quietly fall back to ValueRef (the
-                        // syntax is unambiguous). Surface a clear error.
-                        return Err(syn::Error::new_spanned(
-                            &lens_name,
-                            format!(
-                                "#[drv::memo] on '{}': `impl Into<{}<'..>>` names '{}' which is not a registered lens or atom",
-                                fn_name, lens_name, lens_name
-                            ),
-                        ));
-                    }
-                    // Not a lens or an atom — treat as a ToOwned-style reference.
-                    *p = ParsedParam::ValueRef {
-                        param_name: param_name.clone(),
-                        referent: syn::Type::Path(syn::TypePath {
-                            qself: None,
-                            path: lens_name.clone().into(),
-                        }),
-                    };
+    let vis = &item.vis;
+    let body = &item.block;
+
+    let pascal = snake_to_pascal(&fn_name.to_string());
+    let key_ident = format_ident!("__Drv{}Key", pascal);
+    let slot_ident = format_ident!("__Drv{}Slot", pascal);
+    let state_ident = format_ident!("__Drv{}CacheState", pascal);
+    let static_ident = format_ident!("__DRV_{}_CACHE", fn_name.to_string().to_uppercase());
+
+    // Cache-key struct fields — one per param, typed by cache-storage form.
+    let key_fields: Vec<TokenStream> = params
+        .iter()
+        .map(|p| {
+            let name = &p.name;
+            match &p.kind {
+                ParamKind::InputByValue { snapshot_path, .. }
+                | ParamKind::InputByRef { snapshot_path, .. } => {
+                    quote! { pub #name: #snapshot_path }
+                }
+                ParamKind::Value { ty } => quote! { pub #name: #ty },
+                ParamKind::ValueRef { referent } => {
+                    quote! { pub #name: <#referent as ::std::borrow::ToOwned>::Owned }
                 }
             }
-        }
+        })
+        .collect();
 
-        // Require at least one lens (otherwise we have no atom for the cache).
-        if !parsed.iter().any(|p| matches!(p, ParsedParam::Lens { .. })) {
-            return Err(syn::Error::new_spanned(
-                fn_name,
-                format!(
-                    "#[drv::memo] function '{}' must have at least one `&LensName` parameter",
-                    fn_name,
-                ),
-            ));
-        }
-
-        if reg.memos.iter().any(|e| e.fn_name == fn_name_str) {
-            return Err(syn::Error::new_spanned(
-                fn_name,
-                format!(
-                    "memo '{}' is already declared -- memo names must be unique within a crate",
-                    fn_name
-                ),
-            ));
-        }
-
-        let body = &item.block;
-        let body_tokens = quote!(#body).to_string();
-        let vis = &item.vis;
-        let generics = &item.sig.generics;
-
-        reg.memos.push(MemoRegistration {
-            fn_name: fn_name_str,
-            vis_tokens: quote!(#vis).to_string(),
-            generics_tokens: quote!(#generics).to_string(),
-            params: parsed
-                .iter()
-                .map(|p| match p {
-                    ParsedParam::Lens {
-                        param_name,
-                        lens_name,
-                        ty,
-                        is_impl_into,
-                    } => MemoParam::Lens {
-                        param_name: param_name.to_string(),
-                        lens_name: lens_name.to_string(),
-                        ty_tokens: registry::type_to_tokens(ty),
-                        is_impl_into: *is_impl_into,
-                    },
-                    ParsedParam::Value { param_name, ty } => MemoParam::Value {
-                        param_name: param_name.to_string(),
-                        ty_tokens: registry::type_to_tokens(ty),
-                    },
-                    ParsedParam::ValueRef {
-                        param_name,
-                        referent,
-                    } => MemoParam::ValueRef {
-                        param_name: param_name.to_string(),
-                        referent_tokens: registry::type_to_tokens(referent),
-                    },
-                })
-                .collect(),
-            output_ty_tokens: registry::type_to_tokens(&output_ty),
-            body_tokens,
-            cache_strategy,
-        });
-
-        Ok(())
-    })?;
-
-    // Emit compile-time assertions that each ValueRef referent (a) names a
-    // real type, and (b) implements ToOwned. Using the original syn::Type
-    // preserves spans, so errors point at the user's function signature.
-    // This catches common typos like `foo: &MyLen` (meant `&MyLens`) —
-    // instead of a confusing error deep in generated code, the user sees
-    // "cannot find type `MyLen` in this scope" pointed at their param.
-    let assertions: Vec<TokenStream> = parsed
+    // Outer signature — emitted verbatim as the user wrote it. No sugar,
+    // no rewriting, no rescue. Stripping `#[drv::memo]` leaves a valid
+    // Rust function.
+    let outer_params: Vec<TokenStream> = params
         .iter()
-        .filter_map(|p| match p {
-            ParsedParam::ValueRef { referent, .. } => Some(quote! {
-                const _: fn() = || {
-                    fn __drv_assert_to_owned<T: ?Sized + ::std::borrow::ToOwned>() {}
-                    __drv_assert_to_owned::<#referent>();
-                };
-            }),
+        .map(|p| {
+            let name = &p.name;
+            let ty = &p.orig_ty;
+            quote! { #name: #ty }
+        })
+        .collect();
+
+    // Compile-time bounds — every input-classified parameter must satisfy
+    // `drv::DrvInput`. Emitted as a `where` clause so that a missing
+    // `#[drv::input]` surfaces as a single clear diagnostic.
+    let input_where_bounds: Vec<TokenStream> = params
+        .iter()
+        .filter_map(|p| match &p.kind {
+            ParamKind::InputByValue { input_ty, .. } | ParamKind::InputByRef { input_ty, .. } => {
+                Some(quote! { #input_ty: ::drv::DrvInput })
+            }
             _ => None,
         })
         .collect();
 
-    // Swallow the function body (assemble!() emits the rewritten version);
-    // only the compile-time assertions remain at the #[drv::memo] call site.
-    Ok(quote! { #(#assertions)* })
+    // Merge with any existing where-clause predicates on the user's fn so
+    // we don't drop them.
+    let existing_where = item.sig.generics.where_clause.as_ref();
+    let where_clause: TokenStream = match (existing_where, input_where_bounds.is_empty()) {
+        (None, true) => quote! {},
+        (None, false) => quote! { where #(#input_where_bounds),* },
+        (Some(w), true) => quote! { #w },
+        (Some(w), false) => {
+            let preds = &w.predicates;
+            quote! { where #preds, #(#input_where_bounds),* }
+        }
+    };
+
+    // `generics` without the where clause, so we can splice it in manually.
+    let generics_no_where = {
+        let mut g = item.sig.generics.clone();
+        g.where_clause = None;
+        g
+    };
+
+    // Pre-freshness snap bindings — captured before the body runs so
+    // snapshots survive a moving body.
+    //
+    // - `Value`: Clone the param so install can use it after the body.
+    // - `InputByValue`: `__drv_snapshot()` via auto-ref, keeping `x`
+    //   usable in the body (owned).
+    // - `InputByRef` / `ValueRef`: no pre-snap needed — the body holds
+    //   a reference that stays valid through install.
+    let pre_body_snaps: Vec<TokenStream> = params
+        .iter()
+        .filter_map(|p| match &p.kind {
+            ParamKind::Value { .. } => {
+                let name = &p.name;
+                let snap = format_ident!("__drv_snap_{}", name);
+                Some(quote! { let #snap = <_ as ::core::clone::Clone>::clone(&#name); })
+            }
+            ParamKind::InputByValue { .. } => {
+                let name = &p.name;
+                let snap = format_ident!("__drv_snap_{}", name);
+                Some(quote! { let #snap = (&#name).__drv_snapshot(); })
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Freshness check per param — combined later with `&&`.
+    let fresh_checks: Vec<TokenStream> = params
+        .iter()
+        .map(|p| {
+            let name = &p.name;
+            let field = &p.name;
+            match &p.kind {
+                ParamKind::InputByValue { .. } | ParamKind::InputByRef { .. } => {
+                    quote! { (#name.eq(&__drv_key.#field)) }
+                }
+                ParamKind::Value { .. } => quote! {
+                    ({
+                        use ::drv::FastEqFallback as _;
+                        ::drv::FastEq(&#name).fast_eq(&__drv_key.#field)
+                    })
+                },
+                ParamKind::ValueRef { .. } => quote! { (#name == &__drv_key.#field) },
+            }
+        })
+        .collect();
+
+    let fresh_check_expr: TokenStream = {
+        let first = &fresh_checks[0];
+        let rest = &fresh_checks[1..];
+        quote! { #first #( && #rest )* }
+    };
+
+    // Cache-key construction on miss-install.
+    let key_build_fields: Vec<TokenStream> = params
+        .iter()
+        .map(|p| {
+            let name = &p.name;
+            let field = &p.name;
+            match &p.kind {
+                ParamKind::InputByValue { .. } | ParamKind::Value { .. } => {
+                    let snap = format_ident!("__drv_snap_{}", name);
+                    quote! { #field: #snap }
+                }
+                ParamKind::InputByRef { .. } => {
+                    quote! { #field: #name.__drv_snapshot() }
+                }
+                ParamKind::ValueRef { referent } => quote! {
+                    #field: <#referent as ::std::borrow::ToOwned>::to_owned(#name)
+                },
+            }
+        })
+        .collect();
+
+    Ok(quote! {
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        pub struct #key_ident {
+            #(#key_fields,)*
+        }
+
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        pub struct #slot_ident {
+            pub key: #key_ident,
+            pub output: #output_ty,
+            pub stamp: u64,
+        }
+
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        pub struct #state_ident {
+            pub slots: [::core::option::Option<#slot_ident>; #cache_size],
+            pub next_stamp: u64,
+        }
+
+        impl ::core::default::Default for #state_ident {
+            fn default() -> Self {
+                Self {
+                    slots: [const { ::core::option::Option::None }; #cache_size],
+                    next_stamp: 0,
+                }
+            }
+        }
+
+        thread_local! {
+            #[allow(non_upper_case_globals)]
+            static #static_ident: ::core::cell::RefCell<#state_ident> =
+                ::core::cell::RefCell::new(#state_ident::default());
+        }
+
+        #vis fn #fn_name #generics_no_where (#(#outer_params),*) -> #output_ty
+        #where_clause
+        {
+            #(#pre_body_snaps)*
+
+            // ── Try cache hit. Linear scan; bump the hit slot's stamp to
+            // mark it most-recently-used. Borrow released before body runs.
+            let __drv_hit: ::core::option::Option<#output_ty> = #static_ident.with(|__drv_cell| {
+                let mut __drv_state = ::core::cell::RefCell::borrow_mut(__drv_cell);
+                for __drv_idx in 0..__drv_state.slots.len() {
+                    let __drv_match = if let ::core::option::Option::Some(__drv_slot) = __drv_state.slots[__drv_idx].as_ref() {
+                        let __drv_key: &#key_ident = &__drv_slot.key;
+                        #fresh_check_expr
+                    } else {
+                        false
+                    };
+                    if __drv_match {
+                        __drv_state.next_stamp = __drv_state.next_stamp.wrapping_add(1);
+                        let __drv_new_stamp = __drv_state.next_stamp;
+                        if let ::core::option::Option::Some(__drv_slot) = __drv_state.slots[__drv_idx].as_mut() {
+                            __drv_slot.stamp = __drv_new_stamp;
+                        }
+                        let __drv_out = <#output_ty as ::core::clone::Clone>::clone(
+                            &__drv_state.slots[__drv_idx].as_ref().unwrap().output
+                        );
+                        return ::core::option::Option::Some(__drv_out);
+                    }
+                }
+                ::core::option::Option::None
+            });
+            if let ::core::option::Option::Some(__drv_out) = __drv_hit {
+                return __drv_out;
+            }
+
+            // ── Miss: run the user body with no cache borrow held.
+            let __drv_out: #output_ty = { #body };
+
+            // ── Install: empty slot if available, else LRU victim.
+            #static_ident.with(|__drv_cell| {
+                let mut __drv_state = ::core::cell::RefCell::borrow_mut(__drv_cell);
+                __drv_state.next_stamp = __drv_state.next_stamp.wrapping_add(1);
+                let __drv_stamp = __drv_state.next_stamp;
+                let __drv_key = #key_ident {
+                    #(#key_build_fields,)*
+                };
+                let __drv_idx = __drv_state.slots.iter().position(|__s| __s.is_none())
+                    .unwrap_or_else(|| {
+                        let mut __drv_min_idx = 0usize;
+                        let mut __drv_min_stamp = u64::MAX;
+                        for (__drv_i, __drv_s) in __drv_state.slots.iter().enumerate() {
+                            if let ::core::option::Option::Some(__drv_slot) = __drv_s.as_ref() {
+                                if __drv_slot.stamp < __drv_min_stamp {
+                                    __drv_min_stamp = __drv_slot.stamp;
+                                    __drv_min_idx = __drv_i;
+                                }
+                            }
+                        }
+                        __drv_min_idx
+                    });
+                __drv_state.slots[__drv_idx] = ::core::option::Option::Some(#slot_ident {
+                    key: __drv_key,
+                    output: <#output_ty as ::core::clone::Clone>::clone(&__drv_out),
+                    stamp: __drv_stamp,
+                });
+            });
+
+            __drv_out
+        }
+    })
 }
 
-fn parse_cache_strategy(attr: &TokenStream, fn_name: &Ident) -> Result<CacheStrategy, syn::Error> {
+fn parse_cache_strategy(attr: &TokenStream, fn_name: &Ident) -> Result<usize, syn::Error> {
     if attr.is_empty() {
         return Err(syn::Error::new_spanned(
             fn_name,
@@ -190,7 +309,7 @@ fn parse_cache_strategy(attr: &TokenStream, fn_name: &Ident) -> Result<CacheStra
         )
     })?;
     match meta {
-        syn::Meta::Path(path) if path.is_ident("single") => Ok(CacheStrategy::Single),
+        syn::Meta::Path(path) if path.is_ident("single") => Ok(1),
         syn::Meta::NameValue(nv) if nv.path.is_ident("lru") => {
             let lit = match &nv.value {
                 syn::Expr::Lit(expr_lit) => match &expr_lit.lit {
@@ -218,7 +337,7 @@ fn parse_cache_strategy(attr: &TokenStream, fn_name: &Ident) -> Result<CacheStra
                     "#[drv::memo(lru = N)]: N must be at least 1",
                 ));
             }
-            Ok(CacheStrategy::Lru(n))
+            Ok(n)
         }
         other => Err(syn::Error::new_spanned(
             &other,
@@ -227,41 +346,51 @@ fn parse_cache_strategy(attr: &TokenStream, fn_name: &Ident) -> Result<CacheStra
     }
 }
 
-enum ParsedParam {
-    Lens {
-        param_name: Ident,
-        lens_name: Ident,
-        /// The user's original parameter type, emitted verbatim at the
-        /// memo's outer fn signature. Either `&MyLens[<'_>]` (body uses it
-        /// directly) or `impl Into<MyLens<'a>>` (body calls `.into()`).
-        ty: syn::Type,
-        /// `true` if `ty` is `impl Into<Lens<'..>>`, meaning the body must
-        /// convert via `.into()` before using it.
-        is_impl_into: bool,
-    },
-    Value {
-        param_name: Ident,
-        ty: syn::Type,
-    },
-    ValueRef {
-        param_name: Ident,
-        referent: syn::Type,
-    },
+struct ParsedParam {
+    name: Ident,
+    orig_ty: syn::Type,
+    kind: ParamKind,
 }
 
-fn classify_param(param: &FnArg, fn_name: &syn::Ident) -> Result<ParsedParam, syn::Error> {
-    let typed = match param {
+/// Classification of a memo parameter. Purely syntactic — the macro reads
+/// the type you wrote, nothing more. No sugar, no rewriting: stripping
+/// `#[drv::memo]` leaves a valid Rust function whose body sees exactly
+/// the declared types.
+enum ParamKind {
+    /// `x: MyInput<'a>` — by-value input. Body owns `x`; snapshot is
+    /// captured before the body runs so it survives a moving body.
+    InputByValue {
+        input_ty: syn::Type,
+        snapshot_path: syn::Path,
+    },
+    /// `x: &MyInput<'a>` — borrowed input. Body uses the reference;
+    /// snapshot is taken at install time via the ref.
+    InputByRef {
+        input_ty: syn::Type,
+        snapshot_path: syn::Path,
+    },
+    /// `x: T` (no lifetime argument on `T`). Stored via `Clone`,
+    /// compared via `FastEq`.
+    Value { ty: syn::Type },
+    /// `x: &T` (no lifetime argument on `T`). Stored as
+    /// `<T as ToOwned>::Owned`, compared via the `impl PartialEq<&B> for &A`
+    /// blanket.
+    ValueRef { referent: syn::Type },
+}
+
+fn classify_param(arg: &FnArg, fn_name: &Ident) -> Result<ParsedParam, syn::Error> {
+    let typed = match arg {
         FnArg::Typed(t) => t,
         FnArg::Receiver(_) => {
             return Err(syn::Error::new_spanned(
-                param,
+                arg,
                 format!("#[drv::memo] function '{}' cannot take self", fn_name),
             ));
         }
     };
 
-    let param_name = match typed.pat.as_ref() {
-        Pat::Ident(pat_ident) => pat_ident.ident.clone(),
+    let name = match typed.pat.as_ref() {
+        Pat::Ident(pi) => pi.ident.clone(),
         _ => {
             return Err(syn::Error::new_spanned(
                 &typed.pat,
@@ -273,9 +402,19 @@ fn classify_param(param: &FnArg, fn_name: &syn::Ident) -> Result<ParsedParam, sy
         }
     };
 
-    // A shared reference is either a lens (`&MyLens`) or a ToOwned reference
-    // (`&str`, `&[u8]`, etc.). We classify `&Ident` tentatively as Lens; the
-    // caller promotes to ValueRef if the ident isn't a registered lens/atom.
+    let orig_ty = (*typed.ty).clone();
+
+    // `impl Trait` — not supported. Users write concrete types.
+    if matches!(typed.ty.as_ref(), Type::ImplTrait(_)) {
+        return Err(syn::Error::new_spanned(
+            &typed.ty,
+            "#[drv::memo]: `impl Trait` parameters are not supported — use a concrete type \
+             (e.g. `MyInput<'a>`, `&MyInput<'a>`, `T`, or `&T`)",
+        ));
+    }
+
+    // `&T` — split on whether `T`'s path carries a lifetime argument.
+    // `&MyInput<'a>` → InputByRef; plain `&str` / `&MyStruct` → ValueRef.
     if let Type::Reference(r) = typed.ty.as_ref() {
         if r.mutability.is_some() {
             return Err(syn::Error::new_spanned(
@@ -287,69 +426,86 @@ fn classify_param(param: &FnArg, fn_name: &syn::Ident) -> Result<ParsedParam, sy
             ));
         }
         if let Type::Path(p) = r.elem.as_ref() {
-            if let Some(lens_name) = p.path.get_ident() {
-                return Ok(ParsedParam::Lens {
-                    param_name,
-                    lens_name: lens_name.clone(),
-                    ty: (*typed.ty).clone(),
-                    is_impl_into: false,
+            if path_last_has_lifetime(&p.path) {
+                let snapshot_path = snapshot_path_from_input(&p.path)?;
+                return Ok(ParsedParam {
+                    name,
+                    orig_ty,
+                    kind: ParamKind::InputByRef {
+                        input_ty: (*r.elem).clone(),
+                        snapshot_path,
+                    },
                 });
             }
         }
-        // Non-ident referent (e.g., &[u8], &(A, B), &dyn Trait) — ToOwned ref.
-        return Ok(ParsedParam::ValueRef {
-            param_name,
-            referent: (*r.elem).clone(),
+        return Ok(ParsedParam {
+            name,
+            orig_ty,
+            kind: ParamKind::ValueRef {
+                referent: (*r.elem).clone(),
+            },
         });
     }
 
-    // `impl Into<LensName<'...>>` — the user-written equivalent of `&LensName`
-    // with the ergonomic sugar that lets callers pass `&atom` directly. We
-    // accept it verbatim and the body calls `.into()` before use.
-    if let Type::ImplTrait(it) = typed.ty.as_ref() {
-        if let Some(lens_name) = extract_lens_name_from_impl_into(it) {
-            return Ok(ParsedParam::Lens {
-                param_name,
-                lens_name,
-                ty: (*typed.ty).clone(),
-                is_impl_into: true,
+    // By-value path — split on lifetime-arg presence. `MyInput<'a>` →
+    // InputByValue; plain `u32` / `String` / `Vec<u8>` → Value.
+    if let Type::Path(p) = typed.ty.as_ref() {
+        if path_last_has_lifetime(&p.path) {
+            let snapshot_path = snapshot_path_from_input(&p.path)?;
+            return Ok(ParsedParam {
+                name,
+                orig_ty: orig_ty.clone(),
+                kind: ParamKind::InputByValue {
+                    input_ty: orig_ty,
+                    snapshot_path,
+                },
             });
         }
     }
 
-    // Anything else: treat as an owned value parameter.
-    Ok(ParsedParam::Value {
-        param_name,
-        ty: (*typed.ty).clone(),
+    // Everything else by-value → owned value.
+    Ok(ParsedParam {
+        name,
+        orig_ty: orig_ty.clone(),
+        kind: ParamKind::Value { ty: orig_ty },
     })
 }
 
-/// If `it` is `impl Into<LensName[<'..>]>`, return `LensName`. Other bounds
-/// on the `impl Trait` (e.g. `+ Send`) aren't accepted — the sugar form
-/// should be a single `Into<...>` bound.
-fn extract_lens_name_from_impl_into(it: &syn::TypeImplTrait) -> Option<Ident> {
-    if it.bounds.len() != 1 {
-        return None;
+/// `true` if the path's last segment has at least one lifetime generic
+/// argument — the syntactic signal distinguishing "input type" from
+/// "owned value type."
+fn path_last_has_lifetime(path: &syn::Path) -> bool {
+    match path.segments.last() {
+        Some(seg) => matches!(
+            &seg.arguments,
+            PathArguments::AngleBracketed(a)
+                if a.args.iter().any(|g| matches!(g, GenericArgument::Lifetime(_)))
+        ),
+        None => false,
     }
-    let tb = match it.bounds.first()? {
-        syn::TypeParamBound::Trait(tb) => tb,
-        _ => return None,
-    };
-    let last = tb.path.segments.last()?;
-    if last.ident != "Into" {
-        return None;
-    }
-    let args = match &last.arguments {
-        syn::PathArguments::AngleBracketed(a) => a,
-        _ => return None,
-    };
-    let target = match args.args.first()? {
-        syn::GenericArgument::Type(ty) => ty,
-        _ => return None,
-    };
-    let p = match target {
-        Type::Path(p) => p,
-        _ => return None,
-    };
-    Some(p.path.segments.last()?.ident.clone())
+}
+
+/// Derive the snapshot type path from an input type's path: replace the
+/// last segment's ident with `__Drv<Ident>` and drop its generic arguments
+/// (the snapshot is always `'static`, so it carries no lifetime).
+fn snapshot_path_from_input(input_path: &syn::Path) -> Result<syn::Path, syn::Error> {
+    let mut snap = input_path.clone();
+    let last = snap.segments.last_mut().ok_or_else(|| {
+        syn::Error::new_spanned(input_path, "input type must have at least one path segment")
+    })?;
+    last.ident = format_ident!("__Drv{}", last.ident);
+    last.arguments = PathArguments::None;
+    Ok(snap)
+}
+
+fn snake_to_pascal(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect()
 }

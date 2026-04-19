@@ -1,41 +1,56 @@
-//! Verify that `#[drv::atom]` alone imposes no field-trait requirements and
-//! that fields outside any consumed lens carry no bounds.
+//! Verify that a plain source struct places no trait requirements on fields
+//! that are never projected by any input and never reached by any memo.
+//!
+//! Fields touched by an input need `Clone + PartialEq` (plus the input
+//! macro's derive requirements). Fields outside any input — and not reached
+//! via a `&Source` value-ref identity consumer — carry no bounds at all.
 
-/// Holds only the traits drv genuinely requires for lens participation:
-/// `PartialEq + Clone` (+ `Debug` for the lens struct's derive).
+use std::marker::PhantomData;
+
+/// Holds only the traits drv genuinely requires for an input field.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct LensReady(pub u32);
+pub struct Tracked(pub u32);
 
 /// Deliberately bare — no `PartialEq`, no `Clone`, no `Debug`, no `Default`.
-/// Safe to place on an atom as long as no memo consumes the identity lens and
-/// no explicit lens projects this field.
+/// Safe on a source as long as no input projects it and no memo consumes the
+/// source as `&Source`.
 pub struct Opaque {
     pub _private: std::sync::Mutex<u32>,
 }
 
-#[drv::atom]
-pub struct RelaxedAtom {
-    #[drv::lens(Simple)]
-    pub n: LensReady,
-
-    // Bare field — never projected into a lens, never reached via identity.
+pub struct Relaxed {
+    pub n: Tracked,
+    // Bare field — never projected, never reached via `&Source`.
     pub opaque: Opaque,
 }
 
-#[drv::memo(single)]
-fn doubled<'a>(lens: impl Into<Simple<'a>>) -> u32 {
-    lens.n.0 * 2
+#[drv::input]
+struct Simple<'a> {
+    pub n: &'a Tracked,
+    _p: PhantomData<&'a ()>,
 }
 
-drv::assemble!();
+impl<'a> From<&'a Relaxed> for Simple<'a> {
+    fn from(a: &'a Relaxed) -> Self {
+        Self {
+            n: &a.n,
+            _p: PhantomData,
+        }
+    }
+}
+
+#[drv::memo(single)]
+fn doubled<'a>(input: Simple<'a>) -> u32 {
+    input.n.0 * 2
+}
 
 #[test]
-fn atom_without_identity_consumer_and_no_bounds_on_unused_field() {
-    let atom = RelaxedAtom {
-        n: LensReady(21),
+fn source_with_bare_field_compiles_and_memoizes() {
+    let source = Relaxed {
+        n: Tracked(21),
         opaque: Opaque {
             _private: std::sync::Mutex::new(7),
         },
     };
-    assert_eq!(doubled(&atom), 42);
+    assert_eq!(doubled((&source).into()), 42);
 }

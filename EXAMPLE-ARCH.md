@@ -13,7 +13,7 @@ from scratch.
 
 1. [Core idea](#core-idea)
 2. [Query-driven vs reactive](#query-driven-vs-reactive)
-3. [Atoms: two kinds of ground truth](#atoms-two-kinds-of-ground-truth)
+3. [Sources: two kinds of ground truth](#sources-two-kinds-of-ground-truth)
 4. [Drivers: the sync/async split](#drivers-the-syncasync-split)
 5. [Queries: desired state, not transitions](#queries-desired-state-not-transitions)
 6. [Actions as diffs](#actions-as-diffs)
@@ -30,7 +30,7 @@ from scratch.
 
 ## Core idea
 
-The application is structured as a **database of ground truth** (atoms) and
+The application is structured as a **database of ground truth** (sources) and
 **cached queries** over that database (memos). Nothing watches anything.
 Nothing subscribes to anything. The main loop sets inputs, asks questions,
 and acts on answers. Memoization makes the asking cheap.
@@ -77,7 +77,7 @@ construction. N states = O(N) rules.
 
 ---
 
-## Atoms: two kinds of ground truth
+## Sources: two kinds of ground truth
 
 Not all ground truth is the same. There are two distinct categories:
 
@@ -100,12 +100,11 @@ Chosen, not discovered. Changes come from user interaction.
 - UI preferences (layout, theme)
 
 These have different lifecycles, different update paths, and different owners.
-They should live in **separate atoms**.
+They should live in **separate sources**.
 
 ```rust
 // External fact — managed by the device enumeration driver
 #[derive(Debug, Clone, PartialEq, Default)]
-#[drv::atom]
 pub struct MicInventory {
     pub permission: MicPermission,     // NotAsked, Pending, Granted, Denied
     pub mics: imbl::Vector<MicDevice>, // empty until Granted
@@ -113,31 +112,31 @@ pub struct MicInventory {
 
 // User decision — managed by UI event handlers
 #[derive(Debug, Clone, PartialEq, Default)]
-#[drv::atom]
 pub struct MicPreference {
     pub selected: Option<MicId>,
 }
 ```
 
-At runtime each atom is just the plain struct — `MyAtom { ... }`. No
-wrapper, no hidden state. Memoization lives entirely in per-memo thread-
-local caches keyed by input value, so drivers and the main loop simply
-pass `&mut MyAtom` around and mutate fields directly.
+Sources are plain Rust structs. `drv` doesn't wrap them. Memoization lives
+entirely in per-memo thread-local caches keyed by input value, so drivers
+and the main loop simply pass `&mut MySource` around and mutate fields
+directly.
 
 Why separate? The device driver should not need to know about user
 preferences. The UI handler should not need to know about OS enumeration.
-Memos bridge them:
+Memos bridge them — each memo takes one or more **inputs** (projections
+declared with `#[drv::input]`):
 
 ```rust
 #[drv::memo(single)]
-fn mic_picker(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
-    // lenses from two atoms — only the fields this memo reads
+fn mic_picker<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> MicPickerModel {
+    // inputs from two sources — only the fields this memo reads
 }
 ```
 
-### Organizing atoms by domain
+### Organizing sources by domain
 
-Group atoms into domains. Each domain covers one area of the application:
+Group sources into domains. Each domain covers one area of the application:
 
 ```
 Domain: Devices
@@ -160,34 +159,34 @@ Domain: Media
   RemoteStreams      (external: incoming audio/video streams)
 ```
 
-Drivers manage external-fact atoms. UI handlers manage user-decision atoms.
-Memos reach across domains freely via multi-lens parameters.
+Drivers manage external-fact sources. UI handlers manage user-decision sources.
+Memos reach across domains freely via multi-input parameters.
 
 ---
 
 ## Drivers: the sync/async split
 
-A driver manages one external-fact atom. Every driver has two sides:
+A driver manages one external-fact source. Every driver has two sides:
 
-### The synchronous side: the atom
+### The synchronous side: the source
 
-The atom is the queryable truth. It lives on the main thread (or whichever
-thread owns the atoms). It is always available for reading via lenses.
+The source is the queryable truth. It lives on the main thread (or whichever
+thread owns the sources). It is always available for reading via inputs.
 Queries never block.
 
 ### The asynchronous side: platform I/O
 
 Hardware access, network calls, OS dialogs — these run on background threads
 or async tasks. When they complete, they post results back to the main thread,
-which writes them into the atom.
+which writes them into the source.
 
 ```
 Background threads                        Main thread
-(expensive I/O)                           (cheap: atoms + queries)
+(expensive I/O)                           (cheap: sources + queries)
 
 mic_driver ──────────┐
-camera_driver ───────┤  atom updates
-signaling_driver ────┼──────────────────→  process_updates(&mut atoms)
+camera_driver ───────┤  source updates
+signaling_driver ────┼──────────────────→  process_updates(&mut sources)
 webrtc_driver ───────┤
 hotplug_listener ────┘
 ```
@@ -195,7 +194,7 @@ hotplug_listener ────┘
 ### Driver structure
 
 ```rust
-/// Manages the MicInventory atom.
+/// Manages the MicInventory source.
 pub struct MicEnumerationDriver {
     /// Receives updates from the async enumeration task.
     rx: mpsc::Receiver<MicEvent>,
@@ -205,7 +204,7 @@ pub struct MicEnumerationDriver {
 
 impl MicEnumerationDriver {
     /// Called on the main thread each tick. Drains pending events
-    /// into the atom. Cheap — just field assignments.
+    /// into the source. Cheap — just field assignments.
     pub fn process(&self, inv: &mut MicInventory) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -241,7 +240,7 @@ Some drivers also need to act on query results. For example, the mic stream
 driver opens/closes streams based on the diff between desired and actual
 state. The execute method does two things atomically:
 
-1. Writes the intent into the atom (sync — prevents re-triggering)
+1. Writes the intent into the source (sync — prevents re-triggering)
 2. Starts the async work (async — completes later)
 
 ```rust
@@ -253,7 +252,7 @@ impl MicStreamDriver {
     pub fn execute(&self, action: MicAction, cap: &mut MicCapture) {
         match action {
             MicAction::Open(id) => {
-                // 1. Sync: update atom immediately
+                // 1. Sync: update source immediately
                 cap.state = CaptureState::Opening;
                 cap.device_id = Some(id);
                 // 2. Async: start the work
@@ -270,15 +269,15 @@ impl MicStreamDriver {
 }
 ```
 
-The synchronous write into the atom is critical. Without it, the next query
-would return the same action again (because the atom hasn't changed yet),
-causing a double-open. The atom write closes the loop: execute → atom
+The synchronous write into the source is critical. Without it, the next query
+would return the same action again (because the source hasn't changed yet),
+causing a double-open. The source write closes the loop: execute → source
 updates → query returns Noop → no re-execution.
 
 ### One driver, two crates
 
 "The driver" as described here is a unit, but it's best organised as two
-crates: a portable sync **core** (the atom + the sync `process`/`execute`
+crates: a portable sync **core** (the source + the sync `process`/`execute`
 API + the `Cmd`/`Event` types that cross to the async side) and a
 platform-specific **native** (the worker implementation — thread on
 desktop, GCD on iOS, coroutines on Android). The mpsc between them *is*
@@ -310,10 +309,10 @@ The "close old stream when switching mics" case is easy to forget.
 
 ```rust
 /// "What mic should be open right now?"
-/// Multi-lens memo: lenses from two atoms, only the fields that matter.
+/// Multi-input memo: inputs from two sources, only the fields that matter.
 #[drv::memo(single)]
-fn desired_mic(inv: &MicListLens, pref: &MicSelectLens) -> Option<MicId> {
-    match (*inv.permission, pref.selected) {
+fn desired_mic<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> Option<MicId> {
+    match (inv.permission, pref.selected) {
         (MicPermission::Granted, Some(id))
             if inv.mics.iter().any(|m| m.id == *id) => Some(*id),
         _ => None,
@@ -340,16 +339,16 @@ desired end state. The diff against actual state determines the action.
 
 ## Actions as diffs
 
-A query describes what should be true. The driver's atom describes what is
+A query describes what should be true. The driver's source describes what is
 actually true. The diff is the action.
 
 ```rust
 /// "What should we do about the mic stream?"
 #[drv::memo(single)]
-fn mic_action(
-    inv: &MicListLens,
-    pref: &MicSelectLens,
-    cap: &MicCapStateLens,
+fn mic_action<'a, 'b, 'c>(
+    inv: MicListInput<'a>,
+    pref: MicSelectInput<'b>,
+    cap: MicCapStateInput<'c>,
 ) -> MicAction {
     let desired = desired_mic(inv, pref);
     let actual = match cap.state {
@@ -379,8 +378,8 @@ The main loop has three phases, every tick:
 ```rust
 loop {
     // ── Phase 1: Ingest ──────────────────────────────────────
-    // Drain async driver results into atoms.
-    // Drain UI events into user-decision atoms.
+    // Drain async driver results into sources.
+    // Drain UI events into user-decision sources.
     mic_enum_driver.process(&mut mic_inventory);
     mic_stream_driver.process(&mut mic_capture);
     camera_driver.process(&mut camera_inventory);
@@ -390,11 +389,19 @@ loop {
 
     // ── Phase 2: Query ───────────────────────────────────────
     // Ask questions. All reads, no writes. Memoized — mostly cache hits.
-    let mic_act = mic_action(&mic_inventory, &mic_preference, &mic_capture);
-    let cam_act = camera_action(&camera_inventory, &camera_preference, &camera_capture);
+    let mic_act = mic_action(
+        MicListInput::new(&mic_inventory),
+        MicSelectInput::new(&mic_preference),
+        MicCapStateInput::new(&mic_capture),
+    );
+    let cam_act = camera_action(
+        CamListInput::new(&camera_inventory),
+        CamSelectInput::new(&camera_preference),
+        CamCapStateInput::new(&camera_capture),
+    );
 
     // ── Phase 3: Execute ─────────────────────────────────────
-    // Act on query results. Writes intent into atoms + starts async work.
+    // Act on query results. Writes intent into sources + starts async work.
     mic_stream_driver.execute(mic_act, &mut mic_capture);
     camera_stream_driver.execute(cam_act, &mut camera_capture);
 
@@ -407,10 +414,10 @@ loop {
 ```
 
 Every phase is clearly separated:
-- **Ingest**: writes to atoms from external sources. No reads.
-- **Query**: reads from atoms. No writes. All memoized.
-- **Execute**: writes intent to atoms + starts async work.
-- **Render**: reads from atoms. Pushes to UI. All memoized.
+- **Ingest**: writes to sources from outside the app. No reads.
+- **Query**: reads from sources. No writes. All memoized.
+- **Execute**: writes intent to sources + starts async work.
+- **Render**: reads from sources. Pushes to UI. All memoized.
 
 ---
 
@@ -428,7 +435,7 @@ driver into **two crates**:
 
 ```
 driver-<name>/
-  core/    → led-driver-<name>-core       portable: atom + sync API
+  core/    → led-driver-<name>-core       portable: source + sync API
                                           + `Cmd`/`Event` ABI types
                                           + trace trait. Pure Rust, no
                                           platform deps.
@@ -439,7 +446,7 @@ driver-<name>/
 
 The **core** crate knows nothing about any platform. It holds:
 
-- The atom(s) the driver owns.
+- The source(s) the driver owns.
 - The sync driver struct with `process` / `execute` (or analogous)
   methods the main loop calls.
 - The `Cmd` / `Done` / `Event` types that cross to the async worker.
@@ -514,9 +521,9 @@ Each runtime crate depends on the `*-core` crates (shared) plus the
 right `*-native-<platform>` crate. This scales cleanly when the
 platforms have genuinely different wiring needs, which they usually do.
 
-### User-decision atoms have no driver
+### User-decision sources have no driver
 
-A user-decision atom is chosen, not discovered — no async side, no
+A user-decision source is chosen, not discovered — no async side, no
 worker, no driver struct. Let it sit in a plain `state-*` crate and be
 mutated directly by dispatch in the runtime. Don't force it into the
 driver shape for consistency; the driver shape is for units that have
@@ -528,11 +535,11 @@ an async peer.
 import `driver-bar/core/` or `state-baz/`. Each driver is independently
 testable, independently swappable, independently mockable.
 
-Every memo that combines lenses from multiple drivers' atoms lives in a
+Every memo that combines inputs from multiple drivers' sources lives in a
 separate **runtime** crate that depends on all of them. That runtime
 crate also owns:
 
-- `Event` + `dispatch` (the user-event handler that mutates driver atoms).
+- `Event` + `dispatch` (the user-event handler that mutates driver sources).
 - `Trace` / unified trace sink that driver traces forward to.
 - The main loop `run` itself.
 - The platform-specific wiring that spawns native workers and builds
@@ -544,52 +551,47 @@ around the same `*-core` crates; the drivers stay intact.
 ```
 crates/
   core/                              shared primitives (paths, id newtypes, ...)
-  state-<name>/                      user-decision atom + its own memos (self-contained)
+  state-<name>/                      user-decision source + its own memos (self-contained)
   driver-<name>/
-    core/                            portable sync driver + atom + ABI types
+    core/                            portable sync driver + source + ABI types
     native/                          platform-specific async worker
-  runtime/                           cross-atom lenses + memos + dispatch + main loop
+  runtime/                           cross-source inputs + memos + dispatch + main loop
 <bin>/                               thin main: CLI parse, raw-mode guard, run
 ```
 
-### Cross-crate lenses: the consumer declares its own
+### Cross-crate inputs: the consumer declares its own
 
-`drv`'s macro registry is per-crate-compilation. A memo's `impl
-Into<Lens>` param is resolved against the local registry, so a consumer
-crate (e.g. `runtime`) can't use a lens name declared in a different
-crate as a memo param type. Declare the lens **locally** where the
-memo lives, with a hand-written `From<&ForeignAtom>` impl:
+Inputs live in the crate that uses them. A source crate (e.g.
+`driver-mic-enum/core`) exports its plain struct and doesn't depend on
+`drv`. The consumer crate declares the input, the projection, and the
+memo:
 
 ```rust
 // In the runtime crate, projecting MicInventory from the sibling
 // driver-mic-enum/core crate.
 
-#[drv::lens]
-struct MicsLens<'a> {
+#[drv::input]
+struct MicsInput<'a> {
     pub mics: &'a imbl::Vector<MicDevice>,
 }
 
-impl<'a> From<&'a MicInventory> for MicsLens<'a> {
-    fn from(m: &'a MicInventory) -> Self { Self { mics: &m.mics } }
-}
-
-// Ref-clone impl so the body can forward `&lens` to a sibling memo
-// whose outer sig is `impl Into<MicsLens>`. drv auto-generates this
-// for inline lenses; for standalone ones, write it once:
-impl<'a> From<&MicsLens<'a>> for MicsLens<'a> {
-    fn from(s: &MicsLens<'a>) -> Self { Self { mics: s.mics } }
+impl<'a> MicsInput<'a> {
+    pub fn new(m: &'a MicInventory) -> Self {
+        Self { mics: &m.mics }
+    }
 }
 
 #[drv::memo(single)]
-fn mic_count<'a>(inv: impl Into<MicsLens<'a>>) -> usize {
+fn mic_count<'a>(inv: MicsInput<'a>) -> usize {
     inv.mics.len()
 }
+
+// Call site:
+// mic_count(MicsInput::new(&mic_inventory))
 ```
 
-The inline `#[drv::lens(Name)]` shorthand on atom fields is the
-convenient case — useful when the atom and the lens-consuming memo live
-in the same crate. The standalone form is the general one; it's what
-scales across crate boundaries.
+No registry, no cross-crate coordination. The consumer crate is the only
+one that needs a `drv` dependency.
 
 ### Drop-order: don't join in `Drop`
 
@@ -619,7 +621,7 @@ Each view has a corresponding memo that produces a view-specific model:
 
 ```rust
 #[drv::memo(single)]
-fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
+fn mic_picker_model<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> MicPickerModel {
     match inv.permission {
         MicPermission::NotAsked => MicPickerModel::NeedPermission,
         MicPermission::Pending  => MicPickerModel::Waiting,
@@ -631,37 +633,35 @@ fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
     }
 }
 
-// Lenses for participant grid — only the fields this view needs.
-// Standalone lenses are a separate struct tagged with `#[drv::lens]`,
-// with a `From<&AtomName>` impl that projects into it.
-#[drv::lens]
-struct GridParticipantsLens<'a> {
+// Inputs for participant grid — only the fields this view needs.
+#[drv::input]
+struct GridParticipantsInput<'a> {
     pub participants: &'a imbl::Vector<Participant>,
 }
 
-impl<'a> From<&'a RemoteParticipants> for GridParticipantsLens<'a> {
-    fn from(p: &'a RemoteParticipants) -> Self {
+impl<'a> GridParticipantsInput<'a> {
+    pub fn new(p: &'a RemoteParticipants) -> Self {
         Self { participants: &p.participants }
     }
 }
 
-#[drv::lens]
-struct GridSettingsLens<'a> {
+#[drv::input]
+struct GridSettingsInput<'a> {
     pub muted: &'a imbl::HashSet<ParticipantId>,
     pub pinned: &'a Option<ParticipantId>,
 }
 
-impl<'a> From<&'a ParticipantSettings> for GridSettingsLens<'a> {
-    fn from(s: &'a ParticipantSettings) -> Self {
+impl<'a> GridSettingsInput<'a> {
+    pub fn new(s: &'a ParticipantSettings) -> Self {
         Self { muted: &s.muted, pinned: &s.pinned }
     }
 }
 
 #[drv::memo(single)]
-fn participant_grid_model(
-    p: &GridParticipantsLens,
-    s: &GridSettingsLens,
-    m: &RemoteStreams,  // identity lens ok if all fields are relevant
+fn participant_grid_model<'a, 'b>(
+    p: GridParticipantsInput<'a>,
+    s: GridSettingsInput<'b>,
+    m: &RemoteStreams,   // whole source; cached as `Clone` + `PartialEq`
 ) -> ParticipantGridModel {
     p.participants.iter().map(|participant| {
         GridTile {
@@ -739,19 +739,19 @@ Three layers, each avoiding redundant work at its own level:
 
 | Layer | Mechanism | What it avoids |
 |-------|-----------|----------------|
-| `drv` lens | Field-by-field `PartialEq` on projected fields | Recomputing memo when irrelevant atom fields changed |
+| `drv` input | Field-by-field `PartialEq` on projected fields | Recomputing memo when irrelevant source fields changed |
 | `PartialEq` bridge | `new_model != current_model` | Pushing to Swift when the model is identical |
 | SwiftUI `@Observable` | Per-property tracking | Re-rendering views that didn't read the changed property |
 
 ### User events flow back
 
 SwiftUI user actions cross the FFI boundary in the opposite direction and
-mutate user-decision atoms:
+mutate user-decision sources:
 
 ```
 SwiftUI onTapGesture
   → RustBridge.selectMic(id)      // FFI call
-    → mic_preference.selected = Some(id)  // atom mutation
+    → mic_preference.selected = Some(id)  // source mutation
       → next tick: queries recompute, bridge pushes if changed
 ```
 
@@ -761,7 +761,7 @@ SwiftUI onTapGesture
 
 ```
 Background threads                        UI / Main thread
-(async I/O, platform calls)              (atoms, queries, render)
+(async I/O, platform calls)              (sources, queries, render)
 
 ┌──────────────────────┐
 │  mic_enum_driver     │──┐
@@ -781,9 +781,9 @@ Background threads                        UI / Main thread
 └──────────────────────┘
 ```
 
-### Why atoms stay on the UI thread
+### Why sources stay on the UI thread
 
-- Atoms are plain structs; they're `Send` (or `Sync`) iff `T` is. The
+- Sources are plain structs; they're `Send` (or `Sync`) iff `T` is. The
   memoization caches live in per-memo `thread_local!` slots, so each
   thread builds its own cache independently — no shared state, no
   contention.
@@ -791,10 +791,10 @@ Background threads                        UI / Main thread
   per frame is < 1ms.
 - The expensive work (I/O, network, audio processing) is already on
   background threads.
-- Keeping atoms on the UI thread means views can lens directly — no
-  thread-boundary serialization for read access. An atom *can* move
-  between threads, but the cache doesn't follow; the new thread builds
-  its own on first miss.
+- Keeping sources on the UI thread means views can read them directly
+  through inputs — no thread-boundary serialization for read access.
+  A source *can* move between threads, but the cache doesn't follow;
+  the new thread builds its own on first miss.
 
 ### Communication pattern
 
@@ -802,72 +802,99 @@ Background threads communicate with the main thread via channels
 (`mpsc::Receiver`, `crossbeam::Receiver`, etc.) or callback dispatch
 (e.g., `DispatchQueue.main.async` on iOS).
 
-The main loop's **ingest phase** drains these channels into atoms. This is
+The main loop's **ingest phase** drains these channels into sources. This is
 the only point where external data enters the query system.
 
 ---
 
 ## Worked example: microphone lifecycle
 
-A complete walkthrough of the mic selection flow, showing atoms, mutations,
+A complete walkthrough of the mic selection flow, showing sources, mutations,
 queries, and actions at each step.
 
-### Atoms
+### Sources
 
-A lens projects from a single atom. To combine fields from multiple atoms,
-use multi-lens memos — one parameter per atom or per lens. Always use
-lenses that project only the fields the memo actually reads. This way, changes
-to unrelated fields (e.g., `last_enumerated` timestamp updating frequently)
-don't cause unnecessary recomputation.
+Sources are plain Rust structs. Inputs — the projections memos read — are
+declared separately, each with a `#[drv::input]` struct and a hand-written
+projection (a `::new` method, a `From` impl, whatever reads naturally).
+Always project only the fields the memo actually needs. Changes to
+unrelated fields (e.g., `last_enumerated` timestamp updating frequently)
+then don't trigger recomputation.
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Default)]
-#[drv::atom]
 pub struct MicInventory {
-    #[drv::lens(MicListLens)]
     pub permission: MicPermission,
-
-    #[drv::lens(MicListLens)]
     pub mics: imbl::Vector<MicDevice>,
-
     pub last_enumerated: Option<Instant>,   // updated frequently, most memos don't care
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-#[drv::atom]
 pub struct MicPreference {
-    #[drv::lens(MicSelectLens)]
     pub selected: Option<MicId>,
-
     pub last_changed: Option<Instant>,      // for analytics, not for queries
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-#[drv::atom]
 pub struct MicCapture {
-    #[drv::lens(MicCapStateLens)]
     pub state: CaptureState,
-
-    #[drv::lens(MicCapStateLens)]
     pub device_id: Option<MicId>,
-
     pub volume_level: f32,                  // updated every audio frame, mic_action doesn't need it
+}
+```
+
+Inputs for the queries below project only what each one reads:
+
+```rust
+#[drv::input]
+struct MicListInput<'a> {
+    pub permission: &'a MicPermission,
+    pub mics: &'a imbl::Vector<MicDevice>,
+}
+
+impl<'a> MicListInput<'a> {
+    pub fn new(inv: &'a MicInventory) -> Self {
+        Self { permission: &inv.permission, mics: &inv.mics }
+    }
+}
+
+#[drv::input]
+struct MicSelectInput<'a> {
+    pub selected: &'a Option<MicId>,
+}
+
+impl<'a> MicSelectInput<'a> {
+    pub fn new(pref: &'a MicPreference) -> Self {
+        Self { selected: &pref.selected }
+    }
+}
+
+#[drv::input]
+struct MicCapStateInput<'a> {
+    pub state: &'a CaptureState,
+    pub device_id: &'a Option<MicId>,
+}
+
+impl<'a> MicCapStateInput<'a> {
+    pub fn new(cap: &'a MicCapture) -> Self {
+        Self { state: &cap.state, device_id: &cap.device_id }
+    }
 }
 ```
 
 ### Queries
 
-Each memo takes lens references that project only the fields it needs.
-Changes to fields outside the lens (e.g., `volume_level` updating 60 times
-per second) don't trigger recomputation of unrelated memos.
+Each memo takes inputs that project only the fields it needs. Changes to
+fields outside the input (e.g., `volume_level` updating 60 times per
+second) don't trigger recomputation of unrelated memos.
 
 ```rust
 /// "What mic should be open right now?"
 /// Needs permission + available mics + user selection. Does NOT need
 /// last_enumerated, last_changed, or volume_level.
 #[drv::memo(single)]
-fn desired_mic(inv: &MicListLens, pref: &MicSelectLens) -> Option<MicId> {
-    match (*inv.permission, pref.selected) {
+fn desired_mic<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> Option<MicId> {
+    match (inv.permission, pref.selected) {
         (MicPermission::Granted, Some(id))
             if inv.mics.iter().any(|m| m.id == *id) => Some(*id),
         _ => None,
@@ -877,10 +904,10 @@ fn desired_mic(inv: &MicListLens, pref: &MicSelectLens) -> Option<MicId> {
 /// "What should we do about the mic stream?"
 /// Needs desired state + capture state. Does NOT need volume_level.
 #[drv::memo(single)]
-fn mic_action(
-    inv: &MicListLens,
-    pref: &MicSelectLens,
-    cap: &MicCapStateLens,
+fn mic_action<'a, 'b, 'c>(
+    inv: MicListInput<'a>,
+    pref: MicSelectInput<'b>,
+    cap: MicCapStateInput<'c>,
 ) -> MicAction {
     let want = desired_mic(inv, pref);
     let have = match cap.state {
@@ -898,7 +925,7 @@ fn mic_action(
 /// "What should the mic picker view show?"
 /// Needs permission + mics + selection. Same fields as desired_mic, different output.
 #[drv::memo(single)]
-fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
+fn mic_picker_model<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> MicPickerModel {
     match inv.permission {
         MicPermission::NotAsked => MicPickerModel::NeedPermission,
         MicPermission::Pending  => MicPickerModel::Waiting,
@@ -912,27 +939,30 @@ fn mic_picker_model(inv: &MicListLens, pref: &MicSelectLens) -> MicPickerModel {
 
 /// "What is the current mic volume?" — depends ONLY on volume_level.
 /// Audio frame updates don't trigger mic_action or mic_picker recomputation.
-#[drv::lens]
-struct MicVolumeLens {
-    pub volume_level: f32,
+#[drv::input]
+struct MicVolumeInput<'a> {
+    pub volume_level: &'a f32,
 }
 
-impl From<&MicCapture> for MicVolumeLens {
-    fn from(c: &MicCapture) -> Self {
-        Self { volume_level: c.volume_level }
+impl<'a> MicVolumeInput<'a> {
+    pub fn new(c: &'a MicCapture) -> Self {
+        Self { volume_level: &c.volume_level }
     }
 }
 
 #[drv::memo(single)]
-fn mic_volume_display(vol: &MicVolumeLens) -> VolumeLevel {
-    VolumeLevel::from_linear(vol.volume_level)
+fn mic_volume_display<'a>(vol: MicVolumeInput<'a>) -> VolumeLevel {
+    VolumeLevel::from_linear(*vol.volume_level)
 }
 ```
+
+Call sites build inputs explicitly: `mic_action(MicListInput::new(&inv),
+MicSelectInput::new(&pref), MicCapStateInput::new(&cap))`.
 
 ### Step-by-step flow
 
 ```
-Step  What happens                 Atom mutations                   Query results
+Step  What happens                 Source mutations                   Query results
 ────  ──────────────────────────── ──────────────────────────────── ──────────────────────
 1     User opens mic picker        (none)                           mic_picker_model → NeedPermission
 2     User taps "grant access"     inv.permission = Pending         mic_picker_model → Waiting
@@ -961,24 +991,21 @@ and the diff against `Disconnected` producing `Open(mic1)`.
 
 ## Worked example: remote participants
 
-### Atoms
+### Sources
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Default)]
-#[drv::atom]
 pub struct RemoteParticipants {
     pub participants: imbl::Vector<Participant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-#[drv::atom]
 pub struct ParticipantSettings {
     pub muted: imbl::HashSet<ParticipantId>,
     pub pinned: Option<ParticipantId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-#[drv::atom]
 pub struct RemoteStreams {
     pub video_tracks: imbl::HashMap<ParticipantId, VideoTrackState>,
     pub audio_tracks: imbl::HashMap<ParticipantId, AudioTrackState>,
@@ -1040,7 +1067,7 @@ if let Some(pinned_id) = participant_settings.pinned {
 ```
 
 This is application logic — not a query, not a driver. It runs during ingest
-because it's cleaning up a user-decision atom in response to an external
+because it's cleaning up a user-decision source in response to an external
 fact changing.
 
 ---
@@ -1060,23 +1087,23 @@ fn desired_mic_requires_permission_and_availability() {
 
     // No permission → no desired mic
     pref.selected = Some(MicId(1));
-    assert_eq!(desired_mic(&inv, &pref), None);
+    assert_eq!(desired_mic(MicListInput::new(&inv), MicSelectInput::new(&pref)), None);
 
     // Permission but mic not in list → no desired mic
     inv.permission = MicPermission::Granted;
-    assert_eq!(desired_mic(&inv, &pref), None);
+    assert_eq!(desired_mic(MicListInput::new(&inv), MicSelectInput::new(&pref)), None);
 
     // Permission and mic available → desired
     inv.mics.push_back(MicDevice { id: MicId(1), name: "USB Mic".into() });
-    assert_eq!(desired_mic(&inv, &pref), Some(MicId(1)));
+    assert_eq!(desired_mic(MicListInput::new(&inv), MicSelectInput::new(&pref)), Some(MicId(1)));
 
     // Mic removed → no desired mic (reconnect scenario)
     inv.mics.retain(|m| m.id != MicId(1));
-    assert_eq!(desired_mic(&inv, &pref), None);
+    assert_eq!(desired_mic(MicListInput::new(&inv), MicSelectInput::new(&pref)), None);
 
     // Mic re-added → desired again (selection survived)
     inv.mics.push_back(MicDevice { id: MicId(1), name: "USB Mic".into() });
-    assert_eq!(desired_mic(&inv, &pref), Some(MicId(1)));
+    assert_eq!(desired_mic(MicListInput::new(&inv), MicSelectInput::new(&pref)), Some(MicId(1)));
 }
 ```
 
@@ -1095,26 +1122,34 @@ fn mic_action_produces_correct_diffs() {
     inv.mics.push_back(mic(1));
     inv.mics.push_back(mic(2));
 
+    let act = |inv: &MicInventory, pref: &MicPreference, cap: &MicCapture| {
+        mic_action(
+            MicListInput::new(inv),
+            MicSelectInput::new(pref),
+            MicCapStateInput::new(cap),
+        )
+    };
+
     // Select mic1 → should open
     pref.selected = Some(MicId(1));
-    assert_eq!(mic_action(&inv, &pref, &cap), MicAction::Open(MicId(1)));
+    assert_eq!(act(&inv, &pref, &cap), MicAction::Open(MicId(1)));
 
     // Simulate execute: cap reflects Opening
     cap.state = CaptureState::Opening;
     cap.device_id = Some(MicId(1));
-    assert_eq!(mic_action(&inv, &pref, &cap), MicAction::Noop);
+    assert_eq!(act(&inv, &pref, &cap), MicAction::Noop);
 
     // Stream live
     cap.state = CaptureState::Live;
-    assert_eq!(mic_action(&inv, &pref, &cap), MicAction::Noop);
+    assert_eq!(act(&inv, &pref, &cap), MicAction::Noop);
 
     // Switch to mic2
     pref.selected = Some(MicId(2));
-    assert_eq!(mic_action(&inv, &pref, &cap), MicAction::Switch(MicId(2)));
+    assert_eq!(act(&inv, &pref, &cap), MicAction::Switch(MicId(2)));
 
     // Deselect
     pref.selected = None;
-    assert_eq!(mic_action(&inv, &pref, &cap), MicAction::Close);
+    assert_eq!(act(&inv, &pref, &cap), MicAction::Close);
 }
 ```
 
@@ -1170,9 +1205,9 @@ logic above the ABI is already covered.
 
 ## Guidelines
 
-### 1. External facts and user decisions go in separate atoms
+### 1. External facts and user decisions go in separate sources
 
-Don't mix "what the OS told me" with "what the user chose" in the same atom.
+Don't mix "what the OS told me" with "what the user chose" in the same source.
 Drivers manage external facts. UI handlers manage user decisions. Memos
 combine them.
 
@@ -1183,14 +1218,14 @@ The diff between desired and actual is the action.
 
 ### 3. Execute writes intent synchronously
 
-When acting on a query result, update the driver's atom to reflect the
+When acting on a query result, update the driver's source to reflect the
 in-progress operation *before* starting the async work. This prevents the
 query from returning the same action on the next tick.
 
 ### 4. The main loop is ingest → query → execute → render
 
-Keep the phases separate. Ingest writes to atoms from external sources.
-Query reads atoms (memoized). Execute acts on query results and writes
+Keep the phases separate. Ingest writes to sources from outside the app.
+Query reads sources (memoized). Execute acts on query results and writes
 intent. Render computes view models (also memoized) and pushes to UI.
 
 ### 5. Use `imbl` collections for large or frequently-cloned data
@@ -1208,14 +1243,14 @@ The reactive framework handles per-property granularity from there.
 ### 7. Clean up stale user decisions in the ingest phase
 
 When an external fact invalidates a user decision (pinned participant left,
-selected mic removed), clean up the user-decision atom during ingest. This
+selected mic removed), clean up the user-decision source during ingest. This
 is application logic, not a query.
 
 ### 8. Keep drivers ignorant of each other
 
 The mic enumeration driver should not know about the stream driver. The
 stream driver should not know about user preferences. Memos express the
-relationships between domains. Drivers just keep their atom in sync with
+relationships between domains. Drivers just keep their source in sync with
 reality.
 
 ### 9. Enforce driver ignorance with crate boundaries
@@ -1223,12 +1258,12 @@ reality.
 Don't rely on discipline — put each driver in its own crate (or crate
 pair) that has no dependency on other drivers or on sibling
 user-decision state. The Cargo.toml is the constraint; the compiler
-rejects accidental coupling. Cross-atom composition lives in a separate
+rejects accidental coupling. Cross-source composition lives in a separate
 runtime crate that depends on all of them.
 
 ### 10. Split each driver into a portable core and a platform-specific native
 
-The sync API + atom + ABI types are the same on every platform. The
+The sync API + source + ABI types are the same on every platform. The
 async worker is not. Putting them in separate crates means the core
 crate compiles on every target and stays thin; the native crate is
 swapped (Rust thread / Swift + GCD / Kotlin + coroutines / mock for
@@ -1245,13 +1280,12 @@ picks one via target-specific dependencies — or, when the UI differs
 substantially per platform, ships as parallel `runtime-<platform>`
 crates depending on the shared `*-core` crates plus the right native.
 
-### 11. Declare standalone lenses in the consumer crate
+### 11. Declare inputs in the crate that uses them
 
-Inline `#[drv::lens(Name)]` is for the same-crate case. When a memo in
-crate B projects an atom defined in crate A, declare a `#[drv::lens]`
-struct in crate B with a hand-written `From<&ForeignAtom>` impl — plus
-the `From<&Self>` ref-clone impl if any sibling memo in B takes
-`impl Into<ThatLens>`.
+When a memo in crate B projects a source defined in crate A, declare the
+`#[drv::input]` struct in crate B alongside a hand-written projection
+(inherent `::new` method, `From` impl, etc.). The source crate stays
+plain and doesn't need `drv` as a dependency.
 
 ### 12. Don't `join()` native workers in `Drop`
 

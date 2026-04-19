@@ -8,8 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/algesten/drv"
 homepage = "https://github.com/algesten/drv"
 description = "Derived, memoized values over plain structs"
-readme = "../README.md"
-keywords = ["memoization", "incremental", "derive", "lens", "reactive"]
+keywords = ["memoization", "incremental", "derive", "cache", "reactive"]
 categories = ["caching", "data-structures", "rust-patterns"]
 
 [features]
@@ -17,20 +16,14 @@ default = []
 # Enables pointer-equality fast-path comparisons for imbl's persistent
 # collections (Vector, HashMap, OrdMap, HashSet, OrdSet).
 imbl = ["dep:imbl"]
-# Forwards Serialize / Deserialize through Atom<T> when T implements them.
-# Only the inner atom data is serialized; the cache is always reconstructed
-# empty on deserialize.
-serde = ["dep:serde"]
 
 [dependencies]
 drv-macros = { version = "=0.2.0", path = "../drv-macros" }
 imbl = { version = "7.0.0", optional = true }
-serde = { version = "1", optional = true }
 
 [dev-dependencies]
 imbl = "7.0.0"
 rustversion = "1"
-serde = { version = "1", features = ["derive"] }
 trybuild = "1.0"
 
 [lints]

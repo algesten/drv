@@ -6,6 +6,3 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
-
-[dependencies]
-drv = { path = "../../drv" }
