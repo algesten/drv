@@ -18,12 +18,13 @@ from scratch.
 5. [Queries: desired state, not transitions](#queries-desired-state-not-transitions)
 6. [Actions as diffs](#actions-as-diffs)
 7. [The main loop](#the-main-loop)
-8. [Bridging to a reactive UI framework (SwiftUI)](#bridging-to-a-reactive-ui-framework-swiftui)
-9. [Threading model](#threading-model)
-10. [Worked example: microphone lifecycle](#worked-example-microphone-lifecycle)
-11. [Worked example: remote participants](#worked-example-remote-participants)
-12. [Testing](#testing)
-13. [Guidelines](#guidelines)
+8. [Organizing the code: crate layout](#organizing-the-code-crate-layout)
+9. [Bridging to a reactive UI framework (SwiftUI)](#bridging-to-a-reactive-ui-framework-swiftui)
+10. [Threading model](#threading-model)
+11. [Worked example: microphone lifecycle](#worked-example-microphone-lifecycle)
+12. [Worked example: remote participants](#worked-example-remote-participants)
+13. [Testing](#testing)
+14. [Guidelines](#guidelines)
 
 ---
 
@@ -274,6 +275,16 @@ would return the same action again (because the atom hasn't changed yet),
 causing a double-open. The atom write closes the loop: execute → atom
 updates → query returns Noop → no re-execution.
 
+### One driver, two crates
+
+"The driver" as described here is a unit, but it's best organised as two
+crates: a portable sync **core** (the atom + the sync `process`/`execute`
+API + the `Cmd`/`Event` types that cross to the async side) and a
+platform-specific **native** (the worker implementation — thread on
+desktop, GCD on iOS, coroutines on Android). The mpsc between them *is*
+the ABI boundary, and it's also the mock point for tests. See
+[Organizing the code](#organizing-the-code-crate-layout).
+
 ---
 
 ## Queries: desired state, not transitions
@@ -400,6 +411,199 @@ Every phase is clearly separated:
 - **Query**: reads from atoms. No writes. All memoized.
 - **Execute**: writes intent to atoms + starts async work.
 - **Render**: reads from atoms. Pushes to UI. All memoized.
+
+---
+
+## Organizing the code: crate layout
+
+Everything above describes the shape of the code at runtime. A second
+decision is *where* the code lives. The patterns below keep the model
+scalable across domains and portable across platforms.
+
+### One driver per crate pair
+
+For any app where the async side could plausibly be replaced — desktop
+thread, iOS GCD, Android coroutines, or a fake for tests — split each
+driver into **two crates**:
+
+```
+driver-<name>/
+  core/    → led-driver-<name>-core       portable: atom + sync API
+                                          + `Cmd`/`Event` ABI types
+                                          + trace trait. Pure Rust, no
+                                          platform deps.
+  native/  → led-driver-<name>-native     platform-specific: the async
+                                          worker (thread/GCD/coroutine)
+                                          connected via mpsc.
+```
+
+The **core** crate knows nothing about any platform. It holds:
+
+- The atom(s) the driver owns.
+- The sync driver struct with `process` / `execute` (or analogous)
+  methods the main loop calls.
+- The `Cmd` / `Done` / `Event` types that cross to the async worker.
+- A `Trace` trait the runtime implements to hook observable events.
+
+The **native** crate implements the async worker against those types,
+typically exposing a `spawn(trace) -> (Driver, Native)` convenience.
+Swapping native implementations per platform is the whole point of the
+split; the core crate is shared.
+
+### Multiple platforms: one native per platform, not cfg
+
+When the same driver concept exists on multiple targets (desktop / iOS /
+Android), prefer **separate `*-native-<platform>` crates** over one
+crate with `#[cfg(target_os = ...)]` inside:
+
+```
+driver-buffers/
+  core/
+  native-desktop/    Rust thread + std::fs
+  native-ios/        cdylib bridge: extern "C" shims;
+                     Swift + GCD lives in a SwiftPM package
+                     that links this
+  native-android/    cdylib bridge via jni; Kotlin + coroutines
+                     live in a Gradle module that loads it
+```
+
+Reasons:
+
+- **Deps diverge.** Desktop wants `std::fs`. iOS wants Foundation
+  bindings (e.g. `objc2` or hand-rolled FFI). Android wants `jni` and
+  whatever native libraries you bind. Each crate's `Cargo.toml` only
+  carries what it actually needs.
+- **No dead code compiled.** With cfg inside one crate, iOS still
+  parses the desktop `mod` tree even if gated out; build time and
+  error-surface both bloat. Separate crates don't pay that.
+- **Cargo.toml is the enforcement.** Separate crates let the compiler
+  stop you from accidentally calling a desktop API on iOS.
+
+Cfg *is* appropriate for small leaf differences inside an otherwise-
+shared native (e.g., a desktop native covering macOS and Linux with one
+`cfg` flip for a syscall). Top-level platform selection is the wrong
+place for it.
+
+The runtime crate picks one of the natives via **target-specific
+dependencies** in its `Cargo.toml`:
+
+```toml
+[target.'cfg(all(not(target_os = "ios"), not(target_os = "android")))'.dependencies]
+my-app-driver-buffers-native-desktop = { workspace = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+my-app-driver-buffers-native-ios = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+my-app-driver-buffers-native-android = { workspace = true }
+```
+
+That works when the shape of `spawn_drivers` is identical across
+platforms. When the runtime itself differs substantially — notably
+because the UI driver is entirely different (terminal vs SwiftUI vs
+Jetpack Compose) — prefer **parallel runtime crates** instead:
+
+```
+crates/
+  runtime-desktop/   wires terminal UI driver + desktop workers
+  runtime-ios/       wires SwiftUI bridge + iOS workers
+  runtime-android/   wires Jetpack Compose bridge + Android workers
+```
+
+Each runtime crate depends on the `*-core` crates (shared) plus the
+right `*-native-<platform>` crate. This scales cleanly when the
+platforms have genuinely different wiring needs, which they usually do.
+
+### User-decision atoms have no driver
+
+A user-decision atom is chosen, not discovered — no async side, no
+worker, no driver struct. Let it sit in a plain `state-*` crate and be
+mutated directly by dispatch in the runtime. Don't force it into the
+driver shape for consistency; the driver shape is for units that have
+an async peer.
+
+### Cross-driver composition lives in a runtime crate
+
+**Drivers must not know about each other.** `driver-foo/core/` must not
+import `driver-bar/core/` or `state-baz/`. Each driver is independently
+testable, independently swappable, independently mockable.
+
+Every memo that combines lenses from multiple drivers' atoms lives in a
+separate **runtime** crate that depends on all of them. That runtime
+crate also owns:
+
+- `Event` + `dispatch` (the user-event handler that mutates driver atoms).
+- `Trace` / unified trace sink that driver traces forward to.
+- The main loop `run` itself.
+- The platform-specific wiring that spawns native workers and builds
+  the `Drivers` bundle.
+
+Cross-platform payoff: a mobile target replaces the runtime crate
+around the same `*-core` crates; the drivers stay intact.
+
+```
+crates/
+  core/                              shared primitives (paths, id newtypes, ...)
+  state-<name>/                      user-decision atom + its own memos (self-contained)
+  driver-<name>/
+    core/                            portable sync driver + atom + ABI types
+    native/                          platform-specific async worker
+  runtime/                           cross-atom lenses + memos + dispatch + main loop
+<bin>/                               thin main: CLI parse, raw-mode guard, run
+```
+
+### Cross-crate lenses: the consumer declares its own
+
+`drv`'s macro registry is per-crate-compilation. A memo's `impl
+Into<Lens>` param is resolved against the local registry, so a consumer
+crate (e.g. `runtime`) can't use a lens name declared in a different
+crate as a memo param type. Declare the lens **locally** where the
+memo lives, with a hand-written `From<&ForeignAtom>` impl:
+
+```rust
+// In the runtime crate, projecting MicInventory from the sibling
+// driver-mic-enum/core crate.
+
+#[drv::lens]
+struct MicsLens<'a> {
+    pub mics: &'a imbl::Vector<MicDevice>,
+}
+
+impl<'a> From<&'a MicInventory> for MicsLens<'a> {
+    fn from(m: &'a MicInventory) -> Self { Self { mics: &m.mics } }
+}
+
+// Ref-clone impl so the body can forward `&lens` to a sibling memo
+// whose outer sig is `impl Into<MicsLens>`. drv auto-generates this
+// for inline lenses; for standalone ones, write it once:
+impl<'a> From<&MicsLens<'a>> for MicsLens<'a> {
+    fn from(s: &MicsLens<'a>) -> Self { Self { mics: s.mics } }
+}
+
+#[drv::memo(single)]
+fn mic_count<'a>(inv: impl Into<MicsLens<'a>>) -> usize {
+    inv.mics.len()
+}
+```
+
+The inline `#[drv::lens(Name)]` shorthand on atom fields is the
+convenient case — useful when the atom and the lens-consuming memo live
+in the same crate. The standalone form is the general one; it's what
+scales across crate boundaries.
+
+### Drop-order: don't join in `Drop`
+
+The sync driver holds the `Sender<Cmd>`; its native handle typically
+wraps a `JoinHandle<()>`. If you construct both via `let (driver, native)
+= spawn(...)`, Rust drops `native` before `driver` (reverse
+declaration order). If `native`'s `Drop` calls `join()`, it deadlocks —
+the worker is still blocked on `recv()` waiting for `driver`'s
+`Sender` to close.
+
+Safer: don't `join` in the native's `Drop`. Let the worker self-exit on
+channel hangup when the sync driver's `Sender` drops, and let process
+exit reap any straggler. If a specific test needs deterministic
+shutdown, drop the driver explicitly first.
 
 ---
 
@@ -917,6 +1121,51 @@ fn mic_action_produces_correct_diffs() {
 No mocking. No async runtime. No event loop setup. Just pure functions with
 known inputs and expected outputs.
 
+### Testing a driver at the mpsc boundary
+
+The sync driver is just `new(channels, ...) + process/execute`. In the
+driver's `*-core` crate you can test it directly against synthetic
+channel peers — no thread, no platform I/O, no other drivers:
+
+```rust
+#[test]
+fn execute_writes_pending_sync_and_emits_cmd() {
+    let (tx_cmd, rx_cmd) = mpsc::channel::<ReadCmd>();
+    let (_tx_done, rx_done) = mpsc::channel::<ReadDone>();
+    let driver = FileReadDriver::new(tx_cmd, rx_done, Arc::new(NoopTrace));
+
+    let mut store = BufferStore::default();
+    let acts = [LoadAction::Load(path.clone())];
+    driver.execute(acts.iter(), &mut store);
+
+    // (1) Sync state was written immediately.
+    assert!(matches!(store.loaded.get(&path), Some(LoadState::Pending)));
+    // (2) The command landed on the ABI boundary.
+    matches!(rx_cmd.try_recv(), Ok(ReadCmd::Read(_)));
+}
+
+#[test]
+fn process_applies_worker_completion() {
+    let (tx_cmd, _rx_cmd) = mpsc::channel::<ReadCmd>();
+    let (tx_done, rx_done) = mpsc::channel::<ReadDone>();
+    let driver = FileReadDriver::new(tx_cmd, rx_done, Arc::new(NoopTrace));
+
+    // Play the role of the native worker directly.
+    tx_done.send(ReadDone { path: path.clone(), result: Ok(rope) }).unwrap();
+
+    let mut store = BufferStore::default();
+    driver.process(&mut store);
+    assert!(matches!(store.loaded.get(&path), Some(LoadState::Ready(_))));
+}
+```
+
+The mpsc pair is the **mock point**. Tests at this layer replace the
+native worker with a directly-driven peer, which scales from unit tests
+(send one `Done`) to integration tests (script a whole session of
+`Cmd`/`Done` exchanges). Integration tests against the real native
+worker live in the `*-native` crate and can be sparser, because the
+logic above the ABI is already covered.
+
 ---
 
 ## Guidelines
@@ -968,3 +1217,46 @@ The mic enumeration driver should not know about the stream driver. The
 stream driver should not know about user preferences. Memos express the
 relationships between domains. Drivers just keep their atom in sync with
 reality.
+
+### 9. Enforce driver ignorance with crate boundaries
+
+Don't rely on discipline — put each driver in its own crate (or crate
+pair) that has no dependency on other drivers or on sibling
+user-decision state. The Cargo.toml is the constraint; the compiler
+rejects accidental coupling. Cross-atom composition lives in a separate
+runtime crate that depends on all of them.
+
+### 10. Split each driver into a portable core and a platform-specific native
+
+The sync API + atom + ABI types are the same on every platform. The
+async worker is not. Putting them in separate crates means the core
+crate compiles on every target and stays thin; the native crate is
+swapped (Rust thread / Swift + GCD / Kotlin + coroutines / mock for
+tests) without touching anything upstream.
+
+### 10a. One native crate per platform, not `cfg` inside one crate
+
+When the same driver exists on multiple platforms, ship one
+`*-native-<platform>` crate per target instead of a single native with
+`#[cfg(target_os = ...)]` gates. Separate crates keep each platform's
+dependency set narrow, avoid compiling dead code, and let the compiler
+(via `Cargo.toml`) reject accidental cross-platform calls. The runtime
+picks one via target-specific dependencies — or, when the UI differs
+substantially per platform, ships as parallel `runtime-<platform>`
+crates depending on the shared `*-core` crates plus the right native.
+
+### 11. Declare standalone lenses in the consumer crate
+
+Inline `#[drv::lens(Name)]` is for the same-crate case. When a memo in
+crate B projects an atom defined in crate A, declare a `#[drv::lens]`
+struct in crate B with a hand-written `From<&ForeignAtom>` impl — plus
+the `From<&Self>` ref-clone impl if any sibling memo in B takes
+`impl Into<ThatLens>`.
+
+### 12. Don't `join()` native workers in `Drop`
+
+The mpsc hangup is the shutdown signal: when the sync driver's `Sender`
+drops, the worker's `recv` returns `Err` and it exits. A `join()` in
+the native handle's `Drop` deadlocks whenever the native handle drops
+before the sync driver (e.g. reverse-order drops in a tuple binding).
+Let the worker self-exit; process exit reaps any straggler.
