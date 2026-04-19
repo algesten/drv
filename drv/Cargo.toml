@@ -1,6 +1,6 @@
 [package]
 name = "drv"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Martin Algesten <martin@algesten.se>"]
 edition = "2021"
 rust-version = "1.85"
@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/algesten/drv"
 homepage = "https://github.com/algesten/drv"
 description = "Derived, memoized values over plain structs"
+readme = "../README.md"
 keywords = ["memoization", "incremental", "derive", "cache", "reactive"]
 categories = ["caching", "data-structures", "rust-patterns"]
 
@@ -18,11 +19,14 @@ default = []
 imbl = ["dep:imbl"]
 
 [dependencies]
-drv-macros = { version = "=0.3.0", path = "../drv-macros" }
+drv-macros = { version = "=0.3.1", path = "../drv-macros" }
 imbl = { version = "7.0.0", optional = true }
 
 [dev-dependencies]
 imbl = "7.0.0"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true
