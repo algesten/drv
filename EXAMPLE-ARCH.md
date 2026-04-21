@@ -19,12 +19,13 @@ from scratch.
 6. [Actions as diffs](#actions-as-diffs)
 7. [The main loop](#the-main-loop)
 8. [Organizing the code: crate layout](#organizing-the-code-crate-layout)
-9. [Bridging to a reactive UI framework (SwiftUI)](#bridging-to-a-reactive-ui-framework-swiftui)
-10. [Threading model](#threading-model)
-11. [Worked example: microphone lifecycle](#worked-example-microphone-lifecycle)
-12. [Worked example: remote participants](#worked-example-remote-participants)
-13. [Testing](#testing)
-14. [Guidelines](#guidelines)
+9. [Crossing the ABI: foreign-owned buffers](#crossing-the-abi-foreign-owned-buffers)
+10. [Bridging to a reactive UI framework (SwiftUI)](#bridging-to-a-reactive-ui-framework-swiftui)
+11. [Threading model](#threading-model)
+12. [Worked example: microphone lifecycle](#worked-example-microphone-lifecycle)
+13. [Worked example: remote participants](#worked-example-remote-participants)
+14. [Testing](#testing)
+15. [Guidelines](#guidelines)
 
 ---
 
@@ -552,12 +553,60 @@ around the same `*-core` crates; the drivers stay intact.
 crates/
   core/                              shared primitives (paths, id newtypes, ...)
   state-<name>/                      user-decision source + its own memos (self-contained)
-  driver-<name>/
+  platform-<name>/                   shared platform primitive used by >1 driver
     core/                            portable sync driver + source + ABI types
     native/                          platform-specific async worker
+  driver-<name>/                     domain driver (room, mic, camera, ...)
+    core/                            portable sync driver + source + ABI types
+    native/                          platform-specific async worker
+  abi-<name>/                        stable-ABI types crossing Rust ↔ native (Swift/Kotlin)
   runtime/                           cross-source inputs + memos + dispatch + main loop
 <bin>/                               thin main: CLI parse, raw-mode guard, run
 ```
+
+### Platform drivers: shared primitives as a third tier
+
+Some drivers wrap a **platform-provided primitive** that multiple domain
+drivers need. A UDP socket driver used by a WebRTC stack *and* by an
+opportunistic peer-discovery component. An HTTP driver used by auth,
+signaling, and push. A timer driver used by everything that needs
+`wake_me_at(t)`. These are infrastructure, not domain state.
+
+They sit **below** domain drivers in the dependency graph and
+deliberately break one rule from the previous section: *cross-driver
+imports into them are expected*. A domain driver importing
+`platform-http-core`'s `Cmd` / `Event` ABI is how it speaks HTTP at
+all. The isolation rule is about stopping domain drivers from knowing
+about each other's domains — it is not about stopping them from using
+shared transport.
+
+Give them a distinct crate prefix — `platform-*` — so the role is
+visible at a glance and the exception doesn't read as drift. The
+three-tier dependency rule the `Cargo.toml` graph then enforces:
+
+- `state-*` depends on nothing (or only on shared primitive crates).
+- `platform-*` may depend on `state-*` and shared primitives; not on
+  `driver-*`.
+- `driver-*` may depend on `platform-*` and on `state-*`; must not
+  depend on other `driver-*`.
+- `runtime` depends on all of them.
+
+**Not every cross-cutting concern is a platform driver.** The criterion
+is *multiple domain drivers actively call into it* — i.e. they import
+its `Cmd` / `Event` ABI and issue requests. It is **not** *multiple
+parts of the app observe it*. A lifecycle / foreground-background
+driver has a singleton source that runtime-level memos read and feed
+into dispatch; no domain driver imports `driver-lifecycle-core`. That
+is a regular `driver-*` with a cross-cutting observer pattern, not a
+platform driver. The `platform-*` prefix is for transport and
+infrastructure that domain drivers actively issue requests to.
+
+**Shape-wise:** platform drivers are usually stateless in the domain
+sense but **multi-request**. Their source is typically a
+`HashMap<RequestId, InFlight>` keyed by caller id, not a singleton
+struct. Callers allocate request ids and correlate via events. This is
+the usual "stateless drivers need in-flight sources" pattern — the
+in-flight state is just plural.
 
 ### Cross-crate inputs: the consumer declares its own
 
@@ -608,6 +657,102 @@ exit reap any straggler. If a specific test needs deterministic
 shutdown, drop the driver explicitly first.
 
 ---
+
+## Crossing the ABI: foreign-owned buffers
+
+Mobile targets compile Rust as a static lib (iOS) or cdylib (Android)
+and hand data across a C ABI to Swift / Kotlin. For small one-shot
+values — a `bool` "is-connected", an integer count — just copy; the
+cost is nothing. For **byte buffers** — media frames, encoded packets,
+screen captures, DataChannel payloads — copying on every hop defeats
+the point of a native client.
+
+This is not a driver concern and doesn't belong in any `driver-*` or
+`platform-*` crate. It is a thin layer of **types with stable ABI and
+explicit lifetime rules**. Keep it in its own crate:
+
+```
+crates/
+  abi-buf/                  Rust-side types with stable ABI, plus matching
+                            Swift / Kotlin helper modules alongside the
+                            bindings
+```
+
+### Rust-side base type: `Arc<[u8]>`
+
+Pick `Arc<[u8]>` as the ref-counted byte container — not
+`Arc<Vec<u8>>`, and not `bytes::Bytes`:
+
+- `Arc<Vec<u8>>` has one more indirection and carries the `Vec`'s
+  capacity field you don't need. `Arc<[u8]>` is a DST: single
+  indirection, tight layout, a stable `len` right next to the payload.
+- `bytes::Bytes` adds zero-copy slicing (ref-counted subranges of one
+  allocation). That is real, but solves a problem the hot paths
+  usually don't have. When each buffer is one full packet / frame /
+  message end-to-end, slicing is unused. Pay for `Bytes` only when
+  you actually slice.
+- `Arc::<[u8]>::from(vec)` reuses the allocation — no copy at
+  construction — so a `Vec<u8>` coming out of an encoder or a
+  `Transmit { contents }` from an IO-free library converts cheaply.
+
+### Rust → native handoff
+
+Expose an opaque `#[repr(C)]` handle that carries the pointer + length
+plus a leaked `Arc<[u8]>` raw pointer. Export a `_free` extern fn that
+reconstitutes the `Arc` and drops it:
+
+```rust
+#[repr(C)]
+pub struct RustBuf {
+    pub ptr: *const u8,
+    pub len: usize,
+    handle: *const (),    // Arc::into_raw(arc) — opaque to the foreign side
+}
+
+impl RustBuf {
+    pub fn from_arc(a: Arc<[u8]>) -> Self { /* Arc::into_raw, stash ptr + len */ }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_buf_free(buf: RustBuf) {
+    unsafe { let _ = Arc::from_raw(buf.handle as *const [u8]); }
+}
+```
+
+- **Swift**: feed the `RustBuf` into
+  `Data(bytesNoCopy:count:deallocator:)` with a custom deallocator
+  that calls `rust_buf_free`. Swift ARC triggers the drop on the last
+  reference.
+- **Kotlin / Android**: wrap in `JNIEnv::NewDirectByteBuffer` and
+  attach a `Cleaner` (or a Kotlin `AutoCloseable` + `use { ... }`
+  scope) that calls `rust_buf_free` on release.
+
+Same Rust type, two foreign mappings. The ownership invariant is
+*"the foreign side is responsible for calling `_free` exactly once."*
+
+### Native → Rust handoff
+
+The common case — Swift / Kotlin passing a byte array down — doesn't
+need ref counting because the borrow is call-scoped:
+`Data.withUnsafeBytes { ptr, len in rust_fn(ptr, len) }` on Swift;
+`GetByteArrayRegion` / `GetDirectBufferAddress` on Android. Rust
+copies what it needs within that call and the foreign side retains
+ownership.
+
+Only when a buffer must outlive the call (for example, an inbound
+frame queued for async processing) does it need the symmetric shape: a
+`NativeBuf` handle with a foreign-owned free callback that Rust
+invokes when it is done. Mirror of `RustBuf`, same pattern.
+
+### What doesn't fit this shape
+
+Platform-typed GPU buffers — `CVPixelBuffer` (iOS), `HardwareBuffer` /
+`AImage` (Android) — aren't `[u8]` behind a pointer. They are opaque
+handles with their own lifecycle and retain semantics, often backed by
+GPU memory. Model these as platform-specific types in the relevant
+driver's core crate (e.g. a `platform-camera-core`'s public types),
+not in `abi-buf`. `abi-buf` is specifically for contiguous `u8`
+payloads. GPU handles get their own ABI story, crate by crate.
 
 ## Bridging to a reactive UI framework (SwiftUI)
 
@@ -1253,6 +1398,10 @@ stream driver should not know about user preferences. Memos express the
 relationships between domains. Drivers just keep their source in sync with
 reality.
 
+Exception: `platform-*` drivers (guideline 13) are shared
+infrastructure and are *meant* to be imported by multiple domain
+drivers. The ignorance rule applies between *domain* drivers.
+
 ### 9. Enforce driver ignorance with crate boundaries
 
 Don't rely on discipline — put each driver in its own crate (or crate
@@ -1293,4 +1442,28 @@ The mpsc hangup is the shutdown signal: when the sync driver's `Sender`
 drops, the worker's `recv` returns `Err` and it exits. A `join()` in
 the native handle's `Drop` deadlocks whenever the native handle drops
 before the sync driver (e.g. reverse-order drops in a tuple binding).
+
+### 13. Platform primitives go in a `platform-*` tier, not `driver-*`
+
+When a driver wraps a platform-provided primitive (UDP, HTTP, timers,
+keychain) that *multiple* domain drivers actively call into, put it in
+a `platform-<name>/` crate pair. Cross-driver imports into it are
+expected — a domain driver importing `platform-http-core`'s `Cmd`
+types is how it speaks HTTP at all. This is the one exception to
+guideline 8.
+
+The promotion criterion is *multiple domain drivers issue requests to
+it*, not *wraps a platform API* and not *observed by multiple parts of
+the app*. One-consumer wrappers stay in `driver-*`; event-observed
+singletons (lifecycle, locale) stay in `driver-*` too. Promote to
+`platform-*` only when the second *caller* appears.
+
+### 14. ABI-crossing types live in `abi-*` crates, separate from drivers
+
+Cross-language byte buffers and other stable-ABI wrappers (the kind
+that move through `extern "C"` and need matching Swift / Kotlin
+handling) don't belong in driver cores — they are type and lifetime
+contracts, not behaviours. Keep them in small `abi-*` crates that any
+driver or runtime can import. See *Crossing the ABI: foreign-owned
+buffers*.
 Let the worker self-exit; process exit reaps any straggler.
