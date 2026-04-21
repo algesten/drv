@@ -162,6 +162,70 @@ Domain: Media
 Drivers manage external-fact sources. UI handlers manage user-decision sources.
 Memos reach across domains freely via multi-input parameters.
 
+### User-decision sources keyed by external facts
+
+The temptation to merge user decisions and external facts is strongest when
+the user decision is a map or set keyed by identifiers the driver discovered:
+muted participants keyed by ids the signaling driver reported, expanded
+directories keyed by paths the FS driver listed, pinned items referencing
+entries the inventory contains.
+
+Resist. The user decision is the **key set**; the external fact is the **map
+values**. They have different lifecycles (user choices persist across
+reconnects; enumeration rebuilds) and different owners (dispatch mutates
+decisions; the driver mutates facts). Keep them in separate sources; memos
+that read both produce the combined view.
+
+```rust
+// External fact — driver-owned
+pub struct Inventory {
+    pub mics: imbl::Vector<MicDevice>,
+}
+
+// User decision — dispatch-owned, keyed by MicId the driver discovered
+pub struct MicPreference {
+    pub favorites: imbl::HashSet<MicId>,
+    pub do_not_use: imbl::HashSet<MicId>,
+}
+```
+
+The key set and the map values share an identifier type. That's not coupling
+— it's reference. Neither source needs to know about the other; a memo reads
+both and returns the combined shape.
+
+### Shadow sources
+
+Sometimes a user-decision source holds a *mutation* of an external-fact
+source rather than an independent choice: an editor's edited buffer shadows
+the pristine file on disk; an in-progress form shadows a server-side record;
+a local draft shadows the synced document.
+
+Two sources, shared key (path, record id, document id), one seeded from the
+other. Document the seeding protocol explicitly, because "seeded" is where
+the bugs hide:
+
+- **Seed on first completion.** When the external source first becomes
+  `Ready` for a key, ingest copies it into the user source.
+- **Subsequent external updates don't auto-apply.** If the disk file changes
+  again after the user has started editing, the new version is queued as a
+  reload candidate, not silently dropped into the user source.
+- **Writes are explicit.** The user source flows *out* to the external
+  source only via a deliberate save action, with explicit conflict handling.
+
+When both fields share the same underlying type, field names won't stop
+a confused assignment during a refactor. Newtype the roles so the
+compiler carries the invariant:
+
+```rust
+pub struct Synced(Arc<String>);
+pub struct Local(Arc<String>);
+
+pub struct Draft {
+    pub synced: Synced,
+    pub local:  Local,
+}
+```
+
 ---
 
 ## Drivers: the sync/async split
@@ -273,6 +337,73 @@ The synchronous write into the source is critical. Without it, the next query
 would return the same action again (because the source hasn't changed yet),
 causing a double-open. The source write closes the loop: execute → source
 updates → query returns Noop → no re-execution.
+
+### Pure output drivers
+
+Some drivers have no external-fact source to maintain — they exist only to
+push computed state out to a platform: paint a terminal frame, render a
+graphics surface, play a sound buffer, flash an LED. No hotplug, no
+incoming events; the "what should be true" is a memo in the runtime.
+
+These still follow the execute pattern. The driver's source is the
+**in-flight artifact** plus acknowledgement state:
+
+```rust
+pub struct PaintState {
+    pub in_flight: Option<FrameId>,
+    pub last_acked: Option<FrameId>,
+}
+
+impl TerminalPaintDriver {
+    pub fn execute(&self, frame: Frame, state: &mut PaintState) {
+        if state.in_flight == Some(frame.id) { return; }
+        state.in_flight = Some(frame.id);      // sync intent write
+        self.platform.paint_async(frame);      // async work
+    }
+
+    pub fn process(&self, state: &mut PaintState) {
+        while let Ok(ack) = self.rx.try_recv() {
+            state.last_acked = Some(ack.id);
+            if state.in_flight == Some(ack.id) { state.in_flight = None; }
+        }
+    }
+}
+```
+
+The point isn't tracking frames for their own sake — it's that the same
+"write intent sync, fire async, diff is Noop until Done" pattern every other
+driver uses applies here too. Without a source, paint becomes a free
+function in the runtime that can't be mocked, can't be throttled at its
+natural seat, and can't be traced with the same mechanism as every other
+driver.
+
+### Stateless drivers still need an in-flight source
+
+A driver that's purely a wrapper around a platform API — OS clipboard,
+one-shot shell command, single DNS lookup — has no persistent external-fact
+source. But it still has state while an operation is in flight ("is a read
+currently outstanding?", "is a write queued?").
+
+That state belongs on a **driver-owned source**, never piggybacked onto the
+user-decision source that triggered the operation:
+
+```rust
+// NO: flag lives on a user-decision source
+pub struct KillRing {
+    pub entries: imbl::Vector<Arc<str>>,
+    pub clipboard_read_in_flight: bool,  // ← driver state on a user source
+}
+
+// YES: minimal driver-owned source
+pub struct ClipboardState {
+    pub read: ReadState,    // Idle | InFlight
+    pub write: WriteState,  // Idle | Pending(Arc<str>)
+}
+```
+
+Without this split, the user-decision source accumulates async bookkeeping
+over time, its `PartialEq` picks up churn from driver completions, and the
+rule that says "user decisions are chosen, not discovered" quietly rots.
 
 ### One driver, two crates
 
@@ -418,6 +549,93 @@ Every phase is clearly separated:
 - **Query**: reads from sources. No writes. All memoized.
 - **Execute**: writes intent to sources + starts async work.
 - **Render**: reads from sources. Pushes to UI. All memoized.
+
+### Wake on event, don't spin
+
+Block the main thread until something actually happens — a driver
+completion, a user keystroke, a timer deadline. **Never sleep a fixed
+duration "just in case."** A 100 Hz fixed tick means 100 cache reads per
+second burning CPU for no reason on every idle moment, and adds up to one
+full tick of latency when an event arrives right after a sleep starts.
+Treat fixed-tick loops as an anti-pattern — they're easier to write for
+five minutes and a drag on the app forever after.
+
+The specific primitive depends on how the drivers are wired:
+
+**Sync drivers (std threads + `std::mpsc`).** The main thread owns a
+`Receiver<()>`; every driver, the input source, and timer machinery hold
+clones of the matching `Sender`. Drivers signal after each completion;
+input signals on each key. The loop blocks on
+`recv_timeout(nearest_deadline)`; the timeout is only there so wall-clock
+timers (toast expiry, animation frames) don't oversleep.
+
+```rust
+let wake = Wake::new();  // Sender<()> + Receiver<()>
+let drivers = spawn_drivers(trace, &wake)?;  // each gets a wake.tx clone
+
+loop {
+    // ingest → query → execute → render
+
+    // Drain stale signals — already accounted for by the ingest above.
+    while wake.rx.try_recv().is_ok() {}
+
+    let timeout = nearest_deadline(&atoms)
+        .and_then(|d| d.checked_duration_since(Instant::now()))
+        .unwrap_or(Duration::from_secs(60));
+    match wake.rx.recv_timeout(timeout) { /* ... */ }
+}
+```
+
+**Async drivers (tokio tasks).** The main task `select!`s over driver
+completion channels plus `sleep_until(nearest_deadline)`:
+
+```rust
+loop {
+    // ingest → query → execute → render
+
+    tokio::select! {
+        _ = driver_completions.recv() => {}
+        _ = input_rx.recv() => {}
+        _ = tokio::time::sleep_until(deadline) => {}
+    }
+}
+```
+
+Same shape, different primitives. Pick whichever matches the rest of the
+app; mixing is fine (a std thread can forward into a tokio channel via
+`spawn_blocking`).
+
+**Readiness signals from the OS (inotify, kqueue, epoll, socket ready).**
+Never poll these. The kernel already knows when something happened — use
+`notify`, the raw OS API, or tokio's `AsyncFd`, and have the native
+worker forward into the wake channel the instant the event fires. A
+polling layer between the kernel and your main loop is pure waste.
+
+### Centralize deadline management
+
+Any non-trivial app has multiple pending timers: a toast auto-dismiss, a
+debounced recomputation, an LSP response timeout, an animation frame.
+Hardcoding one into the loop's timeout works for the first feature; the
+second feature has to find-and-replace.
+
+Fold all pending deadlines into one query:
+
+```rust
+#[drv::memo(single)]
+fn nearest_deadline(
+    alerts: AlertsInput<'_>,
+    lsp: LspInput<'_>,
+    anim: AnimationsInput<'_>,
+) -> Option<Instant> {
+    [alerts.info_expires_at, lsp.request_deadline, anim.next_frame_at]
+        .into_iter()
+        .flatten()
+        .min()
+}
+```
+
+The loop reads one value; adding a timer means adding a field to the fold.
+This scales; ad-hoc `.unwrap_or(60s)` in the loop does not.
 
 ---
 
@@ -1201,6 +1419,36 @@ native worker with a directly-driven peer, which scales from unit tests
 worker live in the `*-native` crate and can be sparser, because the
 logic above the ABI is already covered.
 
+### Mid-layer integration tests
+
+Unit tests cover queries (pure functions) and driver cores (at the mpsc).
+End-to-end tests (real binary, real I/O) cover everything together but are
+slow and hard to diagnose. The gap between them — "does dispatch actually
+produce the right driver commands for this keystroke?" — is where plumbing
+bugs hide.
+
+Cover it with mid-layer tests: real dispatch, real runtime composition,
+but driver workers replaced by capturing mocks at the mpsc. Assert on the
+sequence of `Cmd`s emitted and on post-mutation source state:
+
+```rust
+#[test]
+fn save_keybinding_emits_save_cmd_for_dirty_active_buffer() {
+    let mut world = World::fixture_with_dirty_buffer("foo.rs");
+    let (drivers, captures) = capturing_drivers();
+
+    dispatch(Event::Key(ctrl('s')), &mut world);
+    execute(&mut world, &drivers);
+
+    assert_eq!(captures.file_write.drain(), vec![save_cmd("foo.rs")]);
+    assert!(!world.edits.pending_saves.contains(Path::new("foo.rs")));
+}
+```
+
+These catch wiring mistakes (wrong source mutated, wrong driver called,
+execute-pattern discipline broken) before they surface as mysterious
+end-to-end diffs.
+
 ---
 
 ## Guidelines
@@ -1294,3 +1542,34 @@ drops, the worker's `recv` returns `Err` and it exits. A `join()` in
 the native handle's `Drop` deadlocks whenever the native handle drops
 before the sync driver (e.g. reverse-order drops in a tuple binding).
 Let the worker self-exit; process exit reaps any straggler.
+
+### 13. Keep ABI types in the driver's `*-core` crate
+
+When a `Cmd` or `Done` carries a compound type (`DirEntry`, `FrameDelta`,
+`LspResponse`), that type lives in the driver's `*-core` crate, not in
+whichever state crate happens to consume it. Consumer crates depend on
+driver-core for ABI types, never the reverse — even when the consumer is
+the type's only reader today.
+
+Getting this backward (driver-core imports a state crate because "the
+state crate defined the type first") re-couples every driver to every
+consumer that touches its ABI, and the compiler stops catching isolation
+violations. The type always belongs on the driver side of the ABI.
+
+### 14. Zero allocation on idle ticks
+
+An idle tick should be free: every memo cache-hits, every `execute`
+iterates an empty collection, paint is skipped. Allocation on the idle
+path is a bug even when it's "only" a `Vec::new()` — it's noise in
+profiles, pressure on the allocator, and a leading indicator that a memo
+has escaped its cache.
+
+Memo outputs wrapping large data are `Arc`-wrapped (`Arc<Vec<T>>`,
+`Arc<str>`) so cache-hit clones are refcount bumps. Collections used in
+memos are `imbl` so structural sharing survives the clone. Action memos
+filter before cloning (return `Noop` rather than `Open(...)` that the
+driver will no-op on). Render walks views (`RopeSlice`, `&str`) rather
+than materializing intermediate owned collections.
+
+This discipline regresses on its own as features land. Audit the hot
+paths periodically.
