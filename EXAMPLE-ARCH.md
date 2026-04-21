@@ -662,89 +662,37 @@ shutdown, drop the driver explicitly first.
 
 Mobile targets compile Rust as a static lib (iOS) or cdylib (Android)
 and hand data across a C ABI to Swift / Kotlin. For small one-shot
-values — a `bool` "is-connected", an integer count — just copy; the
-cost is nothing. For **byte buffers** — media frames, encoded packets,
-screen captures, DataChannel payloads — copying on every hop defeats
-the point of a native client.
+values — a bool, an integer — copy; the cost is nothing. For **byte
+buffers** (media frames, encoded packets, screen captures, channel
+payloads) copying on every hop defeats the point of a native client.
 
-This is not a driver concern and doesn't belong in any `driver-*` or
-`platform-*` crate. It is a thin layer of **types with stable ABI and
-explicit lifetime rules**. Keep it in its own crate:
+This is not a driver concern. It is a thin layer of **types with
+stable ABI and explicit lifetime rules**, kept in its own
+`abi-<name>/` crate (see the crate layout above) so any driver or
+runtime can import it without pulling driver dependencies along.
 
-```
-crates/
-  abi-buf/                  Rust-side types with stable ABI, plus matching
-                            Swift / Kotlin helper modules alongside the
-                            bindings
-```
+Two directions to model:
 
-### Picking a Rust-side container
+- **Rust-owned, foreign-consumed.** A `#[repr(C)]` handle carries a
+  stable `(ptr, len)` view plus a raw pointer into whatever Rust
+  container owns the allocation, paired with an `extern "C"` free
+  function that reconstitutes and drops it. Ownership invariant: the
+  foreign side calls the free exactly once. Which Rust container the
+  handle wraps is an application choice.
 
-Which byte container your code wraps — `Arc<[u8]>`, `Arc<Vec<u8>>`,
-`bytes::Bytes`, a plain `Vec<u8>`, something else — is an application
-decision driven by what your upstream libraries hand you and whether
-you slice subranges or move whole buffers end-to-end. The ABI handle
-below wraps whichever you pick; the pattern is the same.
+- **Foreign-owned, Rust-consumed.** Usually call-scoped: the foreign
+  side lends a pointer + length for the duration of one extern call,
+  Rust copies what it needs within the call, the foreign side retains
+  ownership. When a buffer must outlive the call, mirror the shape
+  above in reverse — a foreign-owned handle with a Rust-invoked free
+  callback.
 
-### Rust → native handoff
-
-Expose an opaque `#[repr(C)]` handle that carries a stable
-`(ptr, len)` view plus a raw pointer to the underlying container.
-Export a `_free` extern fn that reconstitutes the container and drops
-it. The example below uses `Arc<[u8]>` for concreteness:
-
-```rust
-#[repr(C)]
-pub struct RustBuf {
-    pub ptr: *const u8,
-    pub len: usize,
-    handle: *const (),    // opaque to the foreign side
-}
-
-impl RustBuf {
-    pub fn from_arc(a: Arc<[u8]>) -> Self { /* Arc::into_raw, stash ptr + len */ }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_buf_free(buf: RustBuf) {
-    unsafe { let _ = Arc::from_raw(buf.handle as *const [u8]); }
-}
-```
-
-- **Swift**: feed the `RustBuf` into
-  `Data(bytesNoCopy:count:deallocator:)` with a custom deallocator
-  that calls `rust_buf_free`. Swift ARC triggers the drop on the last
-  reference.
-- **Kotlin / Android**: wrap in `JNIEnv::NewDirectByteBuffer` and
-  attach a `Cleaner` (or a Kotlin `AutoCloseable` + `use { ... }`
-  scope) that calls `rust_buf_free` on release.
-
-Same Rust type, two foreign mappings. The ownership invariant is
-*"the foreign side is responsible for calling `_free` exactly once."*
-
-### Native → Rust handoff
-
-The common case — Swift / Kotlin passing a byte array down — doesn't
-need ref counting because the borrow is call-scoped:
-`Data.withUnsafeBytes { ptr, len in rust_fn(ptr, len) }` on Swift;
-`GetByteArrayRegion` / `GetDirectBufferAddress` on Android. Rust
-copies what it needs within that call and the foreign side retains
-ownership.
-
-Only when a buffer must outlive the call (for example, an inbound
-frame queued for async processing) does it need the symmetric shape: a
-`NativeBuf` handle with a foreign-owned free callback that Rust
-invokes when it is done. Mirror of `RustBuf`, same pattern.
-
-### What doesn't fit this shape
-
-Platform-typed GPU buffers — `CVPixelBuffer` (iOS), `HardwareBuffer` /
-`AImage` (Android) — aren't `[u8]` behind a pointer. They are opaque
-handles with their own lifecycle and retain semantics, often backed by
-GPU memory. Model these as platform-specific types in the relevant
-driver's core crate (e.g. a `platform-camera-core`'s public types),
-not in `abi-buf`. `abi-buf` is specifically for contiguous `u8`
-payloads. GPU handles get their own ABI story, crate by crate.
+Platform-typed GPU buffers (`CVPixelBuffer`, `HardwareBuffer`,
+`AImage`) are out of scope for this layer — they are opaque handles
+with their own lifecycle and retain semantics, often backed by GPU
+memory. Model them as platform-specific types in the relevant
+driver's core crate rather than forcing them into a contiguous-`[u8]`
+shape.
 
 ## Bridging to a reactive UI framework (SwiftUI)
 
