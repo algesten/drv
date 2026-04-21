@@ -678,35 +678,27 @@ crates/
                             bindings
 ```
 
-### Rust-side base type: `Arc<[u8]>`
+### Picking a Rust-side container
 
-Pick `Arc<[u8]>` as the ref-counted byte container — not
-`Arc<Vec<u8>>`, and not `bytes::Bytes`:
-
-- `Arc<Vec<u8>>` has one more indirection and carries the `Vec`'s
-  capacity field you don't need. `Arc<[u8]>` is a DST: single
-  indirection, tight layout, a stable `len` right next to the payload.
-- `bytes::Bytes` adds zero-copy slicing (ref-counted subranges of one
-  allocation). That is real, but solves a problem the hot paths
-  usually don't have. When each buffer is one full packet / frame /
-  message end-to-end, slicing is unused. Pay for `Bytes` only when
-  you actually slice.
-- `Arc::<[u8]>::from(vec)` reuses the allocation — no copy at
-  construction — so a `Vec<u8>` coming out of an encoder or a
-  `Transmit { contents }` from an IO-free library converts cheaply.
+Which byte container your code wraps — `Arc<[u8]>`, `Arc<Vec<u8>>`,
+`bytes::Bytes`, a plain `Vec<u8>`, something else — is an application
+decision driven by what your upstream libraries hand you and whether
+you slice subranges or move whole buffers end-to-end. The ABI handle
+below wraps whichever you pick; the pattern is the same.
 
 ### Rust → native handoff
 
-Expose an opaque `#[repr(C)]` handle that carries the pointer + length
-plus a leaked `Arc<[u8]>` raw pointer. Export a `_free` extern fn that
-reconstitutes the `Arc` and drops it:
+Expose an opaque `#[repr(C)]` handle that carries a stable
+`(ptr, len)` view plus a raw pointer to the underlying container.
+Export a `_free` extern fn that reconstitutes the container and drops
+it. The example below uses `Arc<[u8]>` for concreteness:
 
 ```rust
 #[repr(C)]
 pub struct RustBuf {
     pub ptr: *const u8,
     pub len: usize,
-    handle: *const (),    // Arc::into_raw(arc) — opaque to the foreign side
+    handle: *const (),    // opaque to the foreign side
 }
 
 impl RustBuf {
