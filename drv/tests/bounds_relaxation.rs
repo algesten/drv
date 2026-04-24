@@ -1,15 +1,28 @@
 //! Verify that a plain source struct places no trait requirements on fields
 //! that are never projected by any input and never reached by any memo.
 //!
-//! Fields touched by an input need `Clone + PartialEq` (plus the input
-//! macro's derive requirements). Fields outside any input — and not reached
-//! via a `&Source` value-ref identity consumer — carry no bounds at all.
+//! Fields touched by an input need a `ToStatic` impl (via
+//! `#[derive(drv::Input)]` or a hand impl). Fields outside any input —
+//! and not reached via a `&Source` value-ref consumer — carry no bounds
+//! at all.
 
 use std::marker::PhantomData;
 
-/// Holds only the traits drv genuinely requires for an input field.
+/// Hand-impls `ToStatic` to exercise the escape hatch and to keep the
+/// tuple-struct shape. The only trait drv needs for an input field is
+/// `ToStatic`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tracked(pub u32);
+
+impl drv::ToStatic for Tracked {
+    type Static = Tracked;
+    fn to_static(&self) -> Tracked {
+        self.clone()
+    }
+    fn eq_static(&self, other: &Tracked) -> bool {
+        self == other
+    }
+}
 
 /// Deliberately bare — no `PartialEq`, no `Clone`, no `Debug`, no `Default`.
 /// Safe on a source as long as no input projects it and no memo consumes the
@@ -24,7 +37,7 @@ pub struct Relaxed {
     pub opaque: Opaque,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct Simple<'a> {
     pub n: &'a Tracked,
     _p: PhantomData<&'a ()>,

@@ -1,6 +1,6 @@
 [package]
 name = "drv"
-version = "0.3.1"
+version = "0.4.0"
 authors = ["Martin Algesten <martin@algesten.se>"]
 edition = "2021"
 rust-version = "1.85"
@@ -19,7 +19,7 @@ default = []
 imbl = ["dep:imbl"]
 
 [dependencies]
-drv-macros = { version = "=0.3.1", path = "../drv-macros" }
+drv-macros = { version = "=0.4.0", path = "../drv-macros" }
 imbl = { version = "7.0.0", optional = true }
 
 [dev-dependencies]
@@ -27,6 +27,13 @@ imbl = "7.0.0"
 
 [package.metadata.docs.rs]
 all-features = true
+
+# The main macro test suite uses imbl persistent collections, so it
+# requires the `imbl` feature. Run with `cargo test --features imbl` (or
+# `--all-features`).
+[[test]]
+name = "macro_tests"
+required-features = ["imbl"]
 
 [lints]
 workspace = true

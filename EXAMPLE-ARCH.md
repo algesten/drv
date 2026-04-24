@@ -126,7 +126,7 @@ directly.
 Why separate? The device driver should not need to know about user
 preferences. The UI handler should not need to know about OS enumeration.
 Memos bridge them — each memo takes one or more **inputs** (projections
-declared with `#[drv::input]`):
+declared with `#[derive(drv::Input)]`):
 
 ```rust
 #[drv::memo(single)]
@@ -837,7 +837,7 @@ memo:
 // In the runtime crate, projecting MicInventory from the sibling
 // driver-mic-enum/core crate.
 
-#[drv::input]
+#[derive(drv::Input)]
 struct MicsInput<'a> {
     pub mics: &'a imbl::Vector<MicDevice>,
 }
@@ -937,7 +937,7 @@ fn mic_picker_model<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> 
 }
 
 // Inputs for participant grid — only the fields this view needs.
-#[drv::input]
+#[derive(drv::Input)]
 struct GridParticipantsInput<'a> {
     pub participants: &'a imbl::Vector<Participant>,
 }
@@ -948,7 +948,7 @@ impl<'a> GridParticipantsInput<'a> {
     }
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct GridSettingsInput<'a> {
     pub muted: &'a imbl::HashSet<ParticipantId>,
     pub pinned: &'a Option<ParticipantId>,
@@ -1118,7 +1118,7 @@ queries, and actions at each step.
 ### Sources
 
 Sources are plain Rust structs. Inputs — the projections memos read — are
-declared separately, each with a `#[drv::input]` struct and a hand-written
+declared separately, each with a `#[derive(drv::Input)]` struct and a hand-written
 projection (a `::new` method, a `From` impl, whatever reads naturally).
 Always project only the fields the memo actually needs. Changes to
 unrelated fields (e.g., `last_enumerated` timestamp updating frequently)
@@ -1149,7 +1149,7 @@ pub struct MicCapture {
 Inputs for the queries below project only what each one reads:
 
 ```rust
-#[drv::input]
+#[derive(drv::Input)]
 struct MicListInput<'a> {
     pub permission: &'a MicPermission,
     pub mics: &'a imbl::Vector<MicDevice>,
@@ -1161,7 +1161,7 @@ impl<'a> MicListInput<'a> {
     }
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct MicSelectInput<'a> {
     pub selected: &'a Option<MicId>,
 }
@@ -1172,7 +1172,7 @@ impl<'a> MicSelectInput<'a> {
     }
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct MicCapStateInput<'a> {
     pub state: &'a CaptureState,
     pub device_id: &'a Option<MicId>,
@@ -1242,7 +1242,7 @@ fn mic_picker_model<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> 
 
 /// "What is the current mic volume?" — depends ONLY on volume_level.
 /// Audio frame updates don't trigger mic_action or mic_picker recomputation.
-#[drv::input]
+#[derive(drv::Input)]
 struct MicVolumeInput<'a> {
     pub volume_level: &'a f32,
 }
@@ -1620,7 +1620,7 @@ crates depending on the shared `*-core` crates plus the right native.
 ### 11. Declare inputs in the crate that uses them
 
 When a memo in crate B projects a source defined in crate A, declare the
-`#[drv::input]` struct in crate B alongside a hand-written projection
+`#[derive(drv::Input)]` struct in crate B alongside a hand-written projection
 (inherent `::new` method, `From` impl, etc.). The source crate stays
 plain and doesn't need `drv` as a dependency.
 

@@ -2,7 +2,7 @@
 //! a foreign crate (`drv-tests-xcrate-core`).
 //!
 //! Pattern for an input over a struct in another crate: declare the input as
-//! a standalone `#[drv::input]` struct here, then write the
+//! a standalone `#[derive(drv::Input)]` struct here, then write the
 //! `From<&foreign::Source> for MyInput` impl that projects the fields you
 //! care about. drv doesn't track the source/input association — it's only
 //! known via the `From` impl's signature.
@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 
 use drv_tests_xcrate_core::Config;
 
-#[drv::input]
+#[derive(drv::Input)]
 pub struct CountInput<'a> {
     pub count: u32,
     _p: PhantomData<&'a ()>,

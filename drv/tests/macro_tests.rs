@@ -19,7 +19,7 @@ pub struct Editor {
     pub tabs: ImVector<String>,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct VisibleLines<'a> {
     pub scroll_row: u32,
     pub viewport_rows: u32,
@@ -36,7 +36,7 @@ impl<'a> From<&'a Editor> for VisibleLines<'a> {
     }
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct TabList<'a> {
     pub content: &'a ImVector<String>,
     pub tabs: &'a ImVector<String>,
@@ -81,7 +81,7 @@ pub struct Dashboard {
     pub items: ImVector<String>,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct NotificationInput<'a> {
     pub user_name: &'a String,
     pub notification_count: u32,
@@ -106,7 +106,7 @@ fn notification_badge<'a>(input: NotificationInput<'a>) -> String {
     }
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct ItemsInput<'a> {
     pub items: &'a ImVector<String>,
 }
@@ -132,7 +132,7 @@ pub struct Summary {
     pub label: String,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct CountInput<'a> {
     pub total: usize,
     _p: PhantomData<&'a ()>,
@@ -165,7 +165,7 @@ pub struct GameState {
     pub frame_count: u64,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct PlayerInput<'a> {
     pub player_x: f32,
     pub player_y: f32,
@@ -182,7 +182,7 @@ impl<'a> From<&'a GameState> for PlayerInput<'a> {
     }
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct ScoreInput<'a> {
     pub score: u64,
     pub high_score: u64,
@@ -226,7 +226,7 @@ pub struct BufferStore {
     pub last_save: u64,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct AllBuffersInput<'a> {
     pub buffers: &'a ImHashMap<String, BufferData>,
     pub active: &'a Option<String>,
@@ -260,7 +260,7 @@ pub struct Counter {
     pub name: String,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct ValueInput<'a> {
     pub value: i64,
     _p: PhantomData<&'a ()>,
@@ -284,7 +284,7 @@ fn is_positive<'a>(input: ValueInput<'a>) -> bool {
 // 7. MULTI-INPUT — memo taking inputs from different atoms
 // ══════════════════════════════════════════════════════════════════════
 
-#[drv::input]
+#[derive(drv::Input)]
 struct EditorTabsInput<'a> {
     pub tabs: &'a ImVector<String>,
 }
@@ -295,7 +295,7 @@ impl<'a> From<&'a Editor> for EditorTabsInput<'a> {
     }
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct DashboardUserInput<'a> {
     pub user_name: &'a String,
 }
@@ -324,7 +324,7 @@ pub struct AppState {
     pub theme: String,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct AppItemsInput<'a> {
     pub items: &'a ImVector<String>,
     pub selected: &'a Option<usize>,
@@ -350,13 +350,13 @@ fn items_summary<'a>(input: AppItemsInput<'a>) -> ItemsSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, drv::Input)]
 pub struct ItemsSummary {
     pub count: usize,
     pub current: String,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct ItemsSummaryInput<'a> {
     pub count: usize,
     pub current: &'a String,
@@ -392,7 +392,7 @@ fn summary_label_full(s: &ItemsSummary) -> String {
 // 9. REENTRANCY — a memo body may invoke another memo on the same atom.
 // ══════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, drv::Input)]
 pub struct Reentrant {
     pub value: u32,
 }
@@ -416,7 +416,7 @@ pub struct MixedAtom {
     pub base: u32,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct BaseInput<'a> {
     pub base: u32,
     _p: PhantomData<&'a ()>,
@@ -465,7 +465,7 @@ pub struct ArcAtom {
     pub data: Arc<Vec<u32>>,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct ArcInput<'a> {
     pub data: &'a Arc<Vec<u32>>,
 }
@@ -509,7 +509,7 @@ pub struct CopyTest {
 }
 
 // Owned and borrowed fields side-by-side.
-#[drv::input]
+#[derive(drv::Input)]
 struct CopyMixInput<'a> {
     pub x: u32,
     pub y: &'a u32,
@@ -527,7 +527,7 @@ fn copy_mix_sum<'a>(input: CopyMixInput<'a>) -> u32 {
 }
 
 // Projection input: field names differ, types differ, reaches into nested struct.
-#[drv::input]
+#[derive(drv::Input)]
 struct ProjInput<'a> {
     pub inner_value: u32,
     pub name_ref: &'a str,
@@ -578,7 +578,7 @@ pub struct OverrideAtom {
     pub tag: String,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct OverrideInput<'a> {
     pub n: u32,
     pub tag: &'a String,
@@ -608,7 +608,7 @@ pub struct CacheBehaviorAtom {
     pub value: u32,
 }
 
-#[drv::input]
+#[derive(drv::Input)]
 struct CbInput<'a> {
     pub value: u32,
     _p: PhantomData<&'a ()>,
@@ -1291,6 +1291,251 @@ fn lru_evicts_least_recently_used() {
 
     assert_eq!(lru_memo((&b).into()), 1002);
     assert_eq!(LRU_COMPUTES.load(Ordering::SeqCst), 4);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 16. NESTED INPUTS — a parent drv::Input with child drv::Input fields.
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NestedAtom {
+    pub a: ImVector<u32>,
+    pub b: ImVector<u32>,
+    pub unrelated: u32,
+}
+
+#[derive(drv::Input)]
+struct NestChildA<'a> {
+    pub a: &'a ImVector<u32>,
+}
+
+impl<'a> From<&'a NestedAtom> for NestChildA<'a> {
+    fn from(n: &'a NestedAtom) -> Self {
+        Self { a: &n.a }
+    }
+}
+
+#[derive(drv::Input)]
+struct NestChildB<'a> {
+    pub b: &'a ImVector<u32>,
+}
+
+impl<'a> From<&'a NestedAtom> for NestChildB<'a> {
+    fn from(n: &'a NestedAtom) -> Self {
+        Self { b: &n.b }
+    }
+}
+
+#[derive(drv::Input)]
+struct NestParent<'a> {
+    pub child_a: NestChildA<'a>,
+    pub child_b: NestChildB<'a>,
+}
+
+impl<'a> From<&'a NestedAtom> for NestParent<'a> {
+    fn from(n: &'a NestedAtom) -> Self {
+        Self {
+            child_a: NestChildA::from(n),
+            child_b: NestChildB::from(n),
+        }
+    }
+}
+
+static NESTED_SUM_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo(single)]
+fn nested_sum<'a>(input: NestParent<'a>) -> u32 {
+    NESTED_SUM_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    input.child_a.a.iter().sum::<u32>() + input.child_b.b.iter().sum::<u32>()
+}
+
+#[test]
+fn nested_inputs_compose() {
+    NESTED_SUM_COMPUTES.store(0, Ordering::SeqCst);
+
+    let mut atom = NestedAtom {
+        a: ImVector::from(vec![1u32, 2, 3]),
+        b: ImVector::from(vec![10u32, 20]),
+        unrelated: 0,
+    };
+
+    assert_eq!(nested_sum((&atom).into()), 36);
+    assert_eq!(NESTED_SUM_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Same input → cache hit.
+    assert_eq!(nested_sum((&atom).into()), 36);
+    assert_eq!(NESTED_SUM_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Mutating unrelated → still a hit (not projected).
+    atom.unrelated = 99;
+    assert_eq!(nested_sum((&atom).into()), 36);
+    assert_eq!(NESTED_SUM_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Mutating a → miss.
+    atom.a.push_back(4);
+    assert_eq!(nested_sum((&atom).into()), 40);
+    assert_eq!(NESTED_SUM_COMPUTES.load(Ordering::SeqCst), 2);
+
+    // Cloning atom + pushing to clone diverges pointers → miss.
+    let mut clone = atom.clone();
+    clone.a.push_back(5);
+    assert_eq!(nested_sum((&clone).into()), 45);
+    assert_eq!(NESTED_SUM_COMPUTES.load(Ordering::SeqCst), 3);
+
+    // Going back to the earlier-cached shape — miss again because cache
+    // is single-slot.
+    assert_eq!(nested_sum((&atom).into()), 40);
+    assert_eq!(NESTED_SUM_COMPUTES.load(Ordering::SeqCst), 4);
+}
+
+// ── Mixed parent: nested drv::Input + reference field + plain owned field ──
+
+#[derive(drv::Input)]
+struct NestMixed<'a> {
+    pub child_a: NestChildA<'a>,
+    pub label: &'a String,
+    pub tag: u32,
+}
+
+impl<'a> NestMixed<'a> {
+    fn new(atom: &'a NestedAtom, label: &'a String, tag: u32) -> Self {
+        Self {
+            child_a: NestChildA::from(atom),
+            label,
+            tag,
+        }
+    }
+}
+
+static MIXED_NESTED_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo(single)]
+fn mixed_nested<'a>(input: NestMixed<'a>) -> String {
+    MIXED_NESTED_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    format!(
+        "{}:{}:{}",
+        input.label,
+        input.tag,
+        input.child_a.a.iter().sum::<u32>()
+    )
+}
+
+#[test]
+fn nested_inputs_alongside_plain_and_reference_fields() {
+    MIXED_NESTED_COMPUTES.store(0, Ordering::SeqCst);
+
+    let atom = NestedAtom {
+        a: ImVector::from(vec![1u32, 2, 3]),
+        b: ImVector::new(),
+        unrelated: 0,
+    };
+    let label = String::from("hello");
+
+    assert_eq!(mixed_nested(NestMixed::new(&atom, &label, 7)), "hello:7:6");
+    assert_eq!(MIXED_NESTED_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Same → hit.
+    assert_eq!(mixed_nested(NestMixed::new(&atom, &label, 7)), "hello:7:6");
+    assert_eq!(MIXED_NESTED_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Change tag (plain owned field) → miss.
+    assert_eq!(mixed_nested(NestMixed::new(&atom, &label, 8)), "hello:8:6");
+    assert_eq!(MIXED_NESTED_COMPUTES.load(Ordering::SeqCst), 2);
+
+    // Change label (reference field) → miss.
+    let label2 = String::from("world");
+    assert_eq!(mixed_nested(NestMixed::new(&atom, &label2, 8)), "world:8:6");
+    assert_eq!(MIXED_NESTED_COMPUTES.load(Ordering::SeqCst), 3);
+}
+
+// ── Three-level nesting: grandparent → parent → child ──
+
+#[derive(drv::Input)]
+struct NestGrand<'a> {
+    pub inner: NestParent<'a>,
+    pub extra: u32,
+}
+
+static GRAND_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo(single)]
+fn grand_sum<'a>(input: NestGrand<'a>) -> u32 {
+    GRAND_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    input.inner.child_a.a.iter().sum::<u32>()
+        + input.inner.child_b.b.iter().sum::<u32>()
+        + input.extra
+}
+
+#[test]
+fn three_level_nested_inputs() {
+    GRAND_COMPUTES.store(0, Ordering::SeqCst);
+
+    let mut atom = NestedAtom {
+        a: ImVector::from(vec![1u32, 2]),
+        b: ImVector::from(vec![10u32]),
+        unrelated: 0,
+    };
+
+    let g = NestGrand {
+        inner: NestParent::from(&atom),
+        extra: 100,
+    };
+    assert_eq!(grand_sum(g), 113);
+    assert_eq!(GRAND_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Same shape → hit.
+    let g2 = NestGrand {
+        inner: NestParent::from(&atom),
+        extra: 100,
+    };
+    assert_eq!(grand_sum(g2), 113);
+    assert_eq!(GRAND_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Change `extra` at grandparent level → miss.
+    let g3 = NestGrand {
+        inner: NestParent::from(&atom),
+        extra: 200,
+    };
+    assert_eq!(grand_sum(g3), 213);
+    assert_eq!(GRAND_COMPUTES.load(Ordering::SeqCst), 2);
+
+    // Change at leaf (atom.a) → miss.
+    atom.a.push_back(3);
+    let g4 = NestGrand {
+        inner: NestParent::from(&atom),
+        extra: 200,
+    };
+    assert_eq!(grand_sum(g4), 216);
+    assert_eq!(GRAND_COMPUTES.load(Ordering::SeqCst), 3);
+}
+
+// ── Nested input passed by reference: `fn memo(&NestParent<'a>)` ──
+
+static NESTED_BY_REF_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo(single)]
+fn nested_by_ref<'a>(input: &NestParent<'a>) -> u32 {
+    NESTED_BY_REF_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    input.child_a.a.len() as u32 + input.child_b.b.len() as u32
+}
+
+#[test]
+fn nested_input_by_reference() {
+    NESTED_BY_REF_COMPUTES.store(0, Ordering::SeqCst);
+
+    let atom = NestedAtom {
+        a: ImVector::from(vec![1u32, 2, 3]),
+        b: ImVector::from(vec![10u32, 20]),
+        unrelated: 0,
+    };
+
+    let parent = NestParent::from(&atom);
+    assert_eq!(nested_by_ref(&parent), 5);
+    assert_eq!(NESTED_BY_REF_COMPUTES.load(Ordering::SeqCst), 1);
+
+    let parent2 = NestParent::from(&atom);
+    assert_eq!(nested_by_ref(&parent2), 5);
+    assert_eq!(NESTED_BY_REF_COMPUTES.load(Ordering::SeqCst), 1);
 }
 
 #[test]

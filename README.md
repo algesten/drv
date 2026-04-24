@@ -8,11 +8,11 @@
 
 Memoize a function with `#[drv::memo]`. The attribute is liberal about
 parameter types — owned values, references, struct refs, `&str`,
-`&[u8]` — and caches results in a per-memo thread-local slot array
-keyed by value equality.
+`&[u8]`, `#[derive(drv::Input)]` projections — and caches results in a
+per-memo thread-local slot array keyed by value equality.
 
 ```rust
-#[derive(Debug, Clone, PartialEq)]
+#[derive(drv::Input)]
 pub struct Config {
     pub threads: u32,
     pub timeout_ms: u64,
@@ -28,26 +28,27 @@ assert_eq!(worker_count(&c), 8);   // computes
 assert_eq!(worker_count(&c), 8);   // cache hit, no work
 ```
 
-The companion attribute `#[drv::input]` is a helper for one specific
-situation: when you want to cache on a *subset* of a source struct's
-fields without cloning the whole struct on every call. See
+The companion derive `#[derive(drv::Input)]` is a helper for one
+specific situation: when you want to cache on a *subset* of a source
+struct's fields without cloning the whole struct on every call. See
 [Zero-copy projections](#zero-copy-projections-with-drvinput).
 
 ## Why drv
 
 - **Equality-keyed, not hash-keyed.** No hashing on the hot path, no
   `HashMap` probe. Cache lookup is a linear scan through a fixed-shape
-  slot array with per-field `PartialEq`.
+  slot array with per-field equality.
 - **Thread-local caches.** Every memo owns its own cache —
   single-writer, lock-free.
-- **Zero allocations on cache hit.** A hit is `PartialEq` plus a
+- **Zero allocations on cache hit.** A hit is an equality check plus a
   `Clone` of the output.
 - **O(1) cache-hit check for `Arc<T>` and `imbl` collections.** A
   pointer-equality fast path skips deep comparison when the field's
   pointer hasn't changed since the last miss.
-- **Small public surface.** `#[drv::memo]` is all you need for the
-  common case; `#[drv::input]` is an opt-in helper for borrowed
-  projections.
+- **One concept for inputs.** `#[derive(drv::Input)]` is the single
+  opt-in: any struct you want as a memo parameter derives it. Plain
+  structs, borrowed projections, and nested-input bundles all work
+  the same way.
 
 ## Writing a memo
 
@@ -60,35 +61,37 @@ Every memo picks a cache strategy:
 
 ### Parameters
 
-| You write | Needs `#[drv::input]` | Notes |
-|---|---|---|
-| `x: T` |  | `T: Clone + PartialEq + 'static` |
-| `x: &T` |  | `T: ?Sized + ToOwned` (e.g. `&str` → `String`) |
-| `x: MyInput<'a>` | ✅ | |
-| `x: &MyInput<'a>` | ✅ | |
+Every parameter must implement [`ToStatic`]. That trait is implemented
+by drv for primitives, `String`, `Vec<T>`, `HashMap`, `Arc<T>`, imbl
+collections (feature-gated), `Option<T>`, tuples, and — via a
+reference blanket — `&T` for any `T: ToStatic`. User types become
+inputs by adding `#[derive(drv::Input)]`.
 
-Any by-value type whose last path segment carries a lifetime argument
-(`MyInput<'a>`) is treated as a borrowed projection and must be tagged
-`#[drv::input]`. Everything else — owned values, `&str`, `&[u8]`,
-`&MyStruct`, etc. — works without the helper.
+| You write | Needs `#[derive(drv::Input)]` | Notes |
+|---|---|---|
+| `x: T` (primitive, std type) |  | Shipped impl. |
+| `x: &str`, `x: &[u8]` |  | Reference blanket. |
+| `x: Arc<T>` |  | ptr_eq fast path. |
+| `x: MyInput<'a>` | ✅ | Borrowed projection. |
+| `x: &MyStruct` | ✅ | Plain owned struct. |
 
 Bodies see the exact type you declared: strip `#[drv::memo]` and the
 function still compiles.
 
-## Zero-copy projections with `#[drv::input]`
+## Zero-copy projections with `#[derive(drv::Input)]`
 
 Take the previous `Config` example. If `Config` grows a big
 `Vec<Worker>` field that `worker_count` doesn't read, the default
 `&Config` form still snapshots the whole struct into the cache slot
-via `Clone`, and every cache-hit check compares the whole thing.
+and every cache-hit check compares the whole thing.
 
-`#[drv::input]` lets you declare a lightweight view that borrows only
-the fields the memo actually depends on. The macro auto-generates the
-owned snapshot, the `PartialEq` against it, and the snapshot method
-`#[drv::memo]` uses internally:
+`#[derive(drv::Input)]` lets you declare a lightweight view that
+borrows only the fields the memo actually depends on. The derive
+auto-generates the owned snapshot and the machinery `#[drv::memo]`
+uses internally:
 
 ```rust
-#[drv::input]
+#[derive(drv::Input)]
 struct TotalInput<'a> {
     pub hits: &'a Vec<u32>,
 }
@@ -113,17 +116,41 @@ invalidate; changes to `hits` do. The projection is whatever code you
 write — a `::new` method, a `From<&Source>` impl, or an inline struct
 literal at the call site. drv doesn't prescribe one.
 
+## Nested inputs
+
+A `#[derive(drv::Input)]` struct can have another
+`#[derive(drv::Input)]` struct as a field — useful for bundling a
+handful of sub-projections into one memo parameter:
+
+```rust
+#[derive(drv::Input)]
+struct ChildA<'a> { pub a: &'a Vec<u32> }
+
+#[derive(drv::Input)]
+struct ChildB<'a> { pub b: &'a Vec<u32> }
+
+#[derive(drv::Input)]
+struct Both<'a> {
+    pub ca: ChildA<'a>,
+    pub cb: ChildB<'a>,
+}
+
+#[drv::memo(single)]
+fn sum_both<'a>(input: Both<'a>) -> u32 {
+    input.ca.a.iter().sum::<u32>() + input.cb.b.iter().sum::<u32>()
+}
+```
+
 ## Performance
 
 Two sources of per-call work:
 
-1. **Per-field `PartialEq`** on the cache-hit check.
+1. **Per-field equality check** on cache-hit lookup.
 2. **Output `Clone`** on every return.
 
-drv wires `FastEq` into the per-field comparison so that `Arc<T>` and
-(with the `imbl` feature) `imbl`'s persistent collections take a
-pointer-equality fast path — O(1) when the field hasn't been mutated
-since the last miss.
+drv's `ToStatic` impls for `Arc<T>` and (under the `imbl` feature)
+`imbl`'s persistent collections take a pointer-equality fast path —
+O(1) when the field hasn't been mutated since the last miss.
 
 | Type | `Clone` | Cache hit (same pointer) | Cache hit (equal contents) | Mutation |
 |------|-------|--------------------------|----------------------------|----------|
@@ -141,7 +168,7 @@ Enable `imbl`:
 
 ```toml
 [dependencies]
-drv = { version = "0.2", features = ["imbl"] }
+drv = { version = "0.4", features = ["imbl"] }
 ```
 
 ## Comparison
