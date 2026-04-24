@@ -57,11 +57,15 @@
 //!
 //! ## Parameters
 //!
-//! Every parameter must implement [`ToStatic`]. That trait is implemented
-//! by drv for primitives, `String`, `Vec<T>`, `HashMap`, `Arc<T>`, imbl
-//! collections (feature-gated), `Option<T>`, tuples, and — via a
-//! reference blanket — `&T` for any `T: ToStatic`. User types become
-//! inputs by adding `#[derive(drv::Input)]`.
+//! Every parameter must implement [`ToStatic`]. That trait is
+//! implemented by drv for primitives, `String`, `Arc<T>`, imbl
+//! collections (feature-gated), and — via a reference blanket — `&T`
+//! for any `T: ToStatic`. Containers (`Vec`, `Option`, tuples, arrays,
+//! `HashMap` / `HashSet` / `BTreeMap` / `BTreeSet`) are recursive:
+//! they implement `ToStatic` whenever their elements do, so nested
+//! projections like `Vec<MyInput<'a>>` work without any extra
+//! annotation. User types become inputs by adding
+//! `#[derive(drv::Input)]`.
 //!
 //! | You write | Needs `#[derive(drv::Input)]` | Notes |
 //! |---|---|---|
@@ -146,6 +150,12 @@
 //! }
 //! ```
 //!
+//! `Vec`, `Option`, tuples, `HashMap` / `BTreeMap` values, and arrays
+//! are all recursive — a field type like `Vec<MyInput<'a>>` or
+//! `HashMap<String, MyInput<'a>>` works without any extra annotation.
+//! The derive handles generic type parameters, tuple structs, and unit
+//! structs as well.
+//!
 //! # Performance
 //!
 //! Two sources of per-call work:
@@ -213,16 +223,21 @@
 /// Convert a memo input to its `'static` cache-storage form.
 ///
 /// Every type passed to a `#[drv::memo]` must implement `ToStatic`. drv
-/// ships impls for primitives, `String`, `Vec<T>`, `HashMap`, `HashSet`,
-/// `BTreeMap`, `BTreeSet`, `Arc<T>`, `Option<T>`, tuples up to arity 5,
-/// `&T` (for any `T: ToStatic`), `str`, `[T]`, and (under `feature =
-/// "imbl"`) imbl's persistent collections. User types get `ToStatic` via
-/// `#[derive(drv::Input)]`.
+/// ships impls for primitives, `String`, `Arc<T>`, `&T` (for any `T:
+/// ToStatic`), `str`, and (under `feature = "imbl"`) imbl's persistent
+/// collections. Container types — `Vec<T>`, `[T]`, `[T; N]`,
+/// `Option<T>`, tuples up to arity 5, `HashMap<K, V>`, `HashSet<K>`,
+/// `BTreeMap<K, V>`, `BTreeSet<K>` — are *recursive*: they implement
+/// `ToStatic` whenever their element types do, so things like
+/// `Vec<MyInput<'a>>` and `HashMap<String, MyInput<'a>>` work. User
+/// types get `ToStatic` via `#[derive(drv::Input)]`.
 ///
 /// `Arc<T>` and imbl collections take a pointer-equality fast path in
 /// `eq_static`: if the stored snapshot and the current input share a
 /// root pointer, the equality check short-circuits without walking the
-/// contents.
+/// contents. Because the recursive container impls go through each
+/// element's own `eq_static`, this fast path is preserved inside
+/// containers too (e.g. `Vec<Arc<T>>` benefits per element).
 ///
 /// # Why "ToStatic"?
 ///
@@ -310,26 +325,38 @@ impl ToStatic for str {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Vec<T> / [T].
+// Vec<T> / [T] / [T; N] — recursive so `Vec<MyInput<'a>>` and friends
+// work. For plain element types (`u32`, `Arc<T>`, etc.) where
+// `T::Static = T`, this reduces to the identity behavior.
 // ────────────────────────────────────────────────────────────────────
 
-impl<T: Clone + PartialEq + 'static> ToStatic for Vec<T> {
-    type Static = Vec<T>;
-    fn to_static(&self) -> Vec<T> {
-        self.clone()
+impl<T: ToStatic> ToStatic for Vec<T> {
+    type Static = Vec<T::Static>;
+    fn to_static(&self) -> Vec<T::Static> {
+        self.iter().map(T::to_static).collect()
     }
-    fn eq_static(&self, other: &Vec<T>) -> bool {
-        self == other
+    fn eq_static(&self, other: &Vec<T::Static>) -> bool {
+        self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a.eq_static(b))
     }
 }
 
-impl<T: Clone + PartialEq + 'static> ToStatic for [T] {
-    type Static = Vec<T>;
-    fn to_static(&self) -> Vec<T> {
-        self.to_vec()
+impl<T: ToStatic> ToStatic for [T] {
+    type Static = Vec<T::Static>;
+    fn to_static(&self) -> Vec<T::Static> {
+        self.iter().map(T::to_static).collect()
     }
-    fn eq_static(&self, other: &Vec<T>) -> bool {
-        self == other.as_slice()
+    fn eq_static(&self, other: &Vec<T::Static>) -> bool {
+        self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a.eq_static(b))
+    }
+}
+
+impl<T: ToStatic, const N: usize> ToStatic for [T; N] {
+    type Static = [T::Static; N];
+    fn to_static(&self) -> [T::Static; N] {
+        std::array::from_fn(|i| self[i].to_static())
+    }
+    fn eq_static(&self, other: &[T::Static; N]) -> bool {
+        (0..N).all(|i| self[i].eq_static(&other[i]))
     }
 }
 
@@ -337,57 +364,83 @@ impl<T: Clone + PartialEq + 'static> ToStatic for [T] {
 // std collections.
 // ────────────────────────────────────────────────────────────────────
 
+// Recursive so `HashMap<String, MyInput<'a>>` and friends work. Lookups
+// in `eq_static` go via `K::Static: Borrow<K>`, so no key allocation on
+// the cache-hit path for the common cases (`K::Static = K`).
+
 impl<K, V> ToStatic for std::collections::HashMap<K, V>
 where
-    K: Clone + Eq + std::hash::Hash + 'static,
-    V: Clone + PartialEq + 'static,
+    K: ToStatic + Eq + std::hash::Hash,
+    V: ToStatic,
+    K::Static: Eq + std::hash::Hash + std::borrow::Borrow<K>,
 {
-    type Static = std::collections::HashMap<K, V>;
+    type Static = std::collections::HashMap<K::Static, V::Static>;
     fn to_static(&self) -> Self::Static {
-        self.clone()
+        self.iter()
+            .map(|(k, v)| (k.to_static(), v.to_static()))
+            .collect()
     }
     fn eq_static(&self, other: &Self::Static) -> bool {
-        self == other
+        if self.len() != other.len() {
+            return false;
+        }
+        self.iter()
+            .all(|(k, v)| other.get(k).is_some_and(|ov| v.eq_static(ov)))
     }
 }
 
 impl<K> ToStatic for std::collections::HashSet<K>
 where
-    K: Clone + Eq + std::hash::Hash + 'static,
+    K: ToStatic + Eq + std::hash::Hash,
+    K::Static: Eq + std::hash::Hash + std::borrow::Borrow<K>,
 {
-    type Static = std::collections::HashSet<K>;
+    type Static = std::collections::HashSet<K::Static>;
     fn to_static(&self) -> Self::Static {
-        self.clone()
+        self.iter().map(K::to_static).collect()
     }
     fn eq_static(&self, other: &Self::Static) -> bool {
-        self == other
+        self.len() == other.len() && self.iter().all(|k| other.contains(k))
     }
 }
 
 impl<K, V> ToStatic for std::collections::BTreeMap<K, V>
 where
-    K: Clone + Ord + 'static,
-    V: Clone + PartialEq + 'static,
+    K: ToStatic + Ord,
+    V: ToStatic,
+    K::Static: Ord + std::borrow::Borrow<K>,
 {
-    type Static = std::collections::BTreeMap<K, V>;
+    type Static = std::collections::BTreeMap<K::Static, V::Static>;
     fn to_static(&self) -> Self::Static {
-        self.clone()
+        self.iter()
+            .map(|(k, v)| (k.to_static(), v.to_static()))
+            .collect()
     }
     fn eq_static(&self, other: &Self::Static) -> bool {
-        self == other
+        if self.len() != other.len() {
+            return false;
+        }
+        // BTreeMap iteration is sorted; zip-compare avoids per-key lookups.
+        self.iter().zip(other.iter()).all(|((k1, v1), (k2, v2))| {
+            <K::Static as std::borrow::Borrow<K>>::borrow(k2) == k1 && v1.eq_static(v2)
+        })
     }
 }
 
 impl<K> ToStatic for std::collections::BTreeSet<K>
 where
-    K: Clone + Ord + 'static,
+    K: ToStatic + Ord,
+    K::Static: Ord + std::borrow::Borrow<K>,
 {
-    type Static = std::collections::BTreeSet<K>;
+    type Static = std::collections::BTreeSet<K::Static>;
     fn to_static(&self) -> Self::Static {
-        self.clone()
+        self.iter().map(K::to_static).collect()
     }
     fn eq_static(&self, other: &Self::Static) -> bool {
-        self == other
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|(a, b)| <K::Static as std::borrow::Borrow<K>>::borrow(b) == a)
     }
 }
 

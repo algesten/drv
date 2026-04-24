@@ -1,6 +1,6 @@
 [package]
 name = "drv-macros"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Martin Algesten <martin@algesten.se>"]
 edition = "2021"
 rust-version = "1.85"

@@ -61,11 +61,15 @@ Every memo picks a cache strategy:
 
 ### Parameters
 
-Every parameter must implement [`ToStatic`]. That trait is implemented
-by drv for primitives, `String`, `Vec<T>`, `HashMap`, `Arc<T>`, imbl
-collections (feature-gated), `Option<T>`, tuples, and — via a
-reference blanket — `&T` for any `T: ToStatic`. User types become
-inputs by adding `#[derive(drv::Input)]`.
+Every parameter must implement [`ToStatic`]. That trait is
+implemented by drv for primitives, `String`, `Arc<T>`, imbl
+collections (feature-gated), and — via a reference blanket — `&T`
+for any `T: ToStatic`. Containers (`Vec`, `Option`, tuples, arrays,
+`HashMap` / `HashSet` / `BTreeMap` / `BTreeSet`) are recursive:
+they implement `ToStatic` whenever their elements do, so nested
+projections like `Vec<MyInput<'a>>` work without any extra
+annotation. User types become inputs by adding
+`#[derive(drv::Input)]`.
 
 | You write | Needs `#[derive(drv::Input)]` | Notes |
 |---|---|---|
@@ -140,6 +144,12 @@ fn sum_both<'a>(input: Both<'a>) -> u32 {
     input.ca.a.iter().sum::<u32>() + input.cb.b.iter().sum::<u32>()
 }
 ```
+
+`Vec`, `Option`, tuples, `HashMap` / `BTreeMap` values, and arrays
+are all recursive — a field type like `Vec<MyInput<'a>>` or
+`HashMap<String, MyInput<'a>>` works without any extra annotation.
+The derive handles generic type parameters, tuple structs, and unit
+structs as well.
 
 ## Performance
 

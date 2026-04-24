@@ -417,15 +417,27 @@ fn path_last_has_lifetime(path: &syn::Path) -> bool {
 }
 
 /// Derive the snapshot struct path from a drv::Input type's path:
-/// replace the last segment's ident with `__Drv<Ident>` and drop its
-/// generic args (the snapshot struct is `'static` and has no generics).
+/// rename the last segment's ident to `__Drv<Ident>` and drop lifetime
+/// args (the snapshot struct is `'static`). Type and const args are
+/// preserved so `MyInput<'a, T>` → `__DrvMyInput<T>`.
 fn snapshot_path_from_input(input_path: &syn::Path) -> Result<syn::Path, syn::Error> {
     let mut snap = input_path.clone();
     let last = snap.segments.last_mut().ok_or_else(|| {
         syn::Error::new_spanned(input_path, "input type must have at least one path segment")
     })?;
     last.ident = format_ident!("__Drv{}", last.ident);
-    last.arguments = PathArguments::None;
+    if let PathArguments::AngleBracketed(args) = &mut last.arguments {
+        args.args = args
+            .args
+            .iter()
+            .filter(|a| !matches!(a, GenericArgument::Lifetime(_)))
+            .cloned()
+            .collect();
+        // If nothing left after filtering, drop the brackets entirely.
+        if args.args.is_empty() {
+            last.arguments = PathArguments::None;
+        }
+    }
     Ok(snap)
 }
 

@@ -1538,6 +1538,460 @@ fn nested_input_by_reference() {
     assert_eq!(NESTED_BY_REF_COMPUTES.load(Ordering::SeqCst), 1);
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// 17. TUPLE-STRUCT NEWTYPES as drv::Input.
+// ══════════════════════════════════════════════════════════════════════
+
+/// Newtype wrapping a primitive — common pattern for typed ids.
+#[derive(Debug, Copy, Clone, PartialEq, drv::Input)]
+pub struct UserId(pub u64);
+
+/// Newtype wrapping an owned container.
+#[derive(Debug, Clone, PartialEq, drv::Input)]
+pub struct Tags(pub Vec<String>);
+
+#[drv::memo(single)]
+fn user_id_doubled(id: UserId) -> u64 {
+    id.0 * 2
+}
+
+#[drv::memo(single)]
+fn tag_count(t: &Tags) -> usize {
+    t.0.len()
+}
+
+#[test]
+fn tuple_struct_newtype_id_input() {
+    let id = UserId(21);
+    assert_eq!(user_id_doubled(id), 42);
+    assert_eq!(user_id_doubled(UserId(21)), 42); // hit
+    assert_eq!(user_id_doubled(UserId(100)), 200); // miss
+}
+
+#[test]
+fn tuple_struct_newtype_with_owned_container() {
+    let t = Tags(vec!["a".into(), "b".into(), "c".into()]);
+    assert_eq!(tag_count(&t), 3);
+    let t2 = Tags(vec!["a".into(), "b".into(), "c".into()]);
+    assert_eq!(tag_count(&t2), 3); // hit by value equality
+    let t3 = Tags(vec!["a".into(), "b".into()]);
+    assert_eq!(tag_count(&t3), 2); // miss
+}
+
+/// Multi-field tuple struct.
+#[derive(Debug, Clone, PartialEq, drv::Input)]
+pub struct Pair(pub u32, pub String);
+
+#[drv::memo(single)]
+fn pair_label(p: &Pair) -> String {
+    format!("{}:{}", p.0, p.1)
+}
+
+#[test]
+fn tuple_struct_multi_field() {
+    let p = Pair(7, "hi".into());
+    assert_eq!(pair_label(&p), "7:hi");
+    assert_eq!(pair_label(&Pair(7, "hi".into())), "7:hi"); // hit
+    assert_eq!(pair_label(&Pair(7, "bye".into())), "7:bye"); // miss
+    assert_eq!(pair_label(&Pair(8, "bye".into())), "8:bye"); // miss
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 18. GENERIC drv::Input — type params, const generics, where-clauses.
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(drv::Input)]
+struct GenericOne<'a, T: drv::ToStatic + Clone + PartialEq + 'static> {
+    pub xs: &'a Vec<T>,
+}
+
+#[drv::memo(single)]
+fn generic_sum<'a>(input: GenericOne<'a, u32>) -> u32 {
+    input.xs.iter().sum()
+}
+
+#[derive(drv::Input)]
+struct GenericWhere<T>
+where
+    T: drv::ToStatic + Clone + PartialEq + 'static,
+{
+    pub a: T,
+    pub b: T,
+}
+
+#[drv::memo(single)]
+fn generic_where_eq(input: GenericWhere<u32>) -> bool {
+    input.a == input.b
+}
+
+#[derive(drv::Input)]
+struct WithArray {
+    pub arr: [u32; 4],
+}
+
+#[drv::memo(single)]
+fn array_sum(input: &WithArray) -> u32 {
+    input.arr.iter().sum()
+}
+
+#[test]
+fn generic_type_params() {
+    let data = vec![1u32, 2, 3];
+    assert_eq!(generic_sum(GenericOne { xs: &data }), 6);
+    assert_eq!(generic_sum(GenericOne { xs: &data }), 6);
+}
+
+#[test]
+fn generic_where_clause() {
+    assert!(generic_where_eq(GenericWhere { a: 7, b: 7 }));
+    assert!(!generic_where_eq(GenericWhere { a: 7, b: 8 }));
+}
+
+#[test]
+fn const_generic_array_field() {
+    let w = WithArray { arr: [1, 2, 3, 4] };
+    assert_eq!(array_sum(&w), 10);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 19. CONTAINER-NESTED drv::Input — Vec<MyInput<'a>> etc.
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(drv::Input)]
+struct Item<'a> {
+    pub name: &'a String,
+    pub qty: u32,
+}
+
+#[derive(drv::Input)]
+struct Basket<'a> {
+    pub items: Vec<Item<'a>>,
+}
+
+static BASKET_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo(single)]
+fn basket_total<'a>(input: Basket<'a>) -> u32 {
+    BASKET_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    input.items.iter().map(|i| i.qty).sum()
+}
+
+#[test]
+fn vec_of_drv_input() {
+    BASKET_COMPUTES.store(0, Ordering::SeqCst);
+
+    let apple = "apple".to_string();
+    let banana = "banana".to_string();
+
+    let basket = Basket {
+        items: vec![
+            Item {
+                name: &apple,
+                qty: 3,
+            },
+            Item {
+                name: &banana,
+                qty: 5,
+            },
+        ],
+    };
+    assert_eq!(basket_total(basket), 8);
+    assert_eq!(BASKET_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Rebuild an equivalent basket — should hit cache.
+    let basket2 = Basket {
+        items: vec![
+            Item {
+                name: &apple,
+                qty: 3,
+            },
+            Item {
+                name: &banana,
+                qty: 5,
+            },
+        ],
+    };
+    assert_eq!(basket_total(basket2), 8);
+    assert_eq!(BASKET_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Change a qty → miss.
+    let basket3 = Basket {
+        items: vec![
+            Item {
+                name: &apple,
+                qty: 4,
+            },
+            Item {
+                name: &banana,
+                qty: 5,
+            },
+        ],
+    };
+    assert_eq!(basket_total(basket3), 9);
+    assert_eq!(BASKET_COMPUTES.load(Ordering::SeqCst), 2);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 20. COVERAGE FILLERS — unit struct, std maps/sets, tuple fields,
+//     array-of-drv::Input, Option<drv::Input>.
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(drv::Input)]
+pub struct UnitMarker;
+
+#[drv::memo(single)]
+fn unit_marker_memo(marker: UnitMarker) -> u32 {
+    let _ = marker;
+    7
+}
+
+#[test]
+fn unit_struct_derive() {
+    assert_eq!(unit_marker_memo(UnitMarker), 7);
+    assert_eq!(unit_marker_memo(UnitMarker), 7);
+}
+
+#[derive(drv::Input)]
+struct TupleField<'a> {
+    pub pair: (u32, &'a String),
+}
+
+#[drv::memo(single)]
+fn tuple_field_memo<'a>(input: TupleField<'a>) -> String {
+    format!("{}:{}", input.pair.0, input.pair.1)
+}
+
+#[test]
+fn tuple_type_as_field() {
+    let s = "hello".to_string();
+    assert_eq!(tuple_field_memo(TupleField { pair: (42, &s) }), "42:hello");
+    assert_eq!(tuple_field_memo(TupleField { pair: (42, &s) }), "42:hello");
+}
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+#[derive(drv::Input)]
+struct StdMaps<'a> {
+    pub m: &'a HashMap<String, u32>,
+    pub b: &'a BTreeMap<u32, String>,
+    pub s: &'a HashSet<u32>,
+    pub t: &'a BTreeSet<u32>,
+}
+
+#[drv::memo(single)]
+fn std_maps_sum<'a>(input: StdMaps<'a>) -> u32 {
+    input.m.values().sum::<u32>()
+        + input.b.keys().sum::<u32>()
+        + input.s.iter().sum::<u32>()
+        + input.t.iter().sum::<u32>()
+}
+
+#[test]
+fn std_hashmap_hashset_btreemap_btreeset_fields() {
+    let m: HashMap<String, u32> = [("a".to_string(), 1), ("b".to_string(), 2)]
+        .into_iter()
+        .collect();
+    let b: BTreeMap<u32, String> = [(10u32, "x".to_string()), (20u32, "y".to_string())]
+        .into_iter()
+        .collect();
+    let s: HashSet<u32> = [100u32, 200].into_iter().collect();
+    let t: BTreeSet<u32> = [1000u32, 2000].into_iter().collect();
+
+    assert_eq!(
+        std_maps_sum(StdMaps {
+            m: &m,
+            b: &b,
+            s: &s,
+            t: &t
+        }),
+        3333
+    );
+    assert_eq!(
+        std_maps_sum(StdMaps {
+            m: &m,
+            b: &b,
+            s: &s,
+            t: &t
+        }),
+        3333
+    );
+}
+
+#[derive(drv::Input)]
+struct ArcArray<'a> {
+    pub arr: &'a [Arc<Vec<u32>>; 3],
+}
+
+#[drv::memo(single)]
+fn arc_array_sum<'a>(input: ArcArray<'a>) -> u32 {
+    input.arr.iter().map(|a| a.iter().sum::<u32>()).sum()
+}
+
+#[test]
+fn array_of_nontrivial_element() {
+    let arr: [Arc<Vec<u32>>; 3] = [
+        Arc::new(vec![1, 2]),
+        Arc::new(vec![3, 4]),
+        Arc::new(vec![5, 6]),
+    ];
+    assert_eq!(arc_array_sum(ArcArray { arr: &arr }), 21);
+    assert_eq!(arc_array_sum(ArcArray { arr: &arr }), 21);
+}
+
+#[derive(drv::Input)]
+struct OptionalChild<'a> {
+    pub maybe: Option<NestChildA<'a>>,
+    pub flag: bool,
+}
+
+#[drv::memo(single)]
+fn optional_child_len<'a>(input: OptionalChild<'a>) -> usize {
+    match input.maybe {
+        Some(c) if input.flag => c.a.len(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn option_of_drv_input() {
+    let v = ImVector::from(vec![1u32, 2, 3, 4]);
+    let child = NestChildA { a: &v };
+
+    assert_eq!(
+        optional_child_len(OptionalChild {
+            maybe: Some(child),
+            flag: true,
+        }),
+        4
+    );
+    assert_eq!(
+        optional_child_len(OptionalChild {
+            maybe: None,
+            flag: true,
+        }),
+        0
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 21. MAP-VALUED drv::Input — HashMap<K, MyInput<'a>> etc.
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, drv::Input)]
+struct Row<'a> {
+    pub label: &'a String,
+    pub qty: u32,
+}
+
+#[derive(drv::Input)]
+struct RowHashMap<'a> {
+    pub rows: HashMap<String, Row<'a>>,
+}
+
+static ROW_MAP_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo(single)]
+fn row_map_total<'a>(input: RowHashMap<'a>) -> u32 {
+    ROW_MAP_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    input.rows.values().map(|r| r.qty).sum()
+}
+
+#[test]
+fn hashmap_of_drv_input() {
+    ROW_MAP_COMPUTES.store(0, Ordering::SeqCst);
+
+    let apple = "apple".to_string();
+    let banana = "banana".to_string();
+
+    let rows: HashMap<String, Row<'_>> = [
+        (
+            "fruit".to_string(),
+            Row {
+                label: &apple,
+                qty: 5,
+            },
+        ),
+        (
+            "long".to_string(),
+            Row {
+                label: &banana,
+                qty: 3,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(row_map_total(RowHashMap { rows: rows.clone() }), 8);
+    assert_eq!(ROW_MAP_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Same content → cache hit.
+    assert_eq!(row_map_total(RowHashMap { rows: rows.clone() }), 8);
+    assert_eq!(ROW_MAP_COMPUTES.load(Ordering::SeqCst), 1);
+
+    // Change a qty → miss.
+    let mut mutated = rows.clone();
+    mutated.get_mut("fruit").unwrap().qty = 50;
+    assert_eq!(row_map_total(RowHashMap { rows: mutated }), 53);
+    assert_eq!(ROW_MAP_COMPUTES.load(Ordering::SeqCst), 2);
+
+    // Remove an entry (changes length) → miss.
+    let mut shrunk = rows.clone();
+    shrunk.remove("long");
+    assert_eq!(row_map_total(RowHashMap { rows: shrunk }), 5);
+    assert_eq!(ROW_MAP_COMPUTES.load(Ordering::SeqCst), 3);
+
+    // Different key, same value count → miss (pigeonhole: length equal but
+    // one key differs, so `self.iter().all(other.get(k).is_some())` fails).
+    let orange = "orange".to_string();
+    let rekeyed: HashMap<String, Row<'_>> = [
+        (
+            "fruit".to_string(),
+            Row {
+                label: &apple,
+                qty: 5,
+            },
+        ),
+        (
+            "citrus".to_string(),
+            Row {
+                label: &orange,
+                qty: 3,
+            },
+        ),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(row_map_total(RowHashMap { rows: rekeyed }), 8);
+    assert_eq!(ROW_MAP_COMPUTES.load(Ordering::SeqCst), 4);
+}
+
+#[derive(drv::Input)]
+struct RowBTreeMap<'a> {
+    pub rows: BTreeMap<u32, Row<'a>>,
+}
+
+#[drv::memo(single)]
+fn row_btree_total<'a>(input: RowBTreeMap<'a>) -> u32 {
+    input.rows.values().map(|r| r.qty).sum()
+}
+
+#[test]
+fn btreemap_of_drv_input() {
+    let a = "x".to_string();
+    let b = "y".to_string();
+
+    let rows: BTreeMap<u32, Row<'_>> = [
+        (1u32, Row { label: &a, qty: 10 }),
+        (2u32, Row { label: &b, qty: 20 }),
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(row_btree_total(RowBTreeMap { rows: rows.clone() }), 30);
+    assert_eq!(row_btree_total(RowBTreeMap { rows }), 30);
+}
+
 #[test]
 fn preprojected_input_at_call_site() {
     // Callers can pass a pre-projected input directly (by value) instead of
