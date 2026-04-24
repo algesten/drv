@@ -62,14 +62,16 @@ Every memo picks a cache strategy:
 ### Parameters
 
 Every parameter must implement [`ToStatic`]. That trait is
-implemented by drv for primitives, `String`, `Arc<T>`, imbl
-collections (feature-gated), and — via a reference blanket — `&T`
-for any `T: ToStatic`. Containers (`Vec`, `Option`, tuples, arrays,
+implemented by drv for primitives, `String`, `PathBuf`, `Arc<T>`,
+`std::time::{Instant, Duration, SystemTime}`, imbl collections
+(feature-gated), and — via a reference blanket — `&T` for any
+`T: ToStatic`. Containers (`Vec`, `Option`, tuples, arrays,
 `HashMap` / `HashSet` / `BTreeMap` / `BTreeSet`) are recursive:
 they implement `ToStatic` whenever their elements do, so nested
 projections like `Vec<MyInput<'a>>` work without any extra
 annotation. User types become inputs by adding
-`#[derive(drv::Input)]`.
+`#[derive(drv::Input)]` — supported on structs (named, tuple, unit)
+and enums.
 
 | You write | Needs `#[derive(drv::Input)]` | Notes |
 |---|---|---|

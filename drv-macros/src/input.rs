@@ -2,30 +2,34 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{DeriveInput, Fields, Index};
 
-/// Expand `#[derive(drv::Input)]` on a struct.
+/// Expand `#[derive(drv::Input)]` on a struct or enum.
 ///
-/// Emits:
-/// 1. A `#[doc(hidden)]` shadow struct `__Drv<Name>` whose fields are
-///    each field's `<FieldType as ToStatic>::Static`. Mirrors the input
-///    struct's shape — named, tuple, or unit.
-/// 2. `impl ToStatic for <Name>` with field-by-field `to_static` and
-///    `eq_static` bodies.
+/// For structs: emits a `#[doc(hidden)]` shadow struct `__Drv<Name>`
+/// mirroring the input's shape (named, tuple, or unit), with each
+/// field's type rewritten to `<FieldType as ToStatic>::Static`, plus a
+/// `ToStatic` impl with field-by-field `to_static` and `eq_static`
+/// bodies.
+///
+/// For enums: emits a `#[doc(hidden)]` shadow enum with the same
+/// variants, each variant's fields rewritten to their `ToStatic::Static`
+/// forms. `to_static` and `eq_static` are match-based.
 ///
 /// Per-field codegen is uniform: no branching on reference vs owned vs
 /// nested drv::Input. Rust's method resolution picks the right
 /// `ToStatic` impl at typeck.
 pub fn expand(item: DeriveInput) -> Result<TokenStream, syn::Error> {
-    let input_name = &item.ident;
+    match &item.data {
+        syn::Data::Struct(s) => expand_struct(&item, s),
+        syn::Data::Enum(e) => expand_enum(&item, e),
+        syn::Data::Union(_) => Err(syn::Error::new_spanned(
+            &item,
+            "drv::Input can only be derived on structs or enums",
+        )),
+    }
+}
 
-    let data = match &item.data {
-        syn::Data::Struct(s) => s,
-        _ => {
-            return Err(syn::Error::new_spanned(
-                &item,
-                "drv::Input can only be derived on structs",
-            ));
-        }
-    };
+fn expand_struct(item: &DeriveInput, data: &syn::DataStruct) -> Result<TokenStream, syn::Error> {
+    let input_name = &item.ident;
 
     let snapshot_ident = format_ident!("__Drv{}", input_name);
 
@@ -192,6 +196,198 @@ pub fn expand(item: DeriveInput) -> Result<TokenStream, syn::Error> {
             }
         }
     })
+}
+
+/// Per-variant codegen for an enum derive: shadow variant declaration,
+/// one `to_static` match arm, one `eq_static` match arm.
+struct VariantCodegen {
+    shadow_decl: TokenStream,
+    to_static_arm: TokenStream,
+    eq_static_arm: TokenStream,
+}
+
+fn expand_enum(item: &DeriveInput, data: &syn::DataEnum) -> Result<TokenStream, syn::Error> {
+    let input_name = &item.ident;
+    let snapshot_ident = format_ident!("__Drv{}", input_name);
+
+    let variants: Vec<VariantCodegen> = data
+        .variants
+        .iter()
+        .map(|v| build_variant(input_name, &snapshot_ident, v))
+        .collect();
+
+    let shadow_variant_decls: Vec<_> = variants.iter().map(|v| &v.shadow_decl).collect();
+    let to_static_arms: Vec<_> = variants.iter().map(|v| &v.to_static_arm).collect();
+    let eq_static_arms: Vec<_> = variants.iter().map(|v| &v.eq_static_arm).collect();
+
+    let (shadow_generics, shadow_ty_args) = shadow_struct_generics(&item.generics);
+    let shadow_where = build_shadow_where_clause(&item.generics);
+
+    let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
+    let extra_static_bounds = extra_static_bounds_for_type_params(&item.generics);
+    let mut all_preds: Vec<TokenStream> = Vec::new();
+    if let Some(w) = where_clause {
+        for p in &w.predicates {
+            all_preds.push(quote! { #p });
+        }
+    }
+    all_preds.extend(extra_static_bounds);
+    let impl_where = if all_preds.is_empty() {
+        quote! {}
+    } else {
+        quote! { where #(#all_preds),* }
+    };
+
+    // A `_` fallback arm in the mixed match covers the same-variant-tag
+    // mismatch case. Only needed when the enum has more than one variant.
+    let eq_fallback = if variants.len() > 1 {
+        quote! { _ => false, }
+    } else {
+        quote! {}
+    };
+
+    Ok(quote! {
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        pub enum #snapshot_ident #shadow_generics #shadow_where {
+            #(#shadow_variant_decls,)*
+        }
+
+        impl #impl_generics ::drv::ToStatic for #input_name #ty_generics #impl_where {
+            type Static = #snapshot_ident #shadow_ty_args;
+
+            fn to_static(&self) -> Self::Static {
+                match self {
+                    #(#to_static_arms),*
+                }
+            }
+
+            fn eq_static(&self, other: &Self::Static) -> bool {
+                match (self, other) {
+                    #(#eq_static_arms,)*
+                    #eq_fallback
+                }
+            }
+        }
+    })
+}
+
+fn build_variant(
+    input_name: &syn::Ident,
+    snapshot_ident: &syn::Ident,
+    v: &syn::Variant,
+) -> VariantCodegen {
+    let vname = &v.ident;
+
+    match &v.fields {
+        Fields::Unit => VariantCodegen {
+            shadow_decl: quote! { #vname },
+            to_static_arm: quote! {
+                #input_name::#vname => #snapshot_ident::#vname
+            },
+            eq_static_arm: quote! {
+                (#input_name::#vname, #snapshot_ident::#vname) => true
+            },
+        },
+        Fields::Unnamed(fs) => {
+            let mut shadow_tys = Vec::new();
+            let mut self_binds = Vec::new();
+            let mut other_binds = Vec::new();
+            let mut build_exprs = Vec::new();
+            let mut eq_terms = Vec::new();
+
+            for (i, f) in fs.unnamed.iter().enumerate() {
+                let a = format_ident!("a{}", i);
+                let b = format_ident!("b{}", i);
+                self_binds.push(quote! { #a });
+                other_binds.push(quote! { #b });
+
+                if is_phantom_data(&f.ty) {
+                    // Phantom field: preserve the slot in shadow as
+                    // PhantomData, don't call ToStatic on it.
+                    shadow_tys.push(quote! { ::core::marker::PhantomData<()> });
+                    build_exprs.push(quote! { ::core::marker::PhantomData });
+                    // eq term: no check (phantom always equal).
+                } else {
+                    let fty_static = type_to_static_form(&f.ty);
+                    shadow_tys.push(quote! { <#fty_static as ::drv::ToStatic>::Static });
+                    build_exprs.push(quote! { ::drv::ToStatic::to_static(#a) });
+                    eq_terms.push(quote! { ::drv::ToStatic::eq_static(#a, #b) });
+                }
+            }
+
+            let eq_body = if eq_terms.is_empty() {
+                quote! { true }
+            } else {
+                quote! { #(#eq_terms)&&* }
+            };
+
+            VariantCodegen {
+                shadow_decl: quote! { #vname(#(#shadow_tys),*) },
+                to_static_arm: quote! {
+                    #input_name::#vname(#(#self_binds),*) =>
+                        #snapshot_ident::#vname(#(#build_exprs),*)
+                },
+                eq_static_arm: quote! {
+                    (
+                        #input_name::#vname(#(#self_binds),*),
+                        #snapshot_ident::#vname(#(#other_binds),*)
+                    ) => #eq_body
+                },
+            }
+        }
+        Fields::Named(fs) => {
+            let mut shadow_decls = Vec::new();
+            let mut self_binds = Vec::new();
+            let mut other_binds = Vec::new();
+            let mut build_exprs = Vec::new();
+            let mut eq_terms = Vec::new();
+
+            for f in &fs.named {
+                let fname = f.ident.as_ref().unwrap();
+                let a = format_ident!("__drv_a_{}", fname);
+                let b = format_ident!("__drv_b_{}", fname);
+                self_binds.push(quote! { #fname: #a });
+                other_binds.push(quote! { #fname: #b });
+
+                if is_phantom_data(&f.ty) {
+                    shadow_decls.push(quote! {
+                        #fname: ::core::marker::PhantomData<()>
+                    });
+                    build_exprs.push(quote! { #fname: ::core::marker::PhantomData });
+                } else {
+                    let fty_static = type_to_static_form(&f.ty);
+                    shadow_decls.push(quote! {
+                        #fname: <#fty_static as ::drv::ToStatic>::Static
+                    });
+                    build_exprs.push(quote! {
+                        #fname: ::drv::ToStatic::to_static(#a)
+                    });
+                    eq_terms.push(quote! { ::drv::ToStatic::eq_static(#a, #b) });
+                }
+            }
+
+            let eq_body = if eq_terms.is_empty() {
+                quote! { true }
+            } else {
+                quote! { #(#eq_terms)&&* }
+            };
+
+            VariantCodegen {
+                shadow_decl: quote! { #vname { #(#shadow_decls),* } },
+                to_static_arm: quote! {
+                    #input_name::#vname { #(#self_binds),* } =>
+                        #snapshot_ident::#vname { #(#build_exprs),* }
+                },
+                eq_static_arm: quote! {
+                    (
+                        #input_name::#vname { #(#self_binds),* },
+                        #snapshot_ident::#vname { #(#other_binds),* }
+                    ) => #eq_body
+                },
+            }
+        }
+    }
 }
 
 /// Build generics for the shadow struct: drops lifetime params, keeps

@@ -58,14 +58,16 @@
 //! ## Parameters
 //!
 //! Every parameter must implement [`ToStatic`]. That trait is
-//! implemented by drv for primitives, `String`, `Arc<T>`, imbl
-//! collections (feature-gated), and — via a reference blanket — `&T`
-//! for any `T: ToStatic`. Containers (`Vec`, `Option`, tuples, arrays,
+//! implemented by drv for primitives, `String`, `PathBuf`, `Arc<T>`,
+//! `std::time::{Instant, Duration, SystemTime}`, imbl collections
+//! (feature-gated), and — via a reference blanket — `&T` for any
+//! `T: ToStatic`. Containers (`Vec`, `Option`, tuples, arrays,
 //! `HashMap` / `HashSet` / `BTreeMap` / `BTreeSet`) are recursive:
 //! they implement `ToStatic` whenever their elements do, so nested
 //! projections like `Vec<MyInput<'a>>` work without any extra
 //! annotation. User types become inputs by adding
-//! `#[derive(drv::Input)]`.
+//! `#[derive(drv::Input)]` — supported on structs (named, tuple, unit)
+//! and enums.
 //!
 //! | You write | Needs `#[derive(drv::Input)]` | Notes |
 //! |---|---|---|
@@ -223,14 +225,16 @@
 /// Convert a memo input to its `'static` cache-storage form.
 ///
 /// Every type passed to a `#[drv::memo]` must implement `ToStatic`. drv
-/// ships impls for primitives, `String`, `Arc<T>`, `&T` (for any `T:
-/// ToStatic`), `str`, and (under `feature = "imbl"`) imbl's persistent
+/// ships impls for primitives, `String`, `str`, `PathBuf`, `Path`,
+/// `Arc<T>`, `std::time::{Instant, Duration, SystemTime}`, `&T` (for
+/// any `T: ToStatic`), and (under `feature = "imbl"`) imbl's persistent
 /// collections. Container types — `Vec<T>`, `[T]`, `[T; N]`,
 /// `Option<T>`, tuples up to arity 5, `HashMap<K, V>`, `HashSet<K>`,
 /// `BTreeMap<K, V>`, `BTreeSet<K>` — are *recursive*: they implement
 /// `ToStatic` whenever their element types do, so things like
 /// `Vec<MyInput<'a>>` and `HashMap<String, MyInput<'a>>` work. User
-/// types get `ToStatic` via `#[derive(drv::Input)]`.
+/// types get `ToStatic` via `#[derive(drv::Input)]` on a struct or
+/// enum.
 ///
 /// `Arc<T>` and imbl collections take a pointer-equality fast path in
 /// `eq_static`: if the stored snapshot and the current input share a
@@ -321,6 +325,64 @@ impl ToStatic for str {
     }
     fn eq_static(&self, other: &String) -> bool {
         self == other.as_str()
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// PathBuf / Path.
+// ────────────────────────────────────────────────────────────────────
+
+impl ToStatic for std::path::PathBuf {
+    type Static = std::path::PathBuf;
+    fn to_static(&self) -> std::path::PathBuf {
+        self.clone()
+    }
+    fn eq_static(&self, other: &std::path::PathBuf) -> bool {
+        self == other
+    }
+}
+
+impl ToStatic for std::path::Path {
+    type Static = std::path::PathBuf;
+    fn to_static(&self) -> std::path::PathBuf {
+        self.to_path_buf()
+    }
+    fn eq_static(&self, other: &std::path::PathBuf) -> bool {
+        self == other.as_path()
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// std::time — Instant, Duration, SystemTime are all Copy + PartialEq.
+// ────────────────────────────────────────────────────────────────────
+
+impl ToStatic for std::time::Instant {
+    type Static = std::time::Instant;
+    fn to_static(&self) -> std::time::Instant {
+        *self
+    }
+    fn eq_static(&self, other: &std::time::Instant) -> bool {
+        self == other
+    }
+}
+
+impl ToStatic for std::time::Duration {
+    type Static = std::time::Duration;
+    fn to_static(&self) -> std::time::Duration {
+        *self
+    }
+    fn eq_static(&self, other: &std::time::Duration) -> bool {
+        self == other
+    }
+}
+
+impl ToStatic for std::time::SystemTime {
+    type Static = std::time::SystemTime;
+    fn to_static(&self) -> std::time::SystemTime {
+        *self
+    }
+    fn eq_static(&self, other: &std::time::SystemTime) -> bool {
+        self == other
     }
 }
 

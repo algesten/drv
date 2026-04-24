@@ -1992,6 +1992,154 @@ fn btreemap_of_drv_input() {
     assert_eq!(row_btree_total(RowBTreeMap { rows }), 30);
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// 22. PathBuf / Path / Instant / Duration / SystemTime as inputs.
+// ══════════════════════════════════════════════════════════════════════
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+
+#[derive(drv::Input)]
+struct PathInput<'a> {
+    pub owned: PathBuf,
+    pub borrowed: &'a Path,
+}
+
+#[drv::memo(single)]
+fn path_label<'a>(input: PathInput<'a>) -> String {
+    format!("{}|{}", input.owned.display(), input.borrowed.display())
+}
+
+#[test]
+fn path_and_pathbuf_fields() {
+    let p = Path::new("/tmp/foo");
+    assert_eq!(
+        path_label(PathInput {
+            owned: PathBuf::from("/a"),
+            borrowed: p,
+        }),
+        "/a|/tmp/foo"
+    );
+    assert_eq!(
+        path_label(PathInput {
+            owned: PathBuf::from("/a"),
+            borrowed: p,
+        }),
+        "/a|/tmp/foo"
+    );
+}
+
+#[derive(drv::Input)]
+struct TimeInput {
+    pub started: Instant,
+    pub elapsed: Duration,
+    pub wall: SystemTime,
+}
+
+#[drv::memo(single)]
+fn time_fmt(input: TimeInput) -> String {
+    format!(
+        "{:?}|{}",
+        input.elapsed.as_millis(),
+        input
+            .wall
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    )
+}
+
+#[test]
+fn time_types_as_input() {
+    let now = Instant::now();
+    let d = Duration::from_millis(42);
+    let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+    assert_eq!(
+        time_fmt(TimeInput {
+            started: now,
+            elapsed: d,
+            wall,
+        }),
+        "42|1000"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 23. ENUM drv::Input — unit, tuple, and struct variants.
+// ══════════════════════════════════════════════════════════════════════
+
+#[derive(drv::Input)]
+enum Shape<'a> {
+    Empty,
+    Point(u32, u32),
+    Named { label: &'a String, size: u32 },
+}
+
+#[drv::memo(single)]
+fn shape_label<'a>(input: Shape<'a>) -> String {
+    match input {
+        Shape::Empty => "empty".to_string(),
+        Shape::Point(x, y) => format!("({},{})", x, y),
+        Shape::Named { label, size } => format!("{}@{}", label, size),
+    }
+}
+
+#[test]
+fn enum_unit_tuple_named_variants() {
+    assert_eq!(shape_label(Shape::Empty), "empty");
+    assert_eq!(shape_label(Shape::Empty), "empty"); // hit
+    assert_eq!(shape_label(Shape::Point(3, 4)), "(3,4)"); // miss (variant change)
+    assert_eq!(shape_label(Shape::Point(3, 4)), "(3,4)"); // hit
+    assert_eq!(shape_label(Shape::Point(5, 4)), "(5,4)"); // miss (value change)
+
+    let s = "circle".to_string();
+    assert_eq!(
+        shape_label(Shape::Named {
+            label: &s,
+            size: 10,
+        }),
+        "circle@10"
+    );
+}
+
+// Enum with a nested drv::Input field in one variant.
+#[derive(drv::Input)]
+enum Event<'a> {
+    Tick(Instant),
+    Payload(NestChildA<'a>),
+}
+
+static EVENT_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+#[drv::memo(single)]
+fn event_size<'a>(input: Event<'a>) -> usize {
+    EVENT_COMPUTES.fetch_add(1, Ordering::SeqCst);
+    match input {
+        Event::Tick(_) => 0,
+        Event::Payload(p) => p.a.len(),
+    }
+}
+
+#[test]
+fn enum_with_nested_input() {
+    EVENT_COMPUTES.store(0, Ordering::SeqCst);
+    let v = ImVector::from(vec![1u32, 2, 3]);
+    let t = Instant::now();
+
+    assert_eq!(event_size(Event::Tick(t)), 0);
+    assert_eq!(EVENT_COMPUTES.load(Ordering::SeqCst), 1);
+    assert_eq!(event_size(Event::Tick(t)), 0);
+    assert_eq!(EVENT_COMPUTES.load(Ordering::SeqCst), 1); // hit
+
+    // Variant change → miss.
+    assert_eq!(event_size(Event::Payload(NestChildA { a: &v })), 3);
+    assert_eq!(EVENT_COMPUTES.load(Ordering::SeqCst), 2);
+
+    // Same variant, same contents → hit.
+    assert_eq!(event_size(Event::Payload(NestChildA { a: &v })), 3);
+    assert_eq!(EVENT_COMPUTES.load(Ordering::SeqCst), 2);
+}
+
 #[test]
 fn preprojected_input_at_call_site() {
     // Callers can pass a pre-projected input directly (by value) instead of
