@@ -19,13 +19,7 @@ from scratch.
 6. [Actions as diffs](#actions-as-diffs)
 7. [The main loop](#the-main-loop)
 8. [Organizing the code: crate layout](#organizing-the-code-crate-layout)
-9. [Crossing the ABI: foreign-owned buffers](#crossing-the-abi-foreign-owned-buffers)
-10. [Bridging to a reactive UI framework (SwiftUI)](#bridging-to-a-reactive-ui-framework-swiftui)
-11. [Threading model](#threading-model)
-12. [Worked example: microphone lifecycle](#worked-example-microphone-lifecycle)
-13. [Worked example: remote participants](#worked-example-remote-participants)
-14. [Testing](#testing)
-15. [Guidelines](#guidelines)
+9. [Testing](#testing)
 
 ---
 
@@ -64,7 +58,7 @@ behavior of any query is in one function — centralized, explicit, testable.
 |---------|----------|-------------|
 | "What happens when the user selects a mic?" | Find all observers of `selected_mic`, trace their effects | Read `desired_mic()` — it's a pure function |
 | Mic disconnects while selected | Write an on-disconnect handler that checks intent and re-opens | `desired_mic()` still returns `Some(mic1)` — reconnection is emergent |
-| Two inputs change on the same tick | Observer ordering matters; need batching to avoid glitches | Set both inputs, then query. Always consistent. |
+| Two inputs change in the same iteration | Observer ordering matters; need batching to avoid glitches | Set both inputs, then query. Always consistent. |
 | View removed | Must unsubscribe observers or leak memory | Nobody calls the query. No cost. |
 | Testing | Set up reactive runtime, trigger change, observe effects | Call a pure function with known inputs, assert output |
 
@@ -218,12 +212,12 @@ a confused assignment during a refactor. Newtype the roles so the
 compiler carries the invariant:
 
 ```rust
-pub struct Synced(Arc<String>);
-pub struct Local(Arc<String>);
+pub struct Persisted(Arc<String>);
+pub struct Draft(Arc<String>);
 
-pub struct Draft {
-    pub synced: Synced,
-    pub local:  Local,
+pub struct Document {
+    pub persisted: Persisted,
+    pub draft:     Draft,
 }
 ```
 
@@ -268,7 +262,7 @@ pub struct MicEnumerationDriver {
 }
 
 impl MicEnumerationDriver {
-    /// Called on the main thread each tick. Drains pending events
+    /// Called on the main thread each iteration. Drains pending events
     /// into the source. Cheap — just field assignments.
     pub fn process(&self, inv: &mut MicInventory) {
         while let Ok(event) = self.rx.try_recv() {
@@ -290,7 +284,7 @@ impl MicEnumerationDriver {
     }
 
     /// Initiate a permission request. The result arrives via rx.
-    /// Must write Pending synchronously — without it, the next tick's
+    /// Must write Pending synchronously — without it, the next iteration's
     /// query still sees NotAsked and would request permission again.
     pub fn request_permission(&self, inv: &mut MicInventory) {
         inv.permission = MicPermission::Pending;
@@ -406,16 +400,6 @@ Without this split, the user-decision source accumulates async bookkeeping
 over time, its `PartialEq` picks up churn from driver completions, and the
 rule that says "user decisions are chosen, not discovered" quietly rots.
 
-### One driver, two crates
-
-"The driver" as described here is a unit, but it's best organised as two
-crates: a portable sync **core** (the source + the sync `process`/`execute`
-API + the `Cmd`/`Event` types that cross to the async side) and a
-platform-specific **native** (the worker implementation — thread on
-desktop, GCD on iOS, coroutines on Android). The mpsc between them *is*
-the ABI boundary, and it's also the mock point for tests. See
-[Organizing the code](#organizing-the-code-crate-layout).
-
 ---
 
 ## Queries: desired state, not transitions
@@ -505,19 +489,26 @@ re-triggering an open that's already in flight.
 
 ## The main loop
 
-The main loop has three phases, every tick:
+"Main loop" here means the runtime's own dedicated loop thread — the
+one that owns the sources and runs ingest/query/execute/render. It is
+*not* the platform UI thread (SwiftUI's main, Android's UI thread,
+the terminal's render thread). Those are separate; the UI should be
+considered another driver.
+
+The main loop has three phases, every iteration:
 
 ```rust
 loop {
     // ── Phase 1: Ingest ──────────────────────────────────────
-    // Drain async driver results into sources.
-    // Drain UI events into user-decision sources.
+    // Drain each driver's pending events into its source. Drivers'
+    // workers signaled wake; this just reads what they already
+    // queued. No platform calls happen here.
     mic_enum_driver.process(&mut mic_inventory);
     mic_stream_driver.process(&mut mic_capture);
     camera_driver.process(&mut camera_inventory);
     signaling_driver.process(&mut call_session);
     webrtc_driver.process(&mut remote_participants, &mut remote_streams);
-    ui_events.process(&mut mic_preference, &mut participant_settings, ...);
+    ui_driver.process(&mut mic_preference, &mut participant_settings, ...);
 
     // ── Phase 2: Query ───────────────────────────────────────
     // Ask questions. All reads, no writes. Memoized — mostly cache hits.
@@ -554,41 +545,41 @@ Every phase is clearly separated:
 ### Wake on event, don't spin
 
 Block the main thread until something actually happens — a driver
-completion, a user keystroke, a timer deadline. **Never sleep a fixed
-duration "just in case."** A 100 Hz fixed tick means 100 cache reads per
-second burning CPU for no reason on every idle moment, and adds up to one
-full tick of latency when an event arrives right after a sleep starts.
-Treat fixed-tick loops as an anti-pattern — they're easier to write for
-five minutes and a drag on the app forever after.
+completion, a user keystroke, or a deadline the runner needs to wake
+for. **Never sleep a fixed duration "just in case."** A 100 Hz fixed
+tick means 100 cache reads per second burning CPU on every idle
+moment, and adds one full tick of latency when an event arrives right
+after a sleep starts.
 
 The specific primitive depends on how the drivers are wired:
 
 **Sync drivers (std threads + `std::mpsc`).** The main thread owns a
-`Receiver<()>`; every driver, the input source, and timer machinery hold
-clones of the matching `Sender`. Drivers signal after each completion;
-input signals on each key. The loop blocks on
-`recv_timeout(nearest_deadline)`; the timeout is only there so wall-clock
-timers (toast expiry, animation frames) don't oversleep.
+`Receiver<()>`; every driver and input source holds a clone of the
+matching `Sender`. The loop blocks on `recv_timeout(timeout)`; the
+timeout comes from a deadline query (see *Deadlines are queries*
+below) so the loop wakes at the nearest pending deadline.
 
 ```rust
-let wake = Wake::new();  // Sender<()> + Receiver<()>
-let drivers = spawn_drivers(trace, &wake)?;  // each gets a wake.tx clone
+let wake = Wake::new();
+let drivers = spawn_drivers(trace, &wake)?;
 
 loop {
     // ingest → query → execute → render
 
-    // Drain stale signals — already accounted for by the ingest above.
-    while wake.rx.try_recv().is_ok() {}
-
-    let timeout = nearest_deadline(&atoms)
+    let timeout = nearest_deadline(...)
         .and_then(|d| d.checked_duration_since(Instant::now()))
         .unwrap_or(Duration::from_secs(60));
     match wake.rx.recv_timeout(timeout) { /* ... */ }
+
+    // Drain AFTER recv_timeout, never before — execute may have
+    // kicked off work that signals wake before the sleep, and a
+    // pre-sleep drain would swallow it.
+    while wake.rx.try_recv().is_ok() {}
 }
 ```
 
 **Async drivers (tokio tasks).** The main task `select!`s over driver
-completion channels plus `sleep_until(nearest_deadline)`:
+completion channels plus `sleep_until(deadline)`:
 
 ```rust
 loop {
@@ -602,24 +593,62 @@ loop {
 }
 ```
 
-Same shape, different primitives. Pick whichever matches the rest of the
-app; mixing is fine (a std thread can forward into a tokio channel via
-`spawn_blocking`).
+### Time is a source field
 
-**Readiness signals from the OS (inotify, kqueue, epoll, socket ready).**
-Never poll these. The kernel already knows when something happened — use
-`notify`, the raw OS API, or tokio's `AsyncFd`, and have the native
-worker forward into the wake channel the instant the event fires. A
-polling layer between the kernel and your main loop is pure waste.
+"Now" is data, not a global. Put it on a source, set it during ingest
+each iteration from whatever oracle you've chosen — `Instant::now()`
+in production, a controlled value in tests — and treat it as a
+memoizable input like every other source.
 
-### Centralize deadline management
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clock {
+    pub now: Instant,
+}
 
-Any non-trivial app has multiple pending timers: a toast auto-dismiss, a
-debounced recomputation, an LSP response timeout, an animation frame.
-Hardcoding one into the loop's timeout works for the first feature; the
-second feature has to find-and-replace.
+#[derive(drv::Input)]
+struct ClockInput<'a> {
+    pub now: &'a Instant,
+}
+```
 
-Fold all pending deadlines into one query:
+Time-dependent queries take `ClockInput` alongside their other
+inputs:
+
+```rust
+#[drv::memo(single)]
+fn toast_visible<'a, 'b>(
+    alerts: AlertsInput<'a>,
+    clock: ClockInput<'b>,
+) -> Option<&'a str> {
+    match alerts.info_expires_at {
+        Some(t) if *clock.now < t => Some(alerts.info_message.as_str()),
+        _ => None,
+    }
+}
+```
+
+Two payoffs:
+
+1. **Tests drive faster than realtime.** A test that exercises a
+   30-second timeout takes microseconds: write `clock.now = t0 + 30s`
+   into the source, rerun the query, assert. No `tokio::time::pause`
+   ceremony, no wall-clock sleeps, no flakiness — and the same
+   pattern handles simulated years without taking any longer.
+
+2. **Cache cost is proportional to time-dependent work.** Memos that
+   read clock recompute every iteration — their input changed by
+   definition. Memos that don't read clock are unaffected. The
+   recompute itself is cheap; downstream consumers only re-fire when
+   the output value actually changes (e.g., when the toast crosses
+   its expiry).
+
+### Deadlines are queries the runner consults
+
+A wall-clock deadline (toast expiry, animation frame, debounce flush,
+LSP timeout) is just a field on a source. The runner doesn't need a
+separate timer system — it reads a memo that folds all current
+deadlines and uses the nearest one to size its sleep:
 
 ```rust
 #[drv::memo(single)]
@@ -635,8 +664,28 @@ fn nearest_deadline(
 }
 ```
 
-The loop reads one value; adding a timer means adding a field to the fold.
-This scales; ad-hoc `.unwrap_or(60s)` in the loop does not.
+This is the same kind of memo as everything else. The runner consults
+it to decide *how long to sleep*; it carries no semantic load. The
+question "is the toast still visible?" is answered by a clock-aware
+query (`toast_visible` above), not by the deadline — the fold's only
+job is to keep the loop from oversleeping past a state transition.
+
+Adding a feature with a time-bound is two steps: add the deadline
+field to its source, add it to the fold.
+
+### Fire-and-forget timers via a driver
+
+Some timers don't fit on a source as state — "auto-save 5s after the
+last keystroke," "retry the connection in 30s." For those, a small
+`driver-timer` works well: it accepts `Set { name, duration,
+schedule }` commands and posts back `Fired { name }` events. Ingest
+writes the fire into the appropriate source field (e.g., flipping
+`auto_save.pending = true`); queries observe the field.
+
+This composes with clock-on-source rather than replacing it. The
+driver is the *trigger*; the source field it mutates is what queries
+read. Reach for it when the timer is genuinely a scheduled
+side-effect rather than an attribute of state.
 
 ---
 
@@ -860,519 +909,6 @@ fn mic_count<'a>(inv: MicsInput<'a>) -> usize {
 No registry, no cross-crate coordination. The consumer crate is the only
 one that needs a `drv` dependency.
 
-### Drop-order: don't join in `Drop`
-
-The sync driver holds the `Sender<Cmd>`; its native handle typically
-wraps a `JoinHandle<()>`. If you construct both via `let (driver, native)
-= spawn(...)`, Rust drops `native` before `driver` (reverse
-declaration order). If `native`'s `Drop` calls `join()`, it deadlocks —
-the worker is still blocked on `recv()` waiting for `driver`'s
-`Sender` to close.
-
-Safer: don't `join` in the native's `Drop`. Let the worker self-exit on
-channel hangup when the sync driver's `Sender` drops, and let process
-exit reap any straggler. If a specific test needs deterministic
-shutdown, drop the driver explicitly first.
-
----
-
-## Crossing the ABI: foreign-owned buffers
-
-Mobile targets compile Rust as a static lib (iOS) or cdylib (Android)
-and hand data across a C ABI to Swift / Kotlin. For small one-shot
-values — a bool, an integer — copy; the cost is nothing. For **byte
-buffers** (media frames, encoded packets, screen captures, channel
-payloads) copying on every hop defeats the point of a native client.
-
-This is not a driver concern. It is a thin layer of **types with
-stable ABI and explicit lifetime rules**, kept in its own
-`abi-<name>/` crate (see the crate layout above) so any driver or
-runtime can import it without pulling driver dependencies along.
-
-Two directions to model:
-
-- **Rust-owned, foreign-consumed.** A `#[repr(C)]` handle carries a
-  stable `(ptr, len)` view plus a raw pointer into whatever Rust
-  container owns the allocation, paired with an `extern "C"` free
-  function that reconstitutes and drops it. Ownership invariant: the
-  foreign side calls the free exactly once. Which Rust container the
-  handle wraps is an application choice.
-
-- **Foreign-owned, Rust-consumed.** Usually call-scoped: the foreign
-  side lends a pointer + length for the duration of one extern call,
-  Rust copies what it needs within the call, the foreign side retains
-  ownership. When a buffer must outlive the call, mirror the shape
-  above in reverse — a foreign-owned handle with a Rust-invoked free
-  callback.
-
-Platform-typed GPU buffers (`CVPixelBuffer`, `HardwareBuffer`,
-`AImage`) are out of scope for this layer — they are opaque handles
-with their own lifecycle and retain semantics, often backed by GPU
-memory. Model them as platform-specific types in the relevant
-driver's core crate rather than forcing them into a contiguous-`[u8]`
-shape.
-
-## Bridging to a reactive UI framework (SwiftUI)
-
-SwiftUI is reactive — it re-renders views when `@Observable` properties
-change. `drv` is query-driven — it returns cached values when you ask.
-The bridge converts pull into push.
-
-### One memo per view
-
-Each view has a corresponding memo that produces a view-specific model:
-
-```rust
-#[drv::memo(single)]
-fn mic_picker_model<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> MicPickerModel {
-    match inv.permission {
-        MicPermission::NotAsked => MicPickerModel::NeedPermission,
-        MicPermission::Pending  => MicPickerModel::Waiting,
-        MicPermission::Denied   => MicPickerModel::Denied,
-        MicPermission::Granted  => MicPickerModel::Ready {
-            mics: inv.mics.iter().cloned().collect(),
-            selected: *pref.selected,
-        },
-    }
-}
-
-// Inputs for participant grid — only the fields this view needs.
-#[derive(drv::Input)]
-struct GridParticipantsInput<'a> {
-    pub participants: &'a imbl::Vector<Participant>,
-}
-
-impl<'a> GridParticipantsInput<'a> {
-    pub fn new(p: &'a RemoteParticipants) -> Self {
-        Self { participants: &p.participants }
-    }
-}
-
-#[derive(drv::Input)]
-struct GridSettingsInput<'a> {
-    pub muted: &'a imbl::HashSet<ParticipantId>,
-    pub pinned: &'a Option<ParticipantId>,
-}
-
-impl<'a> GridSettingsInput<'a> {
-    pub fn new(s: &'a ParticipantSettings) -> Self {
-        Self { muted: &s.muted, pinned: &s.pinned }
-    }
-}
-
-#[drv::memo(single)]
-fn participant_grid_model<'a, 'b>(
-    p: GridParticipantsInput<'a>,
-    s: GridSettingsInput<'b>,
-    m: &RemoteStreams,   // whole source; cached as `Clone` + `PartialEq`
-) -> ParticipantGridModel {
-    p.participants.iter().map(|participant| {
-        GridTile {
-            name: participant.name.clone(),
-            muted: s.muted.contains(&participant.id),
-            pinned: *s.pinned == Some(participant.id),
-            has_video: m.has_video_for(participant.id),
-        }
-    }).collect()
-}
-```
-
-### The bridge layer
-
-The bridge holds the previous model and pushes to the Swift side only when
-the model changes:
-
-```rust
-struct ViewBridge<T: PartialEq + Clone> {
-    current: Option<T>,
-    push_fn: Box<dyn Fn(&T)>,  // FFI call to update Swift @Observable
-}
-
-impl<T: PartialEq + Clone> ViewBridge<T> {
-    fn update(&mut self, new_value: T) {
-        if self.current.as_ref() != Some(&new_value) {
-            (self.push_fn)(&new_value);
-            self.current = Some(new_value);
-        }
-    }
-}
-```
-
-### The Swift side
-
-```swift
-@Observable
-class MicPickerVM {
-    var permission: MicPermission = .notAsked
-    var mics: [MicDevice] = []
-    var selected: MicId? = nil
-
-    // Called from Rust via FFI when the model changes
-    func update(from model: MicPickerModel) {
-        permission = model.permission
-        mics = model.mics
-        selected = model.selected
-    }
-}
-
-struct MicPickerView: View {
-    @State var vm: MicPickerVM
-
-    var body: some View {
-        switch vm.permission {
-        case .needPermission:
-            Button("Grant Mic Access") { RustBridge.requestMicPermission() }
-        case .waiting:
-            ProgressView("Requesting access...")
-        case .denied:
-            Text("Microphone access denied")
-        case .ready:
-            List(vm.mics) { mic in
-                MicRow(mic: mic, selected: mic.id == vm.selected)
-                    .onTapGesture { RustBridge.selectMic(mic.id) }
-            }
-        }
-    }
-}
-```
-
-### Granularity chain
-
-Three layers, each avoiding redundant work at its own level:
-
-| Layer | Mechanism | What it avoids |
-|-------|-----------|----------------|
-| `drv` input | Field-by-field `PartialEq` on projected fields | Recomputing memo when irrelevant source fields changed |
-| `PartialEq` bridge | `new_model != current_model` | Pushing to Swift when the model is identical |
-| SwiftUI `@Observable` | Per-property tracking | Re-rendering views that didn't read the changed property |
-
-### User events flow back
-
-SwiftUI user actions cross the FFI boundary in the opposite direction and
-mutate user-decision sources:
-
-```
-SwiftUI onTapGesture
-  → RustBridge.selectMic(id)      // FFI call
-    → mic_preference.selected = Some(id)  // source mutation
-      → next tick: queries recompute, bridge pushes if changed
-```
-
----
-
-## Threading model
-
-```
-Background threads                        UI / Main thread
-(async I/O, platform calls)              (sources, queries, render)
-
-┌──────────────────────┐
-│  mic_enum_driver     │──┐
-│  (OS hotplug events) │  │
-└──────────────────────┘  │
-┌──────────────────────┐  │  mpsc / callback
-│  mic_stream_driver   │──┼──────────────────→  main loop {
-│  (audio capture)     │  │                       ingest
-└──────────────────────┘  │                       query (memoized)
-┌──────────────────────┐  │                       execute
-│  signaling_driver    │──┤                       render
-│  (WebSocket)         │  │                     }
-└──────────────────────┘  │
-┌──────────────────────┐  │
-│  webrtc_driver       │──┘
-│  (peer connections)  │
-└──────────────────────┘
-```
-
-### Why sources stay on the UI thread
-
-- Sources are plain structs; they're `Send` (or `Sync`) iff `T` is. The
-  memoization caches live in per-memo `thread_local!` slots, so each
-  thread builds its own cache independently — no shared state, no
-  contention.
-- Query/memo computation is cheap (cache hits ~10ns). Hundreds of queries
-  per frame is < 1ms.
-- The expensive work (I/O, network, audio processing) is already on
-  background threads.
-- Keeping sources on the UI thread means views can read them directly
-  through inputs — no thread-boundary serialization for read access.
-  A source *can* move between threads, but the cache doesn't follow;
-  the new thread builds its own on first miss.
-
-### Communication pattern
-
-Background threads communicate with the main thread via channels
-(`mpsc::Receiver`, `crossbeam::Receiver`, etc.) or callback dispatch
-(e.g., `DispatchQueue.main.async` on iOS).
-
-The main loop's **ingest phase** drains these channels into sources. This is
-the only point where external data enters the query system.
-
----
-
-## Worked example: microphone lifecycle
-
-A complete walkthrough of the mic selection flow, showing sources, mutations,
-queries, and actions at each step.
-
-### Sources
-
-Sources are plain Rust structs. Inputs — the projections memos read — are
-declared separately, each with a `#[derive(drv::Input)]` struct and a hand-written
-projection (a `::new` method, a `From` impl, whatever reads naturally).
-Always project only the fields the memo actually needs. Changes to
-unrelated fields (e.g., `last_enumerated` timestamp updating frequently)
-then don't trigger recomputation.
-
-```rust
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct MicInventory {
-    pub permission: MicPermission,
-    pub mics: imbl::Vector<MicDevice>,
-    pub last_enumerated: Option<Instant>,   // updated frequently, most memos don't care
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct MicPreference {
-    pub selected: Option<MicId>,
-    pub last_changed: Option<Instant>,      // for analytics, not for queries
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct MicCapture {
-    pub state: CaptureState,
-    pub device_id: Option<MicId>,
-    pub volume_level: f32,                  // updated every audio frame, mic_action doesn't need it
-}
-```
-
-Inputs for the queries below project only what each one reads:
-
-```rust
-#[derive(drv::Input)]
-struct MicListInput<'a> {
-    pub permission: &'a MicPermission,
-    pub mics: &'a imbl::Vector<MicDevice>,
-}
-
-impl<'a> MicListInput<'a> {
-    pub fn new(inv: &'a MicInventory) -> Self {
-        Self { permission: &inv.permission, mics: &inv.mics }
-    }
-}
-
-#[derive(drv::Input)]
-struct MicSelectInput<'a> {
-    pub selected: &'a Option<MicId>,
-}
-
-impl<'a> MicSelectInput<'a> {
-    pub fn new(pref: &'a MicPreference) -> Self {
-        Self { selected: &pref.selected }
-    }
-}
-
-#[derive(drv::Input)]
-struct MicCapStateInput<'a> {
-    pub state: &'a CaptureState,
-    pub device_id: &'a Option<MicId>,
-}
-
-impl<'a> MicCapStateInput<'a> {
-    pub fn new(cap: &'a MicCapture) -> Self {
-        Self { state: &cap.state, device_id: &cap.device_id }
-    }
-}
-```
-
-### Queries
-
-Each memo takes inputs that project only the fields it needs. Changes to
-fields outside the input (e.g., `volume_level` updating 60 times per
-second) don't trigger recomputation of unrelated memos.
-
-```rust
-/// "What mic should be open right now?"
-/// Needs permission + available mics + user selection. Does NOT need
-/// last_enumerated, last_changed, or volume_level.
-#[drv::memo(single)]
-fn desired_mic<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> Option<MicId> {
-    match (inv.permission, pref.selected) {
-        (MicPermission::Granted, Some(id))
-            if inv.mics.iter().any(|m| m.id == *id) => Some(*id),
-        _ => None,
-    }
-}
-
-/// "What should we do about the mic stream?"
-/// Needs desired state + capture state. Does NOT need volume_level.
-#[drv::memo(single)]
-fn mic_action<'a, 'b, 'c>(
-    inv: MicListInput<'a>,
-    pref: MicSelectInput<'b>,
-    cap: MicCapStateInput<'c>,
-) -> MicAction {
-    let want = desired_mic(inv, pref);
-    let have = match cap.state {
-        CaptureState::Live | CaptureState::Opening => *cap.device_id,
-        _ => None,
-    };
-    match (want, have) {
-        (Some(d), None)              => MicAction::Open(d),
-        (Some(d), Some(a)) if d != a => MicAction::Switch(d),
-        (None, Some(_))              => MicAction::Close,
-        _                            => MicAction::Noop,
-    }
-}
-
-/// "What should the mic picker view show?"
-/// Needs permission + mics + selection. Same fields as desired_mic, different output.
-#[drv::memo(single)]
-fn mic_picker_model<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> MicPickerModel {
-    match inv.permission {
-        MicPermission::NotAsked => MicPickerModel::NeedPermission,
-        MicPermission::Pending  => MicPickerModel::Waiting,
-        MicPermission::Denied   => MicPickerModel::Denied,
-        MicPermission::Granted  => MicPickerModel::Ready {
-            mics: inv.mics.iter().cloned().collect(),
-            selected: *pref.selected,
-        },
-    }
-}
-
-/// "What is the current mic volume?" — depends ONLY on volume_level.
-/// Audio frame updates don't trigger mic_action or mic_picker recomputation.
-#[derive(drv::Input)]
-struct MicVolumeInput<'a> {
-    pub volume_level: &'a f32,
-}
-
-impl<'a> MicVolumeInput<'a> {
-    pub fn new(c: &'a MicCapture) -> Self {
-        Self { volume_level: &c.volume_level }
-    }
-}
-
-#[drv::memo(single)]
-fn mic_volume_display<'a>(vol: MicVolumeInput<'a>) -> VolumeLevel {
-    VolumeLevel::from_linear(*vol.volume_level)
-}
-```
-
-Call sites build inputs explicitly: `mic_action(MicListInput::new(&inv),
-MicSelectInput::new(&pref), MicCapStateInput::new(&cap))`.
-
-### Step-by-step flow
-
-```
-Step  What happens                 Source mutations                   Query results
-────  ──────────────────────────── ──────────────────────────────── ──────────────────────
-1     User opens mic picker        (none)                           mic_picker_model → NeedPermission
-2     User taps "grant access"     inv.permission = Pending         mic_picker_model → Waiting
-3     OS grants permission         inv.permission = Granted         mic_picker_model → Ready {
-      Driver enumerates            inv.mics = [mic1, mic2]           mics: [mic1, mic2],
-                                                                     selected: None }
-4     User taps mic1               pref.selected = Some(mic1)       desired_mic → Some(mic1)
-                                                                    mic_action → Open(mic1)
-      Execute writes intent        cap.state = Opening              mic_action → Noop (next tick)
-                                   cap.device_id = Some(mic1)
-5     Driver reports stream open   cap.state = Live                 mic_action → Noop
-6     User yanks USB               inv.mics removes mic1            desired_mic → None
-      Driver reports disconnect    cap.state = Disconnected         mic_action → Close
-      Execute writes intent        cap.state = Closing              mic_action → Noop (next tick)
-7     User re-inserts USB          inv.mics adds mic1               desired_mic → Some(mic1)
-                                                                    mic_action → Open(mic1)
-      Execute writes intent        cap.state = Opening              mic_action → Noop (next tick)
-8     Driver reports stream open   cap.state = Live                 mic_action → Noop
-```
-
-Reconnection (steps 6→7→8) requires zero special-case code. It falls out
-from the query returning `Some(mic1)` (because `selected` was never cleared)
-and the diff against `Disconnected` producing `Open(mic1)`.
-
----
-
-## Worked example: remote participants
-
-### Sources
-
-```rust
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct RemoteParticipants {
-    pub participants: imbl::Vector<Participant>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct ParticipantSettings {
-    pub muted: imbl::HashSet<ParticipantId>,
-    pub pinned: Option<ParticipantId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct RemoteStreams {
-    pub video_tracks: imbl::HashMap<ParticipantId, VideoTrackState>,
-    pub audio_tracks: imbl::HashMap<ParticipantId, AudioTrackState>,
-}
-```
-
-### Queries
-
-```rust
-#[drv::memo(single)]
-fn participant_grid(
-    p: &RemoteParticipants,
-    s: &ParticipantSettings,
-    streams: &RemoteStreams,
-) -> Vec<GridTile> {
-    let mut tiles: Vec<GridTile> = p.participants.iter().map(|participant| {
-        GridTile {
-            id: participant.id,
-            name: participant.name.clone(),
-            is_muted: s.muted.contains(&participant.id),
-            is_pinned: s.pinned == Some(participant.id),
-            has_video: streams.video_tracks.get(&participant.id)
-                .is_some_and(|t| t.is_active()),
-        }
-    }).collect();
-
-    // Pinned participant goes first
-    if let Some(pin_id) = s.pinned {
-        if let Some(pos) = tiles.iter().position(|t| t.id == pin_id) {
-            let pinned = tiles.remove(pos);
-            tiles.insert(0, pinned);
-        }
-    }
-
-    tiles
-}
-```
-
-When a participant leaves, the WebRTC driver removes them from
-`RemoteParticipants`. The query naturally excludes them from the grid.
-No "on participant left" handler needed. When the user mutes someone,
-`ParticipantSettings.muted` is updated. The query includes the mute state.
-No "on mute toggled, re-render tile" handler needed.
-
-### Invariant enforcement
-
-When a pinned participant leaves, the pinned state becomes stale. The query
-handles this gracefully (the `position()` call returns `None`, so no tile is
-moved to front). But the stale state should be cleaned up. This belongs in
-the ingest phase:
-
-```rust
-// In the main loop's ingest phase, after processing webrtc events:
-if let Some(pinned_id) = participant_settings.pinned {
-    if !remote_participants.participants.iter().any(|p| p.id == pinned_id) {
-        participant_settings.pinned = None;
-    }
-}
-```
-
-This is application logic — not a query, not a driver. It runs during ingest
-because it's cleaning up a user-decision source in response to an external
-fact changing.
-
 ---
 
 ## Testing
@@ -1533,156 +1069,3 @@ fn save_keybinding_emits_save_cmd_for_dirty_active_buffer() {
 These catch wiring mistakes (wrong source mutated, wrong driver called,
 execute-pattern discipline broken) before they surface as mysterious
 end-to-end diffs.
-
----
-
-## Guidelines
-
-### 1. External facts and user decisions go in separate sources
-
-Don't mix "what the OS told me" with "what the user chose" in the same source.
-Drivers manage external facts. UI handlers manage user decisions. Memos
-combine them.
-
-### 2. Queries describe desired state, not transitions
-
-Write "what mic should be open?" not "when the user selects a mic, open it."
-The diff between desired and actual is the action.
-
-### 3. Execute writes intent synchronously
-
-When acting on a query result, update the driver's source to reflect the
-in-progress operation *before* starting the async work. This prevents the
-query from returning the same action on the next tick.
-
-### 4. The main loop is ingest → query → execute → render
-
-Keep the phases separate. Ingest writes to sources from outside the app.
-Query reads sources (memoized). Execute acts on query results and writes
-intent. Render computes view models (also memoized) and pushes to UI.
-
-### 5. Use `imbl` collections for large or frequently-cloned data
-
-Enable the `imbl` feature in `drv`. Persistent collections give O(1) clone
-(cheap snapshots on cache miss) and O(1) pointer-equality comparison on
-cache hit.
-
-### 6. One memo per view for the UI bridge
-
-Each UI component gets a memo producing its specific view model. The bridge
-pushes to the reactive framework only when the model changes (`PartialEq`).
-The reactive framework handles per-property granularity from there.
-
-### 7. Clean up stale user decisions in the ingest phase
-
-When an external fact invalidates a user decision (pinned participant left,
-selected mic removed), clean up the user-decision source during ingest. This
-is application logic, not a query.
-
-### 8. Keep drivers ignorant of each other
-
-The mic enumeration driver should not know about the stream driver. The
-stream driver should not know about user preferences. Memos express the
-relationships between domains. Drivers just keep their source in sync with
-reality.
-
-Exception: `platform-*` drivers (guideline 13) are shared
-infrastructure and are *meant* to be imported by multiple domain
-drivers. The ignorance rule applies between *domain* drivers.
-
-### 9. Enforce driver ignorance with crate boundaries
-
-Don't rely on discipline — put each driver in its own crate (or crate
-pair) that has no dependency on other drivers or on sibling
-user-decision state. The Cargo.toml is the constraint; the compiler
-rejects accidental coupling. Cross-source composition lives in a separate
-runtime crate that depends on all of them.
-
-### 10. Split each driver into a portable core and a platform-specific native
-
-The sync API + source + ABI types are the same on every platform. The
-async worker is not. Putting them in separate crates means the core
-crate compiles on every target and stays thin; the native crate is
-swapped (Rust thread / Swift + GCD / Kotlin + coroutines / mock for
-tests) without touching anything upstream.
-
-### 10a. One native crate per platform, not `cfg` inside one crate
-
-When the same driver exists on multiple platforms, ship one
-`*-native-<platform>` crate per target instead of a single native with
-`#[cfg(target_os = ...)]` gates. Separate crates keep each platform's
-dependency set narrow, avoid compiling dead code, and let the compiler
-(via `Cargo.toml`) reject accidental cross-platform calls. The runtime
-picks one via target-specific dependencies — or, when the UI differs
-substantially per platform, ships as parallel `runtime-<platform>`
-crates depending on the shared `*-core` crates plus the right native.
-
-### 11. Declare inputs in the crate that uses them
-
-When a memo in crate B projects a source defined in crate A, declare the
-`#[derive(drv::Input)]` struct in crate B alongside a hand-written projection
-(inherent `::new` method, `From` impl, etc.). The source crate stays
-plain and doesn't need `drv` as a dependency.
-
-### 12. Don't `join()` native workers in `Drop`
-
-The mpsc hangup is the shutdown signal: when the sync driver's `Sender`
-drops, the worker's `recv` returns `Err` and it exits. A `join()` in
-the native handle's `Drop` deadlocks whenever the native handle drops
-before the sync driver (e.g. reverse-order drops in a tuple binding).
-
-### 13. Platform primitives go in a `platform-*` tier, not `driver-*`
-
-When a driver wraps a platform-provided primitive (UDP, HTTP, timers,
-keychain) that *multiple* domain drivers actively call into, put it in
-a `platform-<name>/` crate pair. Cross-driver imports into it are
-expected — a domain driver importing `platform-http-core`'s `Cmd`
-types is how it speaks HTTP at all. This is the one exception to
-guideline 8.
-
-The promotion criterion is *multiple domain drivers issue requests to
-it*, not *wraps a platform API* and not *observed by multiple parts of
-the app*. One-consumer wrappers stay in `driver-*`; event-observed
-singletons (lifecycle, locale) stay in `driver-*` too. Promote to
-`platform-*` only when the second *caller* appears.
-
-### 14. ABI-crossing types live in `abi-*` crates, separate from drivers
-
-Cross-language byte buffers and other stable-ABI wrappers (the kind
-that move through `extern "C"` and need matching Swift / Kotlin
-handling) don't belong in driver cores — they are type and lifetime
-contracts, not behaviours. Keep them in small `abi-*` crates that any
-driver or runtime can import. See *Crossing the ABI: foreign-owned
-buffers*.
-Let the worker self-exit; process exit reaps any straggler.
-
-### 13. Keep ABI types in the driver's `*-core` crate
-
-When a `Cmd` or `Done` carries a compound type (`DirEntry`, `FrameDelta`,
-`LspResponse`), that type lives in the driver's `*-core` crate, not in
-whichever state crate happens to consume it. Consumer crates depend on
-driver-core for ABI types, never the reverse — even when the consumer is
-the type's only reader today.
-
-Getting this backward (driver-core imports a state crate because "the
-state crate defined the type first") re-couples every driver to every
-consumer that touches its ABI, and the compiler stops catching isolation
-violations. The type always belongs on the driver side of the ABI.
-
-### 14. Zero allocation on idle ticks
-
-An idle tick should be free: every memo cache-hits, every `execute`
-iterates an empty collection, paint is skipped. Allocation on the idle
-path is a bug even when it's "only" a `Vec::new()` — it's noise in
-profiles, pressure on the allocator, and a leading indicator that a memo
-has escaped its cache.
-
-Memo outputs wrapping large data are `Arc`-wrapped (`Arc<Vec<T>>`,
-`Arc<str>`) so cache-hit clones are refcount bumps. Collections used in
-memos are `imbl` so structural sharing survives the clone. Action memos
-filter before cloning (return `Noop` rather than `Open(...)` that the
-driver will no-op on). Render walks views (`RopeSlice`, `&str`) rather
-than materializing intermediate owned collections.
-
-This discipline regresses on its own as features land. Audit the hot
-paths periodically.
