@@ -485,6 +485,90 @@ Note how `Opening` is treated the same as `Live` for the "actual" side —
 the stream is either open or in the process of being opened. This prevents
 re-triggering an open that's already in flight.
 
+### Anti-pattern: derived UI state
+
+The query-driven discipline doesn't stop at the runtime boundary. The
+UI layer (Kotlin / Swift / SwiftUI / Compose / a TUI render loop) is a
+driver too: its job is to *render* the queries the runtime exposes,
+not to *re-derive them* on the platform side.
+
+Concrete smell: any boolean or enum in your UI code that combines two
+or more fields read from the runtime (over FFI, over a channel, over
+whatever surface). It is a query wearing the wrong language.
+
+```kotlin
+// ANTI-PATTERN: query in Kotlin
+val connected = handle != 0L && (exit == null || exit == Running)
+//              └── UI fact ──┘   └─── runtime-observed facts ───┘
+```
+
+```swift
+// SAME ANTI-PATTERN: query in Swift
+let connected = runtime.lastExit == nil && runtime.isAlive
+//              └────── two runtime-observed facts combined here ─────┘
+```
+
+The runtime crate has all the source state; the UI is reading
+snapshots over a narrow surface. The combination rule belongs *with*
+the sources, not on the consumer side. Two implementations of the
+same rule in two languages are also two opportunities to drift —
+nothing forces them to agree.
+
+The corrective shape: write the rule as a memo over the runtime's
+sources, expose its output as a single value across the boundary, and
+let the UI read it.
+
+```rust
+// In the runtime crate:
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConnectionPhase { Disconnected, Connecting, Connected, Reconnecting, Failed }
+
+impl ConnectionPhase {
+    pub fn is_active(self) -> bool {
+        matches!(self, ConnectionPhase::Connecting | ConnectionPhase::Connected
+                     | ConnectionPhase::Reconnecting)
+    }
+}
+
+#[drv::memo(single)]
+pub fn connection_phase<'a, 'b>(
+    desired: DesiredInput<'a>,
+    rtc:     RtcInput<'b>,
+) -> ConnectionPhase { /* … */ }
+```
+
+```kotlin
+// On the UI side:
+val connected = isPhaseActive(Native.connectionPhase(handle))
+```
+
+```swift
+// On the UI side:
+let connected = runtime.connectionPhase.isActive
+```
+
+One rule, in one place, derived from sources the cascade already
+tracks, surfaced over the FFI as a single value the UI renders. Adding
+inputs (a permission state, a network gate, a pre-flight check) is one
+change in the memo plus zero changes in the UIs.
+
+#### How to spot it on review
+
+- If a diff adds `&&` or `||` in UI code over fields you can name as
+  "things I read from the runtime," reject in favour of a memo.
+- If two platform UIs end up with structurally similar `if`/`when`
+  ladders, the ladder belongs in a memo.
+- If you find yourself writing `onChange` / `LaunchedEffect` /
+  `Observer` whose job is "sync this derived state when an input
+  changed," it's a memo with extra steps.
+
+UI driver lifecycle (handle allocation, async resource freeing) is
+a legitimate UI-side concern — that's the "execute pattern" from
+earlier, just with the UI as the driver. The line is: lifecycle of
+the UI's own artifacts vs. derivation from runtime-observed facts.
+
 ---
 
 ## The main loop
