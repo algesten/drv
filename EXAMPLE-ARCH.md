@@ -993,6 +993,52 @@ fn mic_count<'a>(inv: MicsInput<'a>) -> usize {
 No registry, no cross-crate coordination. The consumer crate is the only
 one that needs a `drv` dependency.
 
+### Input construction does no work
+
+`Input::new` is a **projection**, not a computation. It selects the
+source fields the memo will read and stops there — no filtering,
+summing, mapping, or other derivation:
+
+```rust
+// ANTI-PATTERN: aggregation inside Input::new
+impl<'a> DesiredBitrateInput<'a> {
+    pub fn new(encoders: &'a Encoders) -> Self {
+        let sum_bps = encoders.by_id.values()
+            .filter(|s| matches!(s.status, EncoderStatus::Opening | EncoderStatus::Active))
+            .map(|s| s.params.bitrate.bps())
+            .sum();
+        Self { encoders_sum_bps: sum_bps, _p: PhantomData }
+    }
+}
+```
+
+```rust
+// CORRECTIVE SHAPE: project the field, let a memo do the work
+#[derive(drv::Input)]
+struct EncodersInput<'a> {
+    pub by_id: &'a imbl::HashMap<EncoderId, EncoderState>,
+}
+
+#[drv::memo(single)]
+fn desired_bitrate_bps<'a>(enc: EncodersInput<'a>) -> u64 {
+    enc.by_id.values()
+        .filter(|s| matches!(s.status, EncoderStatus::Opening | EncoderStatus::Active))
+        .map(|s| s.params.bitrate.bps())
+        .sum()
+}
+```
+
+Work inside `Input::new` runs **every iteration**, uncached — the memo
+cache keys on the input's fields, so moving derivation upstream of the
+cache means it never gets cached. Worse, the derived scalar (`sum_bps`)
+churns whenever any input encoder changes in a way that affects the sum,
+forcing every downstream memo to recompute even when their actual
+dependency is something narrower.
+
+The rule: **Inputs project; memos compute.** If you're tempted to write
+a `filter`/`map`/`sum`/`fold`/`match` inside `Input::new`, that body is
+a memo trying to escape.
+
 ---
 
 ## Testing
