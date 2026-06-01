@@ -1,34 +1,19 @@
 # Architecture: Query-Driven Applications with `drv`
 
-This document describes how to structure an interactive application using
-query-driven architecture powered by `drv`. The running example is a mobile
-teleconferencing app, but the patterns apply to any stateful application
-with derived views and asynchronous I/O.
+This document describes query-driven application architecture with `drv`.
+The running example is a mobile teleconferencing app, but the patterns apply
+to any stateful app with derived views and asynchronous I/O.
 
 The goal: an assistant (human or AI) should be able to read this document
 together with the `drv` crate documentation and structure a new application
 from scratch.
 
-## Table of contents
-
-1. [Core idea](#core-idea)
-2. [Query-driven vs reactive](#query-driven-vs-reactive)
-3. [Sources: two kinds of ground truth](#sources-two-kinds-of-ground-truth)
-4. [Drivers: the sync/async split](#drivers-the-syncasync-split)
-5. [Queries: desired state, not transitions](#queries-desired-state-not-transitions)
-6. [Actions as diffs](#actions-as-diffs)
-7. [The main loop](#the-main-loop)
-8. [Organizing the code: crate layout](#organizing-the-code-crate-layout)
-9. [Testing](#testing)
-
----
-
 ## Core idea
 
-The application is structured as a **database of ground truth** (sources) and
-**cached queries** over that database (memos). Nothing watches anything.
-Nothing subscribes to anything. The main loop sets inputs, asks questions,
-and acts on answers. Memoization makes the asking cheap.
+The application is a **database of ground truth** (sources) plus **cached
+queries** over that database (memos). Nothing watches or subscribes. The main
+loop sets inputs, asks questions, and acts on answers. Memoization makes the
+asking cheap.
 
 ```
 set inputs → ask questions → act on answers → repeat
@@ -42,15 +27,12 @@ the application architecture built on top of it.
 
 ## Query-driven vs reactive
 
-In a **reactive** architecture, state changes push notifications to observers.
-You wire up handlers: "when X changes, do Y." The full behavior of the system
-is the sum of all handlers — distributed across the codebase, implicitly
-ordered, and easy to get wrong.
+Reactive architectures push notifications to observers: "when X changes, do
+Y." Behavior is the sum of distributed, implicitly ordered handlers.
 
-In a **query-driven** architecture, consumers pull query results. You write
-functions: "given the current state of everything, what should be true?" The
-system caches results and only recomputes when inputs change. The full
-behavior of any query is in one function — centralized, explicit, testable.
+Query-driven architectures pull query results: "given the current state, what
+should be true?" Results are cached and recomputed only when inputs change.
+Each query's behavior is centralized, explicit, and testable.
 
 ### Concrete differences
 
@@ -94,8 +76,8 @@ Chosen, not discovered. Changes come from user interaction.
 - Whether the camera is on
 - UI preferences (layout, theme)
 
-These have different lifecycles, different update paths, and different owners.
-They should live in **separate sources**.
+External facts and user decisions have different lifecycles, update paths, and
+owners. Keep them in **separate sources**.
 
 ```rust
 // External fact — managed by the device enumeration driver
@@ -112,15 +94,13 @@ pub struct MicPreference {
 }
 ```
 
-Sources are plain Rust structs. `drv` doesn't wrap them. Memoization lives
-entirely in per-memo thread-local caches keyed by input value, so drivers
-and the main loop simply pass `&mut MySource` around and mutate fields
-directly.
+Sources are plain Rust structs. `drv` doesn't wrap them; memoization lives in
+per-memo thread-local caches keyed by input value. Drivers and the main loop
+pass `&mut MySource` around and mutate fields directly.
 
-Why separate? The device driver should not need to know about user
-preferences. The UI handler should not need to know about OS enumeration.
-Memos bridge them — each memo takes one or more **inputs** (projections
-declared with `#[derive(drv::Input)]`):
+Drivers should not know about user preferences, and UI handlers should not
+know about OS enumeration. Memos bridge sources via **inputs**: projections
+declared with `#[derive(drv::Input)]`.
 
 ```rust
 #[drv::memo(single)]
@@ -131,7 +111,7 @@ fn mic_picker<'a, 'b>(inv: MicListInput<'a>, pref: MicSelectInput<'b>) -> MicPic
 
 ### Organizing sources by domain
 
-Group sources into domains. Each domain covers one area of the application:
+Group sources by domain:
 
 ```
 Domain: Devices
@@ -154,22 +134,19 @@ Domain: Media
   RemoteStreams      (external: incoming audio/video streams)
 ```
 
-Drivers manage external-fact sources. UI handlers manage user-decision sources.
-Memos reach across domains freely via multi-input parameters.
+Drivers manage external facts. UI handlers manage user decisions. Memos reach
+across domains via multi-input parameters.
 
 ### User-decision sources keyed by external facts
 
-The temptation to merge user decisions and external facts is strongest when
-the user decision is a map or set keyed by identifiers the driver discovered:
-muted participants keyed by ids the signaling driver reported, expanded
-directories keyed by paths the FS driver listed, pinned items referencing
-entries the inventory contains.
+Do not merge decisions with external facts just because a decision is keyed by
+ids the driver discovered: muted participants by signaling id, expanded
+directories by filesystem path, pinned inventory entries by item id.
 
-Resist. The user decision is the **key set**; the external fact is the **map
-values**. They have different lifecycles (user choices persist across
-reconnects; enumeration rebuilds) and different owners (dispatch mutates
-decisions; the driver mutates facts). Keep them in separate sources; memos
-that read both produce the combined view.
+The user decision is the **key set**; the external fact is the **map values**.
+User choices can persist across reconnects while enumeration rebuilds. Dispatch
+mutates decisions; drivers mutate facts. Keep them separate and combine them in
+memos.
 
 ```rust
 // External fact — driver-owned
@@ -184,32 +161,27 @@ pub struct MicPreference {
 }
 ```
 
-The key set and the map values share an identifier type. That's not coupling
-— it's reference. Neither source needs to know about the other; a memo reads
-both and returns the combined shape.
+Sharing an identifier type is reference, not coupling. Neither source needs to
+know about the other; a memo reads both and returns the combined shape.
 
 ### Shadow sources
 
-Sometimes a user-decision source holds a *mutation* of an external-fact
-source rather than an independent choice: an editor's edited buffer shadows
-the pristine file on disk; an in-progress form shadows a server-side record;
-a local draft shadows the synced document.
+Sometimes a user-decision source holds a *mutation* of an external-fact source:
+an edited buffer shadows the file on disk, a form shadows a server record, or a
+draft shadows a synced document.
 
-Two sources, shared key (path, record id, document id), one seeded from the
-other. Document the seeding protocol explicitly, because "seeded" is where
-the bugs hide:
+Use two sources with a shared key (path, record id, document id), one seeded
+from the other. Document the seeding protocol:
 
 - **Seed on first completion.** When the external source first becomes
   `Ready` for a key, ingest copies it into the user source.
 - **Subsequent external updates don't auto-apply.** If the disk file changes
-  again after the user has started editing, the new version is queued as a
-  reload candidate, not silently dropped into the user source.
+  after editing starts, queue the new version as a reload candidate.
 - **Writes are explicit.** The user source flows *out* to the external
   source only via a deliberate save action, with explicit conflict handling.
 
-When both fields share the same underlying type, field names won't stop
-a confused assignment during a refactor. Newtype the roles so the
-compiler carries the invariant:
+When both roles share an underlying type, newtype them so the compiler carries
+the invariant:
 
 ```rust
 pub struct Persisted(Arc<String>);
@@ -328,20 +300,16 @@ impl MicStreamDriver {
 }
 ```
 
-The synchronous write into the source is critical. Without it, the next query
-would return the same action again (because the source hasn't changed yet),
-causing a double-open. The source write closes the loop: execute → source
-updates → query returns Noop → no re-execution.
+The sync write is critical: without it, the next query sees unchanged source
+state and returns the same action again. Execute writes intent, the query
+returns `Noop`, and work is not re-triggered.
 
 ### Pure output drivers
 
-Some drivers have no external-fact source to maintain — they exist only to
-push computed state out to a platform: paint a terminal frame, render a
-graphics surface, play a sound buffer, flash an LED. No hotplug, no
-incoming events; the "what should be true" is a memo in the runtime.
-
-These still follow the execute pattern. The driver's source is the
-**in-flight artifact** plus acknowledgement state:
+Some drivers only push computed state out to a platform: paint a terminal
+frame, render a graphics surface, play a sound buffer, flash an LED. They
+still follow the execute pattern. Their source is the **in-flight artifact**
+plus acknowledgement state:
 
 ```rust
 pub struct PaintState {
@@ -365,22 +333,16 @@ impl TerminalPaintDriver {
 }
 ```
 
-The point isn't tracking frames for their own sake — it's that the same
-"write intent sync, fire async, diff is Noop until Done" pattern every other
-driver uses applies here too. Without a source, paint becomes a free
-function in the runtime that can't be mocked, can't be throttled at its
-natural seat, and can't be traced with the same mechanism as every other
-driver.
+This is the same "write intent sync, fire async, diff is `Noop` until done"
+pattern. Without a source, paint becomes an unmockable free function that
+cannot be throttled or traced like other drivers.
 
 ### Stateless drivers still need an in-flight source
 
-A driver that's purely a wrapper around a platform API — OS clipboard,
-one-shot shell command, single DNS lookup — has no persistent external-fact
-source. But it still has state while an operation is in flight ("is a read
-currently outstanding?", "is a write queued?").
-
-That state belongs on a **driver-owned source**, never piggybacked onto the
-user-decision source that triggered the operation:
+A wrapper around a platform API — clipboard, shell command, DNS lookup — may
+have no persistent external fact, but it still has in-flight state. Keep that
+state on a **driver-owned source**, not on the user-decision source that
+triggered the operation:
 
 ```rust
 // NO: flag lives on a user-decision source
@@ -396,16 +358,15 @@ pub struct ClipboardState {
 }
 ```
 
-Without this split, the user-decision source accumulates async bookkeeping
-over time, its `PartialEq` picks up churn from driver completions, and the
-rule that says "user decisions are chosen, not discovered" quietly rots.
+Otherwise user-decision sources accumulate async bookkeeping, `PartialEq` sees
+driver-completion churn, and "chosen, not discovered" stops being true.
 
 ---
 
 ## Queries: desired state, not transitions
 
-The fundamental unit of logic in a query-driven app is a **query** (a `drv`
-memo) that describes what should be true given the current inputs.
+The fundamental unit of logic is a `drv` memo that describes what should be
+true given the current inputs.
 
 ### Anti-pattern: transition handlers
 
@@ -418,8 +379,7 @@ on_permission_revoked() → close_stream(), clear_selection()
 on_switch_mic(old, new) → close_stream(old), open_stream(new)
 ```
 
-Each handler encodes one transition. Miss a handler and you have a bug.
-The "close old stream when switching mics" case is easy to forget.
+Each handler encodes one transition. Miss one and you have a bug.
 
 ### Pattern: desired-state query
 
@@ -448,15 +408,15 @@ This single function handles every transition:
 | Permission revoked | permission=Denied | None | Close stream |
 | Switch to mic2 | selected=mic2 | Some(mic2) | Close mic1, open mic2 |
 
-No transition handler needed for any of these. The query describes the
-desired end state. The diff against actual state determines the action.
+The query describes the desired end state; the diff against actual state
+determines the action.
 
 ---
 
 ## Actions as diffs
 
-A query describes what should be true. The driver's source describes what is
-actually true. The diff is the action.
+A query describes desired state. A driver source describes actual state. The
+diff is the action.
 
 ```rust
 /// "What should we do about the mic stream?"
@@ -481,42 +441,28 @@ fn mic_action<'a, 'b, 'c>(
 }
 ```
 
-Note how `Opening` is treated the same as `Live` for the "actual" side —
-the stream is either open or in the process of being opened. This prevents
-re-triggering an open that's already in flight.
+`Opening` counts as actual because an open is already in flight; this prevents
+duplicate opens.
 
 ### Anti-pattern: derived UI state
 
-The query-driven discipline doesn't stop at the runtime boundary. The
-UI layer (Kotlin / Swift / SwiftUI / Compose / a TUI render loop) is a
-driver too: its job is to *render* the queries the runtime exposes,
-not to *re-derive them* on the platform side.
-
-Concrete smell: any boolean or enum in your UI code that combines two
-or more fields read from the runtime (over FFI, over a channel, over
-whatever surface). It is a query wearing the wrong language.
+The UI layer is a driver: it should *render* runtime queries, not
+*re-derive* them. A boolean or enum that combines runtime fields over FFI, a
+channel, or another narrow surface is a query in the wrong language.
 
 ```kotlin
 // ANTI-PATTERN: query in Kotlin
 val connected = handle != 0L && (exit == null || exit == Running)
-//              └── UI fact ──┘   └─── runtime-observed facts ───┘
 ```
 
 ```swift
 // SAME ANTI-PATTERN: query in Swift
 let connected = runtime.lastExit == nil && runtime.isAlive
-//              └────── two runtime-observed facts combined here ─────┘
 ```
 
-The runtime crate has all the source state; the UI is reading
-snapshots over a narrow surface. The combination rule belongs *with*
-the sources, not on the consumer side. Two implementations of the
-same rule in two languages are also two opportunities to drift —
-nothing forces them to agree.
-
-The corrective shape: write the rule as a memo over the runtime's
-sources, expose its output as a single value across the boundary, and
-let the UI read it.
+The runtime crate has the sources, so the combination rule belongs there.
+Write the rule as a memo, expose one value across the boundary, and let the UI
+read it.
 
 ```rust
 // In the runtime crate:
@@ -549,37 +495,27 @@ val connected = isPhaseActive(Native.connectionPhase(handle))
 let connected = runtime.connectionPhase.isActive
 ```
 
-One rule, in one place, derived from sources the cascade already
-tracks, surfaced over the FFI as a single value the UI renders. Adding
-inputs (a permission state, a network gate, a pre-flight check) is one
-change in the memo plus zero changes in the UIs.
+Adding inputs later is one memo change and no UI rewrites.
 
 #### How to spot it on review
 
-- If a diff adds `&&` or `||` in UI code over fields you can name as
-  "things I read from the runtime," reject in favour of a memo.
-- If two platform UIs end up with structurally similar `if`/`when`
-  ladders, the ladder belongs in a memo.
-- If you find yourself writing `onChange` / `LaunchedEffect` /
-  `Observer` whose job is "sync this derived state when an input
-  changed," it's a memo with extra steps.
+- `&&` or `||` over runtime-observed fields belongs in a memo.
+- Similar `if` / `when` ladders across platform UIs belong in a memo.
+- `onChange` / `LaunchedEffect` / `Observer` used to sync derived state is a
+  memo with extra steps.
 
-UI driver lifecycle (handle allocation, async resource freeing) is
-a legitimate UI-side concern — that's the "execute pattern" from
-earlier, just with the UI as the driver. The line is: lifecycle of
-the UI's own artifacts vs. derivation from runtime-observed facts.
+UI lifecycle (handle allocation, async resource freeing) is UI-side driver
+work. Derivation from runtime-observed facts belongs in runtime memos.
 
 ---
 
 ## The main loop
 
-"Main loop" here means the runtime's own dedicated loop thread — the
-one that owns the sources and runs ingest/query/execute/render. It is
-*not* the platform UI thread (SwiftUI's main, Android's UI thread,
-the terminal's render thread). Those are separate; the UI should be
-considered another driver.
+"Main loop" means the runtime thread that owns sources and runs
+ingest/query/execute/render. It is not SwiftUI's main thread, Android's UI
+thread, or a terminal render thread; those are UI drivers.
 
-The main loop has three phases, every iteration:
+Every iteration:
 
 ```rust
 loop {
@@ -620,28 +556,23 @@ loop {
 }
 ```
 
-Every phase is clearly separated:
-- **Ingest**: writes to sources from outside the app. No reads.
-- **Query**: reads from sources. No writes. All memoized.
-- **Execute**: writes intent to sources + starts async work.
-- **Render**: reads from sources. Pushes to UI. All memoized.
+Phase boundaries stay strict:
+- **Ingest** writes outside events into sources.
+- **Query** reads sources only.
+- **Execute** writes intent into sources and starts async work.
+- **Render** reads memoized view models and pushes UI updates.
 
 ### Wake on event, don't spin
 
-Block the main thread until something actually happens — a driver
-completion, a user keystroke, or a deadline the runner needs to wake
-for. **Never sleep a fixed duration "just in case."** A 100 Hz fixed
-tick means 100 cache reads per second burning CPU on every idle
-moment, and adds one full tick of latency when an event arrives right
-after a sleep starts.
+Block until a driver completion, user input, or deadline. **Never sleep a
+fixed duration "just in case."** Fixed ticks burn idle CPU and add latency
+when an event arrives just after sleep starts.
 
 The specific primitive depends on how the drivers are wired:
 
-**Sync drivers (std threads + `std::mpsc`).** The main thread owns a
-`Receiver<()>`; every driver and input source holds a clone of the
-matching `Sender`. The loop blocks on `recv_timeout(timeout)`; the
-timeout comes from a deadline query (see *Deadlines are queries*
-below) so the loop wakes at the nearest pending deadline.
+**Sync drivers (`std::mpsc`).** The main thread owns a `Receiver<()>`; drivers
+and input sources hold cloned `Sender`s. The loop blocks on
+`recv_timeout(timeout)`, where `timeout` comes from the nearest-deadline query.
 
 ```rust
 let wake = Wake::new();
@@ -655,9 +586,8 @@ loop {
         .unwrap_or(Duration::from_secs(60));
     match wake.rx.recv_timeout(timeout) { /* ... */ }
 
-    // Drain AFTER recv_timeout, never before — execute may have
-    // kicked off work that signals wake before the sleep, and a
-    // pre-sleep drain would swallow it.
+    // Drain after recv_timeout; a pre-sleep drain can swallow a wake
+    // signaled by work started during execute.
     while wake.rx.try_recv().is_ok() {}
 }
 ```
@@ -680,9 +610,8 @@ loop {
 ### Time is a source field
 
 "Now" is data, not a global. Put it on a source, set it during ingest
-each iteration from whatever oracle you've chosen — `Instant::now()`
-in production, a controlled value in tests — and treat it as a
-memoizable input like every other source.
+(`Instant::now()` in production, controlled value in tests), and pass it as a
+memoizable input.
 
 ```rust
 #[derive(Debug, Clone, PartialEq)]
@@ -696,8 +625,7 @@ struct ClockInput<'a> {
 }
 ```
 
-Time-dependent queries take `ClockInput` alongside their other
-inputs:
+Time-dependent queries take `ClockInput` with their other inputs:
 
 ```rust
 #[drv::memo(single)]
@@ -712,26 +640,17 @@ fn toast_visible<'a, 'b>(
 }
 ```
 
-Two payoffs:
+Payoffs:
 
-1. **Tests drive faster than realtime.** A test that exercises a
-   30-second timeout takes microseconds: write `clock.now = t0 + 30s`
-   into the source, rerun the query, assert. No `tokio::time::pause`
-   ceremony, no wall-clock sleeps, no flakiness — and the same
-   pattern handles simulated years without taking any longer.
-
-2. **Cache cost is proportional to time-dependent work.** Memos that
-   read clock recompute every iteration — their input changed by
-   definition. Memos that don't read clock are unaffected. The
-   recompute itself is cheap; downstream consumers only re-fire when
-   the output value actually changes (e.g., when the toast crosses
-   its expiry).
+1. **Tests drive faster than realtime.** Set `clock.now = t0 + 30s`, rerun the
+   query, assert. No wall-clock sleeps or timer-runtime ceremony.
+2. **Cache cost is local.** Only memos that read clock recompute every
+   iteration; consumers only re-fire when outputs change.
 
 ### Deadlines are queries the runner consults
 
-A wall-clock deadline (toast expiry, animation frame, debounce flush,
-LSP timeout) is just a field on a source. The runner doesn't need a
-separate timer system — it reads a memo that folds all current
+A wall-clock deadline (toast expiry, animation frame, debounce flush, LSP
+timeout) is just a source field. The runner reads a memo that folds current
 deadlines and uses the nearest one to size its sleep:
 
 ```rust
@@ -748,36 +667,24 @@ fn nearest_deadline(
 }
 ```
 
-This is the same kind of memo as everything else. The runner consults
-it to decide *how long to sleep*; it carries no semantic load. The
-question "is the toast still visible?" is answered by a clock-aware
-query (`toast_visible` above), not by the deadline — the fold's only
-job is to keep the loop from oversleeping past a state transition.
-
-Adding a feature with a time-bound is two steps: add the deadline
-field to its source, add it to the fold.
+The deadline fold carries no semantic load; `toast_visible` still answers
+whether the toast is visible. The fold only keeps the loop from oversleeping
+past a state transition. Adding a time-bound feature means adding a deadline
+field to its source and to this fold.
 
 ### Fire-and-forget timers via a driver
 
-Some timers don't fit on a source as state — "auto-save 5s after the
-last keystroke," "retry the connection in 30s." For those, a small
-`driver-timer` works well: it accepts `Set { name, duration,
-schedule }` commands and posts back `Fired { name }` events. Ingest
-writes the fire into the appropriate source field (e.g., flipping
-`auto_save.pending = true`); queries observe the field.
-
-This composes with clock-on-source rather than replacing it. The
-driver is the *trigger*; the source field it mutates is what queries
-read. Reach for it when the timer is genuinely a scheduled
-side-effect rather than an attribute of state.
+For timers like "auto-save 5s after the last keystroke" or "retry in 30s",
+use a small `driver-timer`: it accepts `Set { name, duration, schedule }` and
+posts `Fired { name }`. Ingest writes that fire into a source field, and memos
+observe the field. The driver is the trigger; the source remains the truth.
 
 ---
 
 ## Organizing the code: crate layout
 
-Everything above describes the shape of the code at runtime. A second
-decision is *where* the code lives. The patterns below keep the model
-scalable across domains and portable across platforms.
+The runtime model needs a crate layout that scales across domains and
+platforms.
 
 ### One driver per crate pair
 
@@ -843,8 +750,8 @@ shared native (e.g., a desktop native covering macOS and Linux with one
 `cfg` flip for a syscall). Top-level platform selection is the wrong
 place for it.
 
-The runtime crate picks one of the natives via **target-specific
-dependencies** in its `Cargo.toml`:
+The runtime can pick natives with target-specific Cargo dependencies when
+`spawn_drivers` has the same shape on every platform:
 
 ```toml
 [target.'cfg(all(not(target_os = "ios"), not(target_os = "android")))'.dependencies]
@@ -857,10 +764,8 @@ my-app-driver-buffers-native-ios = { workspace = true }
 my-app-driver-buffers-native-android = { workspace = true }
 ```
 
-That works when the shape of `spawn_drivers` is identical across
-platforms. When the runtime itself differs substantially — notably
-because the UI driver is entirely different (terminal vs SwiftUI vs
-Jetpack Compose) — prefer **parallel runtime crates** instead:
+If runtime wiring differs substantially, especially because the UI driver
+differs, use **parallel runtime crates** instead:
 
 ```
 crates/
@@ -869,27 +774,20 @@ crates/
   runtime-android/   wires Jetpack Compose bridge + Android workers
 ```
 
-Each runtime crate depends on the `*-core` crates (shared) plus the
-right `*-native-<platform>` crate. This scales cleanly when the
-platforms have genuinely different wiring needs, which they usually do.
+Each runtime crate depends on shared `*-core` crates plus the right
+`*-native-<platform>` crates.
 
 ### User-decision sources have no driver
 
-A user-decision source is chosen, not discovered — no async side, no
-worker, no driver struct. Let it sit in a plain `state-*` crate and be
-mutated directly by dispatch in the runtime. Don't force it into the
-driver shape for consistency; the driver shape is for units that have
-an async peer.
+A user-decision source is chosen, not discovered: no async side, worker, or
+driver struct. Put it in a `state-*` crate and mutate it from runtime dispatch.
+The driver shape is for units with an async peer.
 
 ### Cross-driver composition lives in a runtime crate
 
-**Drivers must not know about each other.** `driver-foo/core/` must not
-import `driver-bar/core/` or `state-baz/`. Each driver is independently
-testable, independently swappable, independently mockable.
-
-Every memo that combines inputs from multiple drivers' sources lives in a
-separate **runtime** crate that depends on all of them. That runtime
-crate also owns:
+**Drivers must not know about each other.** `driver-foo/core/` must not import
+`driver-bar/core/` or `state-baz/`. Cross-source memos live in a **runtime**
+crate that depends on all sources. The runtime also owns:
 
 - `Event` + `dispatch` (the user-event handler that mutates driver sources).
 - `Trace` / unified trace sink that driver traces forward to.
@@ -897,8 +795,8 @@ crate also owns:
 - The platform-specific wiring that spawns native workers and builds
   the `Drivers` bundle.
 
-Cross-platform payoff: a mobile target replaces the runtime crate
-around the same `*-core` crates; the drivers stay intact.
+Cross-platform payoff: targets can replace runtime crates around the same
+`*-core` drivers.
 
 ```
 crates/
@@ -917,23 +815,12 @@ crates/
 
 ### Platform drivers: shared primitives as a third tier
 
-Some drivers wrap a **platform-provided primitive** that multiple domain
-drivers need. A UDP socket driver used by a WebRTC stack *and* by an
-opportunistic peer-discovery component. An HTTP driver used by auth,
-signaling, and push. A timer driver used by everything that needs
-`wake_me_at(t)`. These are infrastructure, not domain state.
+Some drivers wrap **platform primitives** used by multiple domain drivers: UDP,
+HTTP, timers. These are infrastructure, not domain state.
 
-They sit **below** domain drivers in the dependency graph and
-deliberately break one rule from the previous section: *cross-driver
-imports into them are expected*. A domain driver importing
-`platform-http-core`'s `Cmd` / `Event` ABI is how it speaks HTTP at
-all. The isolation rule is about stopping domain drivers from knowing
-about each other's domains — it is not about stopping them from using
-shared transport.
-
-Give them a distinct crate prefix — `platform-*` — so the role is
-visible at a glance and the exception doesn't read as drift. The
-three-tier dependency rule the `Cargo.toml` graph then enforces:
+They sit **below** domain drivers, and imports into them are expected. A domain
+driver importing `platform-http-core`'s `Cmd` / `Event` ABI is how it speaks
+HTTP. Use the `platform-*` prefix so the dependency exception is explicit:
 
 - `state-*` depends on nothing (or only on shared primitive crates).
 - `platform-*` may depend on `state-*` and shared primitives; not on
@@ -942,29 +829,18 @@ three-tier dependency rule the `Cargo.toml` graph then enforces:
   depend on other `driver-*`.
 - `runtime` depends on all of them.
 
-**Not every cross-cutting concern is a platform driver.** The criterion
-is *multiple domain drivers actively call into it* — i.e. they import
-its `Cmd` / `Event` ABI and issue requests. It is **not** *multiple
-parts of the app observe it*. A lifecycle / foreground-background
-driver has a singleton source that runtime-level memos read and feed
-into dispatch; no domain driver imports `driver-lifecycle-core`. That
-is a regular `driver-*` with a cross-cutting observer pattern, not a
-platform driver. The `platform-*` prefix is for transport and
-infrastructure that domain drivers actively issue requests to.
+**Not every cross-cutting concern is a platform driver.** The criterion is
+*multiple domain drivers actively call into it*, not "many app parts observe
+it." A lifecycle driver read by runtime memos is a regular `driver-*`.
 
-**Shape-wise:** platform drivers are usually stateless in the domain
-sense but **multi-request**. Their source is typically a
-`HashMap<RequestId, InFlight>` keyed by caller id, not a singleton
-struct. Callers allocate request ids and correlate via events. This is
-the usual "stateless drivers need in-flight sources" pattern — the
-in-flight state is just plural.
+Platform drivers are usually domain-stateless but **multi-request**: their
+source is typically `HashMap<RequestId, InFlight>` keyed by caller id.
 
 ### Cross-crate inputs: the consumer declares its own
 
-Inputs live in the crate that uses them. A source crate (e.g.
-`driver-mic-enum/core`) exports its plain struct and doesn't depend on
-`drv`. The consumer crate declares the input, the projection, and the
-memo:
+Inputs live in the crate that uses them. A source crate exports a plain struct
+and usually has no `drv` dependency. The consumer declares the input,
+projection, and memo:
 
 ```rust
 // In the runtime crate, projecting MicInventory from the sibling
@@ -990,14 +866,45 @@ fn mic_count<'a>(inv: MicsInput<'a>) -> usize {
 // mic_count(MicsInput::new(&mic_inventory))
 ```
 
-No registry, no cross-crate coordination. The consumer crate is the only
-one that needs a `drv` dependency.
+No registry, no cross-crate coordination.
+
+`#[derive(drv::Input)]` alone is cache-key / `ToStatic` plumbing, not a memo.
+A source crate may derive it on plain value types when needed for
+consumer-owned snapshots (for example `imbl::Vector<T>` where `T` needs
+`ToStatic`). That does **not** move query ownership into the source crate:
+avoid consumer-specific constructors, `#[drv::memo]`, and cross-source logic
+there.
+
+```rust
+// In state-room: plain value type; derive is cache-key plumbing only.
+#[derive(Debug, Clone, PartialEq, Eq, drv::Input)]
+pub struct Peer {
+    pub peer_id: String,
+    pub name: String,
+}
+
+// In runtime-common: consumer-owned projection + memo.
+#[derive(drv::Input)]
+pub struct RoomPeersInput<'a> {
+    pub peers: &'a imbl::Vector<Peer>,
+}
+
+impl<'a> RoomPeersInput<'a> {
+    pub fn new(room: &'a Room) -> Self {
+        Self { peers: &room.peers }
+    }
+}
+
+#[drv::memo(single)]
+pub fn remote_participants(input: RoomPeersInput<'_>) -> Vec<RemoteTile> {
+    todo!()
+}
+```
 
 ### Input construction does no work
 
-`Input::new` is a **projection**, not a computation. It selects the
-source fields the memo will read and stops there — no filtering,
-summing, mapping, or other derivation:
+`Input::new` is a **projection**, not a computation. It selects fields and
+stops there: no filtering, summing, mapping, or other derivation.
 
 ```rust
 // ANTI-PATTERN: aggregation inside Input::new
@@ -1028,16 +935,12 @@ fn desired_bitrate_bps<'a>(enc: EncodersInput<'a>) -> u64 {
 }
 ```
 
-Work inside `Input::new` runs **every iteration**, uncached — the memo
-cache keys on the input's fields, so moving derivation upstream of the
-cache means it never gets cached. Worse, the derived scalar (`sum_bps`)
-churns whenever any input encoder changes in a way that affects the sum,
-forcing every downstream memo to recompute even when their actual
-dependency is something narrower.
+Work inside `Input::new` runs **every iteration**, uncached. Moving derivation
+upstream of the cache also makes broad derived values like `sum_bps` churn and
+recompute downstream memos that needed narrower dependencies.
 
-The rule: **Inputs project; memos compute.** If you're tempted to write
-a `filter`/`map`/`sum`/`fold`/`match` inside `Input::new`, that body is
-a memo trying to escape.
+Rule: **Inputs project; memos compute.** A `filter` / `map` / `sum` / `fold` /
+`match` inside `Input::new` is a memo trying to escape.
 
 ---
 
