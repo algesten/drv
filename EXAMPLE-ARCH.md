@@ -507,6 +507,104 @@ Adding inputs later is one memo change and no UI rewrites.
 UI lifecycle (handle allocation, async resource freeing) is UI-side driver
 work. Derivation from runtime-observed facts belongs in runtime memos.
 
+### Anti-pattern: the view model assembled across the FFI
+
+The previous anti-pattern is about *deriving* a value UI-side. This one is
+about *transport*: even when every field is a faithful memo read, **pulling
+the view model across the boundary one field at a time, and re-declaring its
+shape once per platform, is the same mistake one level up.**
+
+The render layer should read *one parked view model per change*, not call N
+narrow accessors per frame. The shape lives in the runtime, defined once; each
+UI decodes that one shape. Two tells that it has gone wrong:
+
+```swift
+// ANTI-PATTERN: the view assembles the model by calling N getters at render
+var remoteTiles: [RemoteTile] {
+    let count = runtime_remote_tile_count(rt)
+    return (0..<count).map { i in
+        RemoteTile(
+            id:        readString { runtime_remote_tile_id_at(rt, i, $0, $1) },
+            hue:       Int(runtime_remote_tile_hue_at(rt, i)),
+            micMuted:  runtime_remote_tile_mic_muted_at(rt, i),
+            videoOff:  runtime_remote_tile_video_off_at(rt, i),
+            // …8 more per-field calls per tile, every render…
+        )
+    }
+}
+```
+
+```kotlin
+// SAME ANTI-PATTERN, re-declared a second time in the other UI:
+data class RemoteTile(val id: String, val hue: Int, val micMuted: Boolean, …)
+fun snapshotRemoteTiles(h: Long) = (0 until Native.remoteTileCount(h)).map { i ->
+    RemoteTile(Native.remoteTileIdAt(h, i), Native.remoteTileHueAt(h, i), …)
+}
+```
+
+Three costs compound:
+
+- **The shape is duplicated per platform.** `RemoteTile` exists in Swift *and*
+  in Kotlin, hand-kept in sync, drifting field-by-field (one platform grows a
+  20th getter the other lacks). The "single source of truth" stops at the memo
+  output and forks at the boundary.
+- **The transport is O(fields × items) FFI calls per render.** A 50-tile grid
+  is hundreds of boundary crossings every frame, each a separate
+  length-query-then-copy dance for strings.
+- **It invites a fixed-cadence poll.** Because no single signal says "the model
+  changed," the UI re-pulls everything on a timer — which is the *spin* the
+  "wake on event" rule forbids, now mass-multiplied: every poll re-allocates
+  the whole graph whether or not anything moved.
+
+Corrective shape: **the runtime owns one view-model type, a memo composes it
+from the per-field memos, and exactly one value crosses the boundary per
+change.** Serialize it once (any self-describing format both sides already
+decode — JSON, MessagePack), park it, signal "new model," let each UI decode
+the one shape into its render structs.
+
+```rust
+// One type, defined once, in the runtime crate. The memos above feed it.
+#[derive(Serialize, Clone, PartialEq)]
+pub struct InCallViewModel {
+    pub connection_phase: ConnectionPhase,
+    pub self_tile:        SelfTile,
+    pub remote_tiles:     Vec<RemoteTile>,
+    pub screen_share:     Option<ScreenShare>,
+    // …the whole drawable model, in one place…
+}
+
+#[drv::memo(single)]
+pub fn in_call_view_model(/* the source inputs */) -> InCallViewModel {
+    InCallViewModel {
+        connection_phase: connection_phase(/* … */),
+        self_tile:        self_participant(/* … */),
+        remote_tiles:     remote_participants(/* … */),
+        screen_share:     active_screen_share(/* … */),
+    }
+}
+```
+
+```swift
+// One boundary call per change; decode the one shared shape.
+struct InCallViewModel: Decodable { /* mirrors the Rust struct */ }
+let vm = try JSONDecoder().decode(InCallViewModel.self, from: parkedBytes)
+```
+
+The memo is the "view compiler": when a driver pushes a fact, only the
+sub-memos downstream of it recompute, so composing the whole model per change
+is still cheap. The model is parked in shared memory; the main loop signals the
+UI once; the UI renders the parked value. That is the same **set inputs → ask
+questions → act on answers** loop, with "render" reading a single answer
+instead of interrogating the database field by field.
+
+#### How to spot it on review
+
+- A `*_count()` accessor paired with `*_at(i)` per-field getters — the model is
+  being walked across the boundary by hand.
+- The same `data class` / `struct` view-model shape declared in both the Swift
+  and Kotlin (or other per-platform) source trees.
+- The UI re-reads the model on a timer rather than on a change signal.
+
 ---
 
 ## The main loop
