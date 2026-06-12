@@ -2155,3 +2155,28 @@ fn preprojected_input_at_call_site() {
     let other = CacheBehaviorAtom { value: 4 };
     assert_eq!(preprojected((&other).into()), 20);
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// NONZERO INTEGER INPUTS
+// ══════════════════════════════════════════════════════════════════════
+
+// A `NonZero*` field is `ToStatic` out of the box, so a newtype-style
+// input carrying one (e.g. str0m's `Frequency(NonZeroU32)`) derives
+// `Input` without a hand-written impl.
+#[derive(drv::Input)]
+struct FreqInput {
+    pub hz: std::num::NonZeroU32,
+}
+
+#[drv::memo(single)]
+fn doubled_hz(input: FreqInput) -> u32 {
+    input.hz.get() * 2
+}
+
+#[test]
+fn nonzero_field_is_a_valid_input() {
+    let hz = std::num::NonZeroU32::new(48_000).unwrap();
+    assert_eq!(doubled_hz(FreqInput { hz }), 96_000);
+    // Same value → cache hit, same answer.
+    assert_eq!(doubled_hz(FreqInput { hz }), 96_000);
+}

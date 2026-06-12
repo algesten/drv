@@ -225,8 +225,9 @@
 /// Convert a memo input to its `'static` cache-storage form.
 ///
 /// Every type passed to a `#[drv::memo]` must implement `ToStatic`. drv
-/// ships impls for primitives, `String`, `str`, `PathBuf`, `Path`,
-/// `Arc<T>`, `std::time::{Instant, Duration, SystemTime}`, `&T` (for
+/// ships impls for primitives, the `NonZero*` integer family, `String`,
+/// `str`, `PathBuf`, `Path`, `Arc<T>`,
+/// `std::time::{Instant, Duration, SystemTime}`, `&T` (for
 /// any `T: ToStatic`), and (under `feature = "imbl"`) imbl's persistent
 /// collections. Container types — `Vec<T>`, `[T]`, `[T; N]`,
 /// `Option<T>`, tuples up to arity 5, `HashMap<K, V>`, `HashSet<K>`,
@@ -302,6 +303,27 @@ macro_rules! impl_identity_copy {
 
 impl_identity_copy!(
     u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64, bool, char,
+);
+
+// ────────────────────────────────────────────────────────────────────
+// NonZero integers — Copy + PartialEq, same identity shape as the plain
+// primitives above. Lets newtypes like `Frequency(NonZeroU32)` derive
+// `Input` without a hand-written impl.
+// ────────────────────────────────────────────────────────────────────
+
+impl_identity_copy!(
+    core::num::NonZeroU8,
+    core::num::NonZeroU16,
+    core::num::NonZeroU32,
+    core::num::NonZeroU64,
+    core::num::NonZeroU128,
+    core::num::NonZeroUsize,
+    core::num::NonZeroI8,
+    core::num::NonZeroI16,
+    core::num::NonZeroI32,
+    core::num::NonZeroI64,
+    core::num::NonZeroI128,
+    core::num::NonZeroIsize,
 );
 
 // ────────────────────────────────────────────────────────────────────
