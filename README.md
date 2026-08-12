@@ -39,7 +39,8 @@ struct's fields without cloning the whole struct on every call. See
   `HashMap` probe. Cache lookup is a linear scan through a fixed-shape
   slot array with per-field equality.
 - **Thread-local caches.** Every memo owns its own cache —
-  single-writer, lock-free.
+  single-writer, lock-free. On Android, drv stores those caches behind one
+  shared thread-local key to avoid the platform's low pthread-key limit.
 - **Zero allocations on cache hit.** A hit is an equality check plus a
   `Clone` of the output.
 - **O(1) cache-hit check for `Arc<T>` and `imbl` collections.** A
