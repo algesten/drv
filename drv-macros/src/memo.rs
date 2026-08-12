@@ -158,11 +158,17 @@ pub fn expand(attr: TokenStream, item: ItemFn) -> Result<TokenStream, syn::Error
             }
         }
 
+        #[cfg(not(target_os = "android"))]
         thread_local! {
             #[allow(non_upper_case_globals)]
             static #static_ident: ::core::cell::RefCell<#state_ident> =
                 ::core::cell::RefCell::new(#state_ident::default());
         }
+
+        #[cfg(target_os = "android")]
+        #[allow(non_upper_case_globals)]
+        static #static_ident: ::drv::__private::AndroidLocal<#state_ident> =
+            ::drv::__private::AndroidLocal::new();
 
         #vis fn #fn_name #generics_no_where (#(#outer_params),*) -> #output_ty
         #where_clause
