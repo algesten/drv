@@ -37,6 +37,9 @@
 //! - **Thread-local caches.** Every memo owns its own cache —
 //!   single-writer, lock-free. On Android, drv stores those caches behind one
 //!   shared thread-local key to avoid the platform's low pthread-key limit.
+//!   On other platforms, each cache is lazily heap-allocated so large keys,
+//!   outputs, and LRU capacities do not consume native TLS space (limited
+//!   to 64 KiB offsets on arm64_32 watchOS).
 //! - **Zero allocations on cache hit.** A hit is an equality check plus a
 //!   `Clone` of the output.
 //! - **O(1) cache-hit check for `Arc<T>` and `imbl` collections.** A

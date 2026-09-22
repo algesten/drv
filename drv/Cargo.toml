@@ -37,3 +37,8 @@ required-features = ["imbl"]
 
 [lints]
 workspace = true
+
+# The link fixture is also executable as a host regression test.
+[[example]]
+name = "large_memo"
+harness = false
