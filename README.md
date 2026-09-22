@@ -41,6 +41,9 @@ struct's fields without cloning the whole struct on every call. See
 - **Thread-local caches.** Every memo owns its own cache —
   single-writer, lock-free. On Android, drv stores those caches behind one
   shared thread-local key to avoid the platform's low pthread-key limit.
+  On arm64_32 watchOS, each cache is lazily heap-allocated so large keys,
+  outputs, and LRU capacities do not exceed the 64 KiB TLS offset limit.
+  Other platforms store caches directly in TLS without this indirection.
 - **Zero allocations on cache hit.** A hit is an equality check plus a
   `Clone` of the output.
 - **O(1) cache-hit check for `Arc<T>` and `imbl` collections.** A

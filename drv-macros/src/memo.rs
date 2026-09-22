@@ -158,11 +158,23 @@ pub fn expand(attr: TokenStream, item: ItemFn) -> Result<TokenStream, syn::Error
             }
         }
 
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(
+            target_os = "android",
+            all(target_os = "watchos", target_arch = "aarch64", target_pointer_width = "32")
+        )))]
         thread_local! {
             #[allow(non_upper_case_globals)]
             static #static_ident: ::core::cell::RefCell<#state_ident> =
                 ::core::cell::RefCell::new(#state_ident::default());
+        }
+
+        #[cfg(all(target_os = "watchos", target_arch = "aarch64", target_pointer_width = "32"))]
+        thread_local! {
+            #[allow(non_upper_case_globals)]
+            // Keep cache payloads off native TLS: arm64_32 watchOS has a
+            // 64 KiB TLS offset limit. Allocate once per memo per thread.
+            static #static_ident: ::core::cell::RefCell<::std::boxed::Box<#state_ident>> =
+                ::core::cell::RefCell::new(::std::boxed::Box::new(#state_ident::default()));
         }
 
         #[cfg(target_os = "android")]
